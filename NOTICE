@@ -1,0 +1,28 @@
+WeaveForge — Open-Science 3D Moddable Action-to-GPU Physics Sandbox & Crucible Engine
+Copyright (C) 2026 David Stoler
+Website: https://stoler.systems
+YouTube: https://www.youtube.com/@TNaPhysicist
+Repository: https://github.com/dragula22/WeaveForge
+Companion Archive: https://github.com/dragula22/TNAP-Theories
+Zenodo DOI: https://doi.org/10.5281/zenodo.23919217
+
+DUAL OPEN-SCIENCE LICENSING NOTICE:
+
+1. SOURCE CODE, SHADERS & SIMULATION ENGINES — GNU AGPL v3.0 (AGPL-3.0-only)
+   All executable software, simulation engines, symbolic compilers, GPU shaders,
+   physics mod configurations, and build tools in this repository are free
+   software: you can redistribute them and/or modify them under the terms of the
+   GNU Affero General Public License version 3 as published by the Free Software
+   Foundation (see LICENSE).
+
+   Under AGPL-3.0, any modified version, derivative software, or network-hosted
+   deployment MUST remain 100% open-source under AGPL-3.0, preserve this
+   Copyright & Attribution Notice to David Stoler, and provide complete
+   corresponding source code to all users. Closed-source proprietary capture or
+   paywalled relicensing is strictly prohibited.
+
+2. DOCUMENTATION, SCREENSHOTS & VISUAL ASSETS — Creative Commons Attribution 4.0 (CC BY 4.0)
+   All written documentation, architecture roadmaps, physics audit reports,
+   charts, screenshots, and visual renders are licensed under Creative Commons
+   Attribution 4.0 International (see LICENSE-DOCS.md), requiring clear credit
+   to David Stoler (WeaveForge / Theoretically Not A Physicist / https://stoler.systems).

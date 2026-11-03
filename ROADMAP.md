@@ -1,7 +1,7 @@
 # WeaveForge — System Architecture & Phased Engineering Roadmap
 
 > ***Universe Sandbox* meets a Moddable Relativistic Field-Theory Compiler & Real-Telescope Crucible Engine.**  
-> **License:** MIT Open-Source — Built for the entire physics, student, and game-modding community.
+> **License:** Dual Open-Science (`GNU AGPL-3.0-only` code + `CC BY 4.0` docs/visuals; see [`LICENSE`](LICENSE) & [`LICENSE-DOCS.md`](LICENSE-DOCS.md)) — Built for the entire physics, student, and modding community.
 
 ---
 

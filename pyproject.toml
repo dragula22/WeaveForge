@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "WeaveForge: Open-Source Real-Time 3D Moddable Action-to-GPU Physics Sandbox & Observational Crucible Engine"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = {file = "LICENSE"}
 authors = [
     {name = "David Stoler & Community Contributors"}
 ]

@@ -2,6 +2,10 @@
 
 **Open-Source, Real-Time 60–120+ FPS 3D Moddable Action-to-GPU Physics Sandbox & Observational Crucible Engine**
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23919217.svg)](https://doi.org/10.5281/zenodo.23919217)
+[![Code License: AGPL v3](https://img.shields.io/badge/Code_License-GNU_AGPLv3-blue.svg)](LICENSE)
+[![Docs & Visuals: CC BY 4.0](https://img.shields.io/badge/Docs_%26_Visuals-CC_BY_4.0-lightgrey.svg)](LICENSE-DOCS.md)
+
 > *"Don't trust a physics theory because of a verbal story. Type its Master Cost Sheet (Lagrangian) into the compiler, let `SymPy` derive its exact 3D equations of motion, let the Red-Team Audit check it for ghosts and Solar-System violations, compile it straight into 3D GPU compute shaders, and watch it fight `Lambda-CDM`, `MOND`, `Superfluid Dark Matter`, `AeST`, and `TNaP Spacetime Weave` live against 175 galaxies, the CMB, black-hole shadows, and Gaia DR4 wide binaries."*
 
 ![WeaveForge Studio — Arena 1: 256³ Quantum & Topological Knot Tank](docs/screenshots/studio_arena1_knot_tank.png)
@@ -127,3 +131,12 @@ wa_de = -0.28
 ```
 
 See [`ROADMAP.md`](ROADMAP.md) for the full system architecture diagram and multi-phase open-source roadmap.
+
+---
+
+## Open-Science Dual Licensing (`AGPL-3.0` + `CC BY 4.0`)
+
+Copyright &copy; 2026 **David Stoler** (*WeaveForge* / *Theoretically Not A Physicist* — [`stoler.systems`](https://stoler.systems) | [`@TNaPhysicist`](https://www.youtube.com/@TNaPhysicist)).
+
+- **Source Code, Shaders & Simulation Engines ([`LICENSE`](LICENSE)):** Licensed under the **GNU Affero General Public License v3.0 (`AGPL-3.0-only`)**. Anyone is free to inspect, run, test, and modify the code—provided all modified or network-hosted versions **remain 100% open-source under `AGPL-3.0`** and preserve attribution to David Stoler ([`NOTICE`](NOTICE)). Closed-source or proprietary relicensing is strictly prohibited.
+- **Documentation, Audit Reports, Screenshots & Visual Assets ([`LICENSE-DOCS.md`](LICENSE-DOCS.md)):** Licensed under **Creative Commons Attribution 4.0 International (`CC BY 4.0`)**—free to share, cite, and build upon with clear attribution to David Stoler (`https://stoler.systems` / [`https://github.com/dragula22/WeaveForge`](https://github.com/dragula22/WeaveForge) / DOI [`10.5281/zenodo.23919217`](https://doi.org/10.5281/zenodo.23919217)).
