@@ -1,0 +1,32 @@
+# ==============================================================================
+# WeaveForge Physics Mod #6: Adversarial Red-Team Trap (Ostrogradsky Ghost + Wrong Bending)
+# ==============================================================================
+id = "ghost_redteam_demo"
+name = "Red-Team Stress Trap (Wrong-Sign Ghost + 1911 Half-Bending + Subluminal GW)"
+author = "WeaveForge Automated Diagnostics Demo"
+summary = "Deliberately broken Lagrangian designed to prove WeaveForge NEVER hand-waves or fakes success! Contains a negative-energy kinetic ghost (-T_kin), unbounded quartic collapse, Einstein's 1911 half-deflection metric exp(U) (gamma=0), and subluminal c_T = 0.998c."
+
+[action]
+# DELIBERATE BUGS:
+# 1. Negative kinetic sign (-T_kin) -> Kinetic Ghost Instability!
+# 2. Unbounded quartic attraction (+0.5 * g4 * rho**2 with g6=0) -> Vacuum Collapse!
+field_lagrangian = "-T_kin - c_w**2 * G_grad + 0.5 * g4 * rho**2"
+# 3. Naive scalar refractive index exp(U) instead of exp(2*U) -> PPN gamma = 0 (crushed by Cassini!)
+optical_metric_n = "exp(U)"
+metric_lapse_A = "exp(-2 * U)"
+interpolation_nu = "1.0"
+# 4. Bi-metric lag c_T = 0.998 c -> Crushed by GW170817 by 12 orders of magnitude!
+gw_speed_ratio = "0.998"
+
+[parameters]
+c_w = 1.0
+m_eff = 0.0
+g4 = 4.0
+g6 = 0.0
+a0_si = 1.203e-10
+has_cdm_halo = false
+cdm_halo_scale = 0.0
+waist_clamping_ell = 0.0
+pinned_pleat_coupling = 0.0
+w0_de = -1.0
+wa_de = 0.0

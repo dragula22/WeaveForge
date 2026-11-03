@@ -1,0 +1,31 @@
+# ==============================================================================
+# WeaveForge Physics Mod #4: AeST — Relativistic Aether-Scalar-Tensor (2021)
+# ==============================================================================
+id = "aest"
+name = "AeST Relativistic MOND (Skordis & Zlosnik 2021 PRL)"
+author = "Constantinos Skordis & Tom Zlosnik (Phys. Rev. Lett. 127, 161302)"
+summary = "The reigning peer-reviewed Dark-Matter-free relativistic benchmark! Couples Einstein's metric to a unit-timelike vector A_mu and shift-symmetric scalar phi: passes GW170817 (c_T = c) AND rescues the 3rd CMB peak via ghost-free time-derivative scalar inertia, at the cost of extra vector+scalar fields and free function F_2(Y, Q)."
+
+[action]
+# Relativistic shift-symmetric scalar-condensate effective wave sector in Coleman true-vacuum regime (g4^2 < 16/3 m^2 g6)
+field_lagrangian = "T_kin - c_w**2 * G_grad - 0.5 * m_eff**2 * rho + 0.25 * g4 * rho**2 - (1.0/6.0) * g6 * rho**3"
+# Matches GR isotropic metric to 2PN (shadow = 5.196 r_g)
+optical_metric_n = "((1 + U/2)**3) / (1 - U/2)"
+metric_lapse_A = "((1 - U/2) / (1 + U/2))**2"
+# RAR / Bose-Einstein QUMOND static galactic limit
+interpolation_nu = "1.0 / (1.0 - exp(-sqrt(y)))"
+# Exact c_T = c engineered via vector-tensor orthogonality constraint (GW170817 pass!)
+gw_speed_ratio = "1"
+
+[parameters]
+c_w = 1.0
+m_eff = 2.50
+g4 = 9.40
+g6 = 3.10
+a0_si = 1.20e-10
+has_cdm_halo = false
+cdm_halo_scale = 0.0
+waist_clamping_ell = 0.0
+pinned_pleat_coupling = 1.0   # AeST Q_0*(phi_dot)^2 branch mimics pressureless dust in CMB!
+w0_de = -1.0
+wa_de = 0.0

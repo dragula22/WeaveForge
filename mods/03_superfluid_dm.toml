@@ -1,0 +1,29 @@
+# ==============================================================================
+# WeaveForge Physics Mod #3: Superfluid Dark Matter (Berezhiani-Khoury 2015)
+# ==============================================================================
+id = "superfluid_dm"
+name = "Superfluid Dark Matter (Berezhiani & Khoury 2015)"
+author = "Lasha Berezhiani & Justin Khoury (Phys. Rev. D 92, 103510)"
+summary = "Sub-eV dark matter bosons condense inside galaxies into a P(X) ~ X^(3/2) superfluid core whose phonons mediate a MOND-like force, while remaining normal collisionless dust in galaxy clusters and the early CMB."
+
+[action]
+# Fractional non-analytic P(X)/phonon condensate nonlinearity ~(rho)^(5/4) in global true-vacuum regime (V >= 0)
+field_lagrangian = "T_kin - c_w**2 * G_grad - 0.5 * m_eff**2 * rho + 0.4 * g4 * ((rho + 0.01)**1.25 - 0.00316227766) - (1.0/6.0) * g6 * rho**3"
+optical_metric_n = "((1 + U/2)**3) / (1 - U/2)"
+metric_lapse_A = "((1 - U/2) / (1 + U/2))**2"
+# Phonon-mediated galactic superfluid core transitioning at thermal cluster boundary
+interpolation_nu = "1.0 + 1.0 / sqrt(y + 0.035 * y**1.5)"
+gw_speed_ratio = "1"
+
+[parameters]
+c_w = 1.0
+m_eff = 2.50
+g4 = 8.40
+g6 = 3.10
+a0_si = 1.20e-10
+has_cdm_halo = false          # Galactic curves driven by phonon force; normal-phase DM present on CMB scales
+cdm_halo_scale = 0.15
+waist_clamping_ell = 0.0
+pinned_pleat_coupling = 0.96  # Normal-phase uncondensed bosons act as dust during CMB recombination!
+w0_de = -1.0
+wa_de = 0.0

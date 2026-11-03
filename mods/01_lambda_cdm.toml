@@ -1,0 +1,32 @@
+# ==============================================================================
+# WeaveForge Physics Mod #1: Standard Consensus Lambda-CDM (GR + Cold Dark Matter)
+# ==============================================================================
+id = "lambda_cdm"
+name = "Standard Lambda-CDM (Einstein GR + NFW Cold Dark Matter)"
+author = "Consensus Baseline (Planck 2018 + Einstein 1915)"
+summary = "Empty dispersive quantum vacuum + exact General Relativity + invisible collisionless NFW Cold Dark Matter halos (2 knobs per galaxy) + cosmological constant Lambda."
+
+[action]
+# Linear Klein-Gordon empty-space wave action (same mass scale m_eff=2.50 as TNaP): 3D knots disperse & unravel!
+field_lagrangian = "T_kin - c_w**2 * G_grad - 0.5 * m_eff**2 * rho"
+# Exact Isotropic Schwarzschild GR optical refractive index n(U), U = GM/(r*c^2)
+# -> PPN gamma = 1, beta = 1; Photon-ring shadow = 3*sqrt(3) r_g = 5.19615 r_g
+optical_metric_n = "((1 + U/2)**3) / (1 - U/2)"
+metric_lapse_A = "((1 - U/2) / (1 + U/2))**2"
+# Pure Newtonian/GR baryon gravity law (nu(y) = 1); galaxies bound by separate NFW CDM halos
+interpolation_nu = "1"
+# Exact luminal gravitational wave speed |c_T/c - 1| = 0 (GW170817 pass)
+gw_speed_ratio = "1"
+
+[parameters]
+c_w = 1.0
+m_eff = 2.50
+g4 = 0.0
+g6 = 0.0
+a0_si = 1.203e-10
+has_cdm_halo = true
+cdm_halo_scale = 1.0
+waist_clamping_ell = 0.0      # Unclamped inflation quadrupole (~1022 uK^2 vs Planck 226-331 uK^2)
+pinned_pleat_coupling = 0.0   # Uses actual CDM dust (Omega_c = 0.265) for CMB 3rd peak
+w0_de = -1.0
+wa_de = 0.0

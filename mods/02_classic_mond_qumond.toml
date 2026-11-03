@@ -1,0 +1,30 @@
+# ==============================================================================
+# WeaveForge Physics Mod #2: Classic MOND / QUMOND (Milgrom 1983 / 2010)
+# ==============================================================================
+id = "classic_mond"
+name = "Classic MOND / QUMOND (Milgrom 1983 / Bekenstein-Milgrom AQUAL)"
+author = "Mordehai Milgrom (1983, 2010)"
+summary = "Non-relativistic modified Poisson gravity with empirical acceleration knob a0 = 1.2e-10 m/s^2. Fits SPARC spiral rotation curves without Dark Matter, but lacks uncharged CMB 3rd-peak inertia (Bump 3 collapses!) and power-law inner-Solar-System screening is tight."
+
+[action]
+# Sub-threshold scalar nonlinearity (weak g4, true vacuum V >= 0)
+field_lagrangian = "T_kin - c_w**2 * G_grad - 0.5 * m_eff**2 * rho + 0.25 * g4 * rho**2 - (1.0/6.0) * g6 * rho**3"
+# Relies on standard GR optical metric at 1PN
+optical_metric_n = "((1 + U/2)**3) / (1 - U/2)"
+metric_lapse_A = "((1 - U/2) / (1 + U/2))**2"
+# Classic Milgrom 'Simple' QUMOND interpolation function: nu(y) = 1/2 + sqrt(1/4 + 1/y)
+interpolation_nu = "0.5 + sqrt(0.25 + 1.0 / y)"
+gw_speed_ratio = "1"
+
+[parameters]
+c_w = 1.0
+m_eff = 2.50
+g4 = 3.20
+g6 = 3.10
+a0_si = 1.20e-10
+has_cdm_halo = false
+cdm_halo_scale = 0.0
+waist_clamping_ell = 0.0
+pinned_pleat_coupling = 0.0   # HONEST FAIL: Pure non-relativistic MOND has no neutral CMB potential well -> 3rd peak collapses!
+w0_de = -1.0
+wa_de = 0.0

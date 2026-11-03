@@ -1,0 +1,25 @@
+# Python & Virtual Environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ImGui layout, local reference drops & live agent telemetry logs
+imgui.ini
+telemetry_log.md
+cosmoagent_ref/
+*.log
+artifacts/
+captures/
+qa_renders/
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
