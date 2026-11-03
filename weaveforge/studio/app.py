@@ -128,6 +128,7 @@ _COUPLING_PARAM_FIELDS: Tuple[str, ...] = (
     "g4",
     "g6",
     "k_skyrme",
+    "g_knot",
     "a0_si",
     "has_cdm_halo",
     "cdm_halo_scale",
@@ -1030,7 +1031,7 @@ class WeaveForgeStudioApp:
         setattr(self.working_mod.parameters, param_name, default_val)
         if param_name == "has_cdm_halo":
             self.working_mod.parameters.cdm_halo_scale = float(self._pristine_mod.parameters.cdm_halo_scale)
-        if param_name in ("c_w", "m_eff", "g4", "g6", "k_skyrme", "a0_si"):
+        if param_name in ("c_w", "m_eff", "g4", "g6", "k_skyrme", "g_knot", "a0_si"):
             self._recompile_working_mod()
         else:
             self._refresh_crucible_fast()
@@ -1076,7 +1077,9 @@ class WeaveForgeStudioApp:
     def reset_active_camera(self) -> None:
         """Resets the active 3D arena camera to its canonical orbit pose."""
         idx = int(np.clip(self._active_arena, 0, 3))
-        if idx == 1:
+        if idx == 0 and int(getattr(self.arena1, "preset_idx", 0)) in (4, 5):
+            self.cameras[0].reset(yaw=0.34, pitch=0.32, distance=19.2)
+        elif idx == 1:
             sub = int(getattr(self.arena2, "submode", 0))
             if sub == 1:
                 self.cameras[1].reset(yaw=0.52, pitch=0.38, distance=8.2)
@@ -1993,6 +1996,11 @@ class WeaveForgeStudioApp:
             # TAB 2: COUPLING SLIDERS, ACTIVE ARENA & 4K / DDR5 CONTROLS
             # -----------------------------------------------------------------
             if imgui.begin_tab_item("Arena & Couplings", None, t1_flags)[0]:
+                st_tab2 = imgui.get_style()
+                imgui.push_style_var(
+                    imgui.StyleVar_.item_spacing,
+                    imgui.ImVec2(st_tab2.item_spacing.x, max(3.5 * s, st_tab2.item_spacing.y * 0.78)),
+                )
                 self._last_slider_reset_rects.clear()
                 n_mod_total = self.count_modified_parameters()
                 n_coup_mod = self.count_modified_couplings()
@@ -2045,6 +2053,10 @@ class WeaveForgeStudioApp:
                     if ch:
                         self._clear_replay_backup(0)
                         self.arena1.reset_field(new_p)
+                        if new_p in (4, 5):
+                            self.cameras[0].reset(yaw=0.34, pitch=0.32, distance=19.2)
+                        else:
+                            self.cameras[0].reset(*_DEFAULT_CAMERA_POSES[0])
                         self._poll_memory_telemetry(force=True)
                         self._reset_frame_pacing_clock()
                     res_vals = [128, 256, 512]
@@ -2286,6 +2298,7 @@ class WeaveForgeStudioApp:
                     ch6, _ = self._draw_coupling_slider_float("CDM Halo Scale", "cdm_halo_scale", 0.0, 1.8)
                 else:
                     ch6 = False
+                ch_gk, _ = self._draw_coupling_slider_float("Weave Gravity G_knot", "g_knot", 0.0, 2.5)
                 ch7, _ = self._draw_coupling_slider_float(
                     "Pinned Pleat Coupling", "pinned_pleat_coupling", 0.0, 1.5
                 )
@@ -2295,9 +2308,11 @@ class WeaveForgeStudioApp:
                 ch9, _ = self._draw_coupling_slider_float("Dark Energy w0", "w0_de", -1.6, -0.4)
                 ch10, _ = self._draw_coupling_slider_float("Dark Energy wa", "wa_de", -1.5, 1.0)
 
-                changed_any = ch1 or ch_m or ch2 or ch3 or ch_ks or ch4 or ch5 or ch6 or ch7 or ch8 or ch9 or ch10
+                changed_any = (
+                    ch1 or ch_m or ch2 or ch3 or ch_ks or ch_gk or ch4 or ch5 or ch6 or ch7 or ch8 or ch9 or ch10
+                )
                 if changed_any:
-                    if ch1 or ch_m or ch2 or ch3 or ch_ks or ch4:
+                    if ch1 or ch_m or ch2 or ch3 or ch_ks or ch_gk or ch4:
                         self._recompile_working_mod()
                     else:
                         self._refresh_crucible_fast()
@@ -2330,6 +2345,7 @@ class WeaveForgeStudioApp:
                     f"VRAM: {self.vram_used_gb:.2f} GB | DDR5: {self.ddr5_used_mb:.0f} MB (Ctrl +/-/0 Zoom)",
                 )
                 imgui.pop_text_wrap_pos()
+                imgui.pop_style_var()
 
                 imgui.end_tab_item()
 
@@ -2738,6 +2754,10 @@ class WeaveForgeStudioApp:
                     if imgui.menu_item_simple(kp_lbl, None, self.arena1.preset_idx == kp_i):
                         self._clear_replay_backup(0)
                         self.arena1.reset_field(kp_i)
+                        if kp_i in (4, 5):
+                            self.cameras[0].reset(yaw=0.34, pitch=0.32, distance=19.2)
+                        else:
+                            self.cameras[0].reset(*_DEFAULT_CAMERA_POSES[0])
                         self._poll_memory_telemetry(force=True)
                         self._reset_frame_pacing_clock()
                 imgui.separator()

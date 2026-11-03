@@ -111,6 +111,89 @@ def compute_safe_symplectic_dt(
     return min(dt_cfl, dt_stiff)
 
 
+WEAVE_ALPHA_KNOT: float = 1.75e-4
+WEAVE_KAPPA_SCALE: float = 4.0 * math.pi * WEAVE_ALPHA_KNOT
+_HE_KERNEL_FFT_CACHE: Dict[Tuple[int, float], np.ndarray] = {}
+
+
+def solve_3d_weave_tension_u_cpu(
+    rho_h_zyx: np.ndarray,
+    box_size: float = 12.0,
+    g_knot: float = 0.0,
+) -> np.ndarray:
+    """
+    Solves the exact isolated open-space 3D Poisson equation `nabla^2 U = -kappa * rho_H`
+    (`U -> +kappa * M / (4 * pi * r) > 0` as `r -> inf`) via Hockney-Eastwood `(2N)^3` padded
+    FFT Green's convolution (`1 / (4 * pi * |x - x'|)`), with zero periodic image artifacts.
+    """
+    arr = np.asarray(rho_h_zyx, dtype=np.float32)
+    n_grid = int(arr.shape[0])
+    if abs(float(g_knot)) <= 1.0e-12 or arr.size == 0:
+        return np.zeros((n_grid, n_grid, n_grid), dtype=np.float32)
+
+    # Downsample smoothly to 64^3 if N > 96 to bound FFT RAM while keeping smooth long-range U(x)
+    if n_grid > 96 and n_grid % 2 == 0:
+        m = 64
+        blk = n_grid // m
+        coarse = arr.reshape(m, blk, m, blk, m, blk).mean(axis=(1, 3, 5))
+        u_coarse = solve_3d_weave_tension_u_cpu(coarse, box_size=box_size, g_knot=g_knot)
+        from scipy.ndimage import zoom
+
+        return np.asarray(zoom(u_coarse, float(n_grid) / float(m), order=1), dtype=np.float32)
+
+    dx = float(box_size) / float(n_grid)
+    cache_key = (n_grid, round(dx, 9))
+    g_k = _HE_KERNEL_FFT_CACHE.get(cache_key)
+    p2 = 2 * n_grid
+    if g_k is None:
+        idx = np.arange(p2, dtype=np.float64)
+        wrapped = np.where(idx <= n_grid, idx, idx - p2) * dx
+        zz, yy, xx = np.meshgrid(wrapped, wrapped, wrapped, indexing="ij")
+        rr = np.sqrt(xx * xx + yy * yy + zz * zz)
+        # Exact self-potential of a uniform dx^3 cube at r=0 is 2.380077 / (4 * pi * dx)
+        g_real = np.where(rr > 1.0e-12, 1.0 / (4.0 * math.pi * np.maximum(rr, 1.0e-12)), 2.380077 / (4.0 * math.pi * dx))
+        g_k = np.fft.rfftn(g_real)
+        if len(_HE_KERNEL_FFT_CACHE) > 8:
+            _HE_KERNEL_FFT_CACHE.clear()
+        _HE_KERNEL_FFT_CACHE[cache_key] = g_k
+
+    rho_pad = np.zeros((p2, p2, p2), dtype=np.float64)
+    rho_pad[:n_grid, :n_grid, :n_grid] = arr.astype(np.float64)
+    kappa = WEAVE_KAPPA_SCALE * float(g_knot)
+    u_pad = np.fft.irfftn(np.fft.rfftn(rho_pad, axes=(0, 1, 2)) * g_k, s=(p2, p2, p2), axes=(0, 1, 2))
+    u_box = (kappa * (dx**3)) * u_pad[:n_grid, :n_grid, :n_grid]
+    return np.clip(u_box, -0.35, 0.75).astype(np.float32)
+
+
+def _eval_trefoil_pq_numpy(
+    X: np.ndarray,
+    Y: np.ndarray,
+    Z: np.ndarray,
+    a0: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluates homogeneous complex polynomial pair `(P_re, P_im, Q_re, Q_im)` of a `T_(3,2)` Trefoil (`Q_H = +7`)."""
+    r = np.sqrt(X * X + Y * Y + Z * Z)
+    rn = r / float(a0)
+    rn2 = rn * rn
+    chi = 3.14159265 * np.exp(-0.6931472 * rn2 - 0.095 * rn2 * rn2)
+    sc_over_r = np.where(r > 1.0e-5, np.sin(chi) / np.maximum(r, 1.0e-5), 0.0)
+    z1_re = sc_over_r * X
+    z1_im = sc_over_r * Y
+    z2_re = sc_over_r * Z
+    z2_im = np.cos(chi)
+
+    z1_2_re = z1_re * z1_re - z1_im * z1_im
+    z1_2_im = 2.0 * z1_re * z1_im
+    z2_2_re = z2_re * z2_re - z2_im * z2_im
+    z2_2_im = 2.0 * z2_re * z2_im
+
+    q_re = (z1_2_re * z1_re - z1_2_im * z1_im) + z2_2_re
+    q_im = (z1_2_re * z1_im + z1_2_im * z1_re) + z2_2_im
+    p_re = 1.95 * (z1_2_re * z2_re - z1_2_im * z2_im)
+    p_im = 1.95 * (z1_2_re * z2_im + z1_2_im * z2_re)
+    return p_re, p_im, q_re, q_im
+
+
 def build_3d_topological_initial_state(
     grid_n: int = 64,
     preset: str = "trefoil_knot",
@@ -119,10 +202,12 @@ def build_3d_topological_initial_state(
     """
     Constructs C-infinity smooth, periodic-boundary-clean 3D topological Hopfion / knot initial fields
     `(phi_init, vel_init)` of shape `(N, N, N, 4)` (`float32`), matching `_INIT_KNOT_GLSL` in Arena 1!
-      • `trefoil_knot`:  Sutcliffe (2007, Eq. 3.7) `T_(3,2)` Trefoil Knot Rational Map (`Q_H = +7`)!
-      • `z3_braid`:      3-Ribbon `Z_3` Cyclic Generation Braid Link (Koide `theta0 = 2/9`, `Q_H = +9`!)
-      • `hopfion_ring`:  Symmetric Orthogonal Linked 3D Hopfion Rings (`6_1^2` link, `Q_H = -6`!)
-      • `packet_smash`:  Head-on 3D relativistic wave-packet collision (`Observer Channel A/B` interference)
+      • `trefoil_knot`:               Sutcliffe (2007, Eq. 3.7) `T_(3,2)` Trefoil Knot Rational Map (`Q_H = +7`)!
+      • `z3_braid`:                   3-Ribbon `Z_3` Cyclic Generation Braid Link (Koide `theta0 = 2/9`, `Q_H = +9`!)
+      • `hopfion_ring`:               Symmetric Orthogonal Linked 3D Hopfion Rings (`6_1^2` link, `Q_H = -6`!)
+      • `packet_smash`:               Head-on 3D relativistic wave-packet collision (`Observer Channel A/B` interference)
+      • `two_matter_trefoils`:        Two separated `+7 / +7` Matter Trefoils (`Q_H = +14`) at rest for `1/r^2` gravity!
+      • `matter_antimatter_trefoils`: Separated `+7 / -7` Matter + Antimatter Trefoils (`Q_H = 0`) for gravity + annihilation!
     """
     idx_lin = (np.arange(grid_n, dtype=np.float32) + 0.5) / float(grid_n)
     coords = (idx_lin - 0.5) * float(box_size)
@@ -133,27 +218,7 @@ def build_3d_topological_initial_state(
     v0 = 0.85
 
     if preset == "trefoil_knot":
-        a0 = 0.195 * float(box_size)
-        r = np.sqrt(X * X + Y * Y + Z * Z)
-        rn = r / a0
-        rn2 = rn * rn
-        chi = 3.14159265 * np.exp(-0.6931472 * rn2 - 0.095 * rn2 * rn2)
-        sc_over_r = np.where(r > 1.0e-5, np.sin(chi) / np.maximum(r, 1.0e-5), 0.0)
-        z1_re = sc_over_r * X
-        z1_im = sc_over_r * Y
-        z2_re = sc_over_r * Z
-        z2_im = np.cos(chi)
-
-        z1_2_re = z1_re * z1_re - z1_im * z1_im
-        z1_2_im = 2.0 * z1_re * z1_im
-        z2_2_re = z2_re * z2_re - z2_im * z2_im
-        z2_2_im = 2.0 * z2_re * z2_im
-
-        q_re = (z1_2_re * z1_re - z1_2_im * z1_im) + z2_2_re
-        q_im = (z1_2_re * z1_im + z1_2_im * z1_re) + z2_2_im
-        p_re = 1.95 * (z1_2_re * z2_re - z1_2_im * z2_im)
-        p_im = 1.95 * (z1_2_re * z2_im + z1_2_im * z2_re)
-
+        p_re, p_im, q_re, q_im = _eval_trefoil_pq_numpy(X, Y, Z, 0.195 * float(box_size))
         q2 = q_re * q_re + q_im * q_im
         p2 = p_re * p_re + p_im * p_im
         denom = np.maximum(p2 + q2, 1.0e-12)
@@ -320,6 +385,36 @@ def build_3d_topological_initial_state(
         phi[..., 1] = np.where(hit_core, 0.0, v0 * (2.0 * wy / den))
         phi[..., 2] = np.where(hit_core, -2.0 * v0, v0 * (((1.0 - w2) / den) - 1.0))
 
+    elif preset in ("two_matter_trefoils", "matter_antimatter_trefoils"):
+        a0 = 0.132 * float(box_size)
+        if preset == "two_matter_trefoils":
+            x_off = 0.163 * float(box_size)
+            p1_re, p1_im, q1_re, q1_im = _eval_trefoil_pq_numpy(Y, Z, X + x_off, a0)
+            ct = -0.30901699
+            st = 0.95105652
+            yr = ct * Y - st * Z
+            zr = st * Y + ct * Z
+            p2_re, p2_im, q2_re, q2_im = _eval_trefoil_pq_numpy(yr, zr, X - x_off, a0)
+            pt_re = (p1_re * q2_re - p1_im * q2_im) + (p2_re * q1_re - p2_im * q1_im)
+            pt_im = (p1_re * q2_im + p1_im * q2_re) + (p2_re * q1_im + p2_im * q1_re)
+        else:
+            x_off = 0.138 * float(box_size)
+            p1_re, p1_im, q1_re, q1_im = _eval_trefoil_pq_numpy(Y, Z, X + x_off, a0)
+            p2_re, p2_im, q2_re, q2_im = _eval_trefoil_pq_numpy(Y, Z, x_off - X, a0)
+            pt_re = (p1_re * q2_re - p1_im * q2_im) - (p2_re * q1_re - p2_im * q1_im)
+            pt_im = (p1_re * q2_im + p1_im * q2_re) - (p2_re * q1_im + p2_im * q1_re)
+        qt_re = q1_re * q2_re - q1_im * q2_im
+        qt_im = q1_re * q2_im + q1_im * q2_re
+
+        q2 = qt_re * qt_re + qt_im * qt_im
+        p2 = pt_re * pt_re + pt_im * pt_im
+        denom = np.maximum(p2 + q2, 1.0e-12)
+        pqbar_re = pt_re * qt_re + pt_im * qt_im
+        pqbar_im = pt_im * qt_re - pt_re * qt_im
+        phi[..., 0] = v0 * (2.0 * pqbar_re / denom)
+        phi[..., 1] = v0 * (2.0 * pqbar_im / denom)
+        phi[..., 2] = v0 * (((q2 - p2) / denom) - 1.0)
+
     else:  # packet_smash
         sep = 0.20 * box_size
         w0 = 0.065 * box_size
@@ -341,6 +436,8 @@ _PRESET_NAME_TO_IDX: Dict[str, int] = {
     "z3_braid": 1,
     "hopfion_ring": 2,
     "packet_smash": 3,
+    "two_matter_trefoils": 4,
+    "matter_antimatter_trefoils": 5,
 }
 
 _INIT_KNOT_WGSL = """
@@ -361,6 +458,24 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 
 fn cconj(a: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(a.x, -a.y);
+}
+
+fn eval_trefoil_pq(pt: vec3<f32>, a0: f32) -> vec4<f32> {
+    let r = length(pt);
+    let rn = r / a0;
+    let rn2 = rn * rn;
+    let chi = 3.14159265 * exp(-0.6931472 * rn2 - 0.095 * rn2 * rn2);
+    var sc_over_r: f32 = 0.0;
+    if (r > 1e-5) {
+        sc_over_r = sin(chi) / r;
+    }
+    let Z1 = vec2<f32>(sc_over_r * pt.x, sc_over_r * pt.y);
+    let Z2 = vec2<f32>(sc_over_r * pt.z, cos(chi));
+    let Z1_2 = cmul(Z1, Z1);
+    let Z2_2 = cmul(Z2, Z2);
+    let Q_map = cmul(Z1_2, Z1) + Z2_2;
+    let P_map = 1.95 * cmul(Z1_2, Z2);
+    return vec4<f32>(P_map.x, P_map.y, Q_map.x, Q_map.y);
 }
 
 @compute @workgroup_size(8, 8, 4)
@@ -520,6 +635,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let n_vec = vec3<f32>(2.0 * W_sum.x / den, 2.0 * W_sum.y / den, (1.0 - w2) / den);
             phi = v0 * vec3<f32>(n_vec.x, n_vec.y, n_vec.z - 1.0);
         }
+    } else if (params.preset == 4u || params.preset == 5u) {
+        let a0 = 0.132 * u_box;
+        var P_tot = vec2<f32>(0.0);
+        var Q_tot = vec2<f32>(1.0, 0.0);
+        if (params.preset == 4u) {
+            let x_off = 0.163 * u_box;
+            let pq1 = eval_trefoil_pq(vec3<f32>(p.y, p.z, p.x + x_off), a0);
+            let yr = -0.30901699 * p.y - 0.95105652 * p.z;
+            let zr =  0.95105652 * p.y - 0.30901699 * p.z;
+            let pq2 = eval_trefoil_pq(vec3<f32>(yr, zr, p.x - x_off), a0);
+            P_tot = cmul(pq1.xy, pq2.zw) + cmul(pq2.xy, pq1.zw);
+            Q_tot = cmul(pq1.zw, pq2.zw);
+        } else {
+            let x_off = 0.138 * u_box;
+            let pq1 = eval_trefoil_pq(vec3<f32>(p.y, p.z, p.x + x_off), a0);
+            let pq2 = eval_trefoil_pq(vec3<f32>(p.y, p.z, x_off - p.x), a0);
+            P_tot = cmul(pq1.xy, pq2.zw) - cmul(pq2.xy, pq1.zw);
+            Q_tot = cmul(pq1.zw, pq2.zw);
+        }
+        let denom = max(dot(P_tot, P_tot) + dot(Q_tot, Q_tot), 1e-12);
+        let PQbar = cmul(P_tot, cconj(Q_tot));
+        let n_vec = vec3<f32>(
+            2.0 * PQbar.x / denom,
+            2.0 * PQbar.y / denom,
+            (dot(Q_tot, Q_tot) - dot(P_tot, P_tot)) / denom
+        );
+        phi = v0 * vec3<f32>(n_vec.x, n_vec.y, n_vec.z - 1.0);
     } else {
         let sep = 0.20 * u_box;
         let w0 = 0.065 * u_box;
@@ -764,6 +906,8 @@ class WgpuComputeEngine:
         phi_init_override: Optional[np.ndarray] = None,
         vel_init_override: Optional[np.ndarray] = None,
         readback_full_field: Optional[bool] = None,
+        solve_tension_u: bool = False,
+        u_field_override: Optional[np.ndarray] = None,
     ) -> Dict[str, object]:
         """
         Executes `n_steps` of the compiled 3D WGSL PDE kernel on GPU using packed 3-float (`12` B/voxel)
@@ -796,8 +940,11 @@ class WgpuComputeEngine:
         buf_a: Optional[wgpu.GPUBuffer] = None
         buf_b: Optional[wgpu.GPUBuffer] = None
         buf_vel: Optional[wgpu.GPUBuffer] = None
+        buf_u: Optional[wgpu.GPUBuffer] = None
         buf_uni: Optional[wgpu.GPUBuffer] = None
         buf_init_uni: Optional[wgpu.GPUBuffer] = None
+        phi0_3_cpu: Optional[np.ndarray] = None
+        vel0_3_cpu: Optional[np.ndarray] = None
 
         try:
             if phi_init_override is not None and vel_init_override is not None:
@@ -808,6 +955,8 @@ class WgpuComputeEngine:
                         f"Override fields must have shape ({grid_n}, {grid_n}, {grid_n}, 3|4); "
                         f"got {phi_init_override.shape} and {vel_init_override.shape}"
                     )
+                phi0_3_cpu = phi0_3
+                vel0_3_cpu = vel0_3
                 init_rho = phi0_3[..., 0] ** 2 + phi0_3[..., 1] ** 2 + phi0_3[..., 2] ** 2
                 init_peak = float(np.max(init_rho))
                 init_l2 = float(np.sum(init_rho, dtype=np.float64) * (dx**3))
@@ -848,9 +997,53 @@ class WgpuComputeEngine:
             if dt is None:
                 dt = compute_safe_symplectic_dt(dx, mod, compiled=compiled, peak_rho_est=init_peak)
 
+            g_knot_val = float(getattr(mod.parameters, "g_knot", 0.0))
+            use_tension_u32 = 0
+            if u_field_override is not None:
+                u_arr_32 = np.ascontiguousarray(u_field_override, dtype=np.float32)
+                if u_arr_32.shape != (grid_n, grid_n, grid_n):
+                    raise ValueError(f"u_field_override must have shape ({grid_n}, {grid_n}, {grid_n}), got {u_arr_32.shape}")
+                buf_u = self.device.create_buffer_with_data(data=u_arr_32.tobytes(), usage=usage_storage)
+                use_tension_u32 = 1
+            elif solve_tension_u and abs(g_knot_val) > 1.0e-12 and grid_n <= 128:
+                if phi0_3_cpu is None or vel0_3_cpu is None:
+                    raw_p0 = self.device.queue.read_buffer(buf_a, size=nbytes_vec3)
+                    raw_v0 = self.device.queue.read_buffer(buf_vel, size=nbytes_vec3)
+                    phi0_3_cpu = np.frombuffer(raw_p0, dtype=np.float32).reshape((grid_n, grid_n, grid_n, 3))
+                    vel0_3_cpu = np.frombuffer(raw_v0, dtype=np.float32).reshape((grid_n, grid_n, grid_n, 3))
+                p_c = np.moveaxis(phi0_3_cpu, -1, 0)
+                v_c = np.moveaxis(vel0_3_cpu, -1, 0)
+                grad_c = np.stack(
+                    [
+                        (np.roll(p_c, -1, axis=3) - np.roll(p_c, 1, axis=3)) / (2.0 * dx),
+                        (np.roll(p_c, -1, axis=2) - np.roll(p_c, 1, axis=2)) / (2.0 * dx),
+                        (np.roll(p_c, -1, axis=1) - np.roll(p_c, 1, axis=1)) / (2.0 * dx),
+                    ],
+                    axis=1,
+                )
+                assert compiled.hamiltonian_numpy_fn is not None
+                rho_h0 = compiled.hamiltonian_numpy_fn(
+                    p_c,
+                    v_c,
+                    grad_c,
+                    float(mod.parameters.c_w),
+                    float(mod.parameters.m_eff),
+                    float(mod.parameters.g4),
+                    float(mod.parameters.g6),
+                    float(mod.parameters.k_skyrme),
+                )
+                u_solved = solve_3d_weave_tension_u_cpu(rho_h0, box_size=box_size, g_knot=g_knot_val)
+                buf_u = self.device.create_buffer_with_data(data=u_solved.tobytes(), usage=usage_storage)
+                use_tension_u32 = 1
+            else:
+                buf_u = self.device.create_buffer_with_data(
+                    data=np.zeros(4, dtype=np.float32).tobytes(),
+                    usage=usage_storage,
+                )
+
             pipe = self._get_pipeline(compiled.wgsl_compute_source)
             uniform_bytes = struct.pack(
-                "<I11f",
+                "<I10fI",
                 int(grid_n),
                 float(dx),
                 float(dt),
@@ -862,7 +1055,7 @@ class WgpuComputeEngine:
                 float(mod.parameters.k_skyrme),
                 float(sponge),
                 float(box_size) * 0.5,
-                0.0,
+                int(use_tension_u32),
             )
             buf_uni = self.device.create_buffer_with_data(
                 data=uniform_bytes,
@@ -877,6 +1070,7 @@ class WgpuComputeEngine:
                     {"binding": 1, "resource": {"buffer": buf_a}},
                     {"binding": 2, "resource": {"buffer": buf_vel}},
                     {"binding": 3, "resource": {"buffer": buf_b}},
+                    {"binding": 4, "resource": {"buffer": buf_u}},
                 ],
             )
             bg_ba = self.device.create_bind_group(
@@ -886,6 +1080,7 @@ class WgpuComputeEngine:
                     {"binding": 1, "resource": {"buffer": buf_b}},
                     {"binding": 2, "resource": {"buffer": buf_vel}},
                     {"binding": 3, "resource": {"buffer": buf_a}},
+                    {"binding": 4, "resource": {"buffer": buf_u}},
                 ],
             )
 
@@ -963,7 +1158,7 @@ class WgpuComputeEngine:
                 "elapsed_ms": elapsed_ms,
             }
         finally:
-            for buf_obj in (buf_a, buf_b, buf_vel, buf_uni, buf_init_uni):
+            for buf_obj in (buf_a, buf_b, buf_vel, buf_u, buf_uni, buf_init_uni):
                 if buf_obj is not None:
                     buf_obj.destroy()
 
