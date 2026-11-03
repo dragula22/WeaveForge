@@ -87,6 +87,8 @@ class CompiledMasterAction:
     nu_glsl_expr: str = "1.0"
     nu_wgsl_expr: str = "1.0"
     hamiltonian_glsl_expr: str = "0.0"
+    hamiltonian_wgsl_expr: str = "0.0"
+    gw_speed_ratio_val: float = 1.0
     # Fermat Optical Metric GLSL expressions for Arena 2 Black-Hole Raytracer
     optical_n_glsl_expr: str = "exp(2.0 * U)"
     d_half_n2_dU_glsl_expr: str = "(2.0 * exp(4.0 * U))"
@@ -916,6 +918,7 @@ class _CachedSymbolicTemplate:
     nu_glsl_expr: str
     nu_wgsl_expr: str
     hamiltonian_glsl_expr: str
+    hamiltonian_wgsl_expr: str
     needs_full_hessian: bool
     accel_numpy_fn: Callable
     hamiltonian_numpy_fn: Callable
@@ -1879,6 +1882,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         nu_glsl_expr=_emit_gpu_expr(nu_expr, lang="glsl"),
         nu_wgsl_expr=_emit_gpu_expr(nu_expr, lang="wgsl"),
         hamiltonian_glsl_expr=_emit_gpu_expr(H_sym, lang="glsl"),
+        hamiltonian_wgsl_expr=_emit_gpu_expr(H_sym, lang="wgsl"),
         needs_full_hessian=needs_full_hessian,
         accel_numpy_fn=accel_numpy,
         hamiltonian_numpy_fn=hamiltonian_numpy,
@@ -2222,6 +2226,8 @@ def _evaluate_from_cached_template(tpl: _CachedSymbolicTemplate, mod: PhysicsMod
         nu_glsl_expr=tpl.nu_glsl_expr,
         nu_wgsl_expr=tpl.nu_wgsl_expr,
         hamiltonian_glsl_expr=tpl.hamiltonian_glsl_expr,
+        hamiltonian_wgsl_expr=tpl.hamiltonian_wgsl_expr,
+        gw_speed_ratio_val=gw_ratio,
         optical_n_glsl_expr=tpl.optical_n_glsl,
         d_half_n2_dU_glsl_expr=tpl.d_half_n2_glsl,
         u_photon_sphere=tpl.u_photon,

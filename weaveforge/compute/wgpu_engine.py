@@ -77,6 +77,19 @@ def _enumerate_non_gl_adapters_isolated() -> List[wgpu.GPUAdapter]:
     return list(box.get("adapters", []))  # type: ignore[arg-type]
 
 
+def compute_effective_gw_speed(
+    mod: PhysicsMod,
+    compiled: Optional[CompiledMasterAction] = None,
+) -> float:
+    """Computes the causal weave-tension wave speed `c_gw = |r_gw| * |c_w|` from the compiled Master Action."""
+    r_gw = (
+        abs(float(compiled.gw_speed_ratio_val))
+        if (compiled is not None and math.isfinite(float(getattr(compiled, "gw_speed_ratio_val", 1.0))))
+        else 1.0
+    )
+    return max(r_gw, 0.05) * max(abs(float(mod.parameters.c_w)), 0.05)
+
+
 def compute_safe_symplectic_dt(
     dx: float,
     mod: PhysicsMod,
@@ -88,7 +101,15 @@ def compute_safe_symplectic_dt(
     guarantees symplectic Störmer–Verlet stability even for stiff user Lagrangians (`g6 = 500`, `k_skyrme > 0`).
     """
     cs_sq = abs(compiled.sound_speed_sq) if compiled is not None and math.isfinite(compiled.sound_speed_sq) else 1.0
-    c_eff = max(abs(float(mod.parameters.c_w)), math.sqrt(max(cs_sq, 0.05)), 0.25)
+    c_gw_guard = (
+        compute_effective_gw_speed(mod, compiled)
+        if (
+            abs(float(getattr(mod.parameters, "g_knot", 0.0))) > 1.0e-8
+            and bool(getattr(mod.parameters, "retarded_weave_u", True))
+        )
+        else 0.0
+    )
+    c_eff = max(abs(float(mod.parameters.c_w)), c_gw_guard, math.sqrt(max(cs_sq, 0.05)), 0.25)
 
     rho_ref = max(float(peak_rho_est), 2.8)
     k_sk = abs(float(getattr(mod.parameters, "k_skyrme", 0.0)))
@@ -385,10 +406,10 @@ def build_3d_topological_initial_state(
         phi[..., 1] = np.where(hit_core, 0.0, v0 * (2.0 * wy / den))
         phi[..., 2] = np.where(hit_core, -2.0 * v0, v0 * (((1.0 - w2) / den) - 1.0))
 
-    elif preset in ("two_matter_trefoils", "matter_antimatter_trefoils"):
-        a0 = 0.132 * float(box_size)
-        if preset == "two_matter_trefoils":
-            x_off = 0.163 * float(box_size)
+    elif preset in ("two_matter_trefoils", "matter_antimatter_trefoils", "binary_trefoil_inspiral"):
+        a0 = (0.130 if preset == "binary_trefoil_inspiral" else 0.132) * float(box_size)
+        if preset in ("two_matter_trefoils", "binary_trefoil_inspiral"):
+            x_off = (0.145 if preset == "binary_trefoil_inspiral" else 0.163) * float(box_size)
             p1_re, p1_im, q1_re, q1_im = _eval_trefoil_pq_numpy(Y, Z, X + x_off, a0)
             ct = -0.30901699
             st = 0.95105652
@@ -414,6 +435,11 @@ def build_3d_topological_initial_state(
         phi[..., 0] = v0 * (2.0 * pqbar_re / denom)
         phi[..., 1] = v0 * (2.0 * pqbar_im / denom)
         phi[..., 2] = v0 * (((q2 - p2) / denom) - 1.0)
+        if preset == "binary_trefoil_inspiral":
+            dx_init = float(box_size) / float(grid_n)
+            vy_prof = 0.105 * np.tanh(X / 1.10)
+            dphi_dy = (np.roll(phi[..., :3], -1, axis=1) - np.roll(phi[..., :3], 1, axis=1)) / (2.0 * dx_init)
+            vel[..., :3] = -vy_prof[..., None] * dphi_dy
 
     else:  # packet_smash
         sep = 0.20 * box_size
@@ -438,6 +464,7 @@ _PRESET_NAME_TO_IDX: Dict[str, int] = {
     "packet_smash": 3,
     "two_matter_trefoils": 4,
     "matter_antimatter_trefoils": 5,
+    "binary_trefoil_inspiral": 6,
 }
 
 _INIT_KNOT_WGSL = """
@@ -635,12 +662,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let n_vec = vec3<f32>(2.0 * W_sum.x / den, 2.0 * W_sum.y / den, (1.0 - w2) / den);
             phi = v0 * vec3<f32>(n_vec.x, n_vec.y, n_vec.z - 1.0);
         }
-    } else if (params.preset == 4u || params.preset == 5u) {
-        let a0 = 0.132 * u_box;
+    } else if (params.preset == 4u || params.preset == 5u || params.preset == 6u) {
+        let a0 = select(0.132, 0.130, params.preset == 6u) * u_box;
         var P_tot = vec2<f32>(0.0);
         var Q_tot = vec2<f32>(1.0, 0.0);
-        if (params.preset == 4u) {
-            let x_off = 0.163 * u_box;
+        if (params.preset == 4u || params.preset == 6u) {
+            let x_off = select(0.163, 0.145, params.preset == 6u) * u_box;
             let pq1 = eval_trefoil_pq(vec3<f32>(p.y, p.z, p.x + x_off), a0);
             let yr = -0.30901699 * p.y - 0.95105652 * p.z;
             let zr =  0.95105652 * p.y - 0.30901699 * p.z;
@@ -662,6 +689,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             (dot(Q_tot, Q_tot) - dot(P_tot, P_tot)) / denom
         );
         phi = v0 * vec3<f32>(n_vec.x, n_vec.y, n_vec.z - 1.0);
+        if (params.preset == 6u) {
+            let dx_i = u_box / f32(n);
+            let x_off = 0.145 * u_box;
+            let yp = p.y + dx_i;
+            let ym = p.y - dx_i;
+            let pq1p = eval_trefoil_pq(vec3<f32>(yp, p.z, p.x + x_off), a0);
+            let pq2p = eval_trefoil_pq(vec3<f32>(-0.30901699 * yp - 0.95105652 * p.z, 0.95105652 * yp - 0.30901699 * p.z, p.x - x_off), a0);
+            let Pp = cmul(pq1p.xy, pq2p.zw) + cmul(pq2p.xy, pq1p.zw);
+            let Qp = cmul(pq1p.zw, pq2p.zw);
+            let den_p = max(dot(Pp, Pp) + dot(Qp, Qp), 1e-12);
+            let pqbp = cmul(Pp, cconj(Qp));
+            let phi_yp = v0 * vec3<f32>(2.0 * pqbp.x / den_p, 2.0 * pqbp.y / den_p, ((dot(Qp, Qp) - dot(Pp, Pp)) / den_p) - 1.0);
+
+            let pq1m = eval_trefoil_pq(vec3<f32>(ym, p.z, p.x + x_off), a0);
+            let pq2m = eval_trefoil_pq(vec3<f32>(-0.30901699 * ym - 0.95105652 * p.z, 0.95105652 * ym - 0.30901699 * p.z, p.x - x_off), a0);
+            let Pm = cmul(pq1m.xy, pq2m.zw) + cmul(pq2m.xy, pq1m.zw);
+            let Qm = cmul(pq1m.zw, pq2m.zw);
+            let den_m = max(dot(Pm, Pm) + dot(Qm, Qm), 1e-12);
+            let pqbm = cmul(Pm, cconj(Qm));
+            let phi_ym = v0 * vec3<f32>(2.0 * pqbm.x / den_m, 2.0 * pqbm.y / den_m, ((dot(Qm, Qm) - dot(Pm, Pm)) / den_m) - 1.0);
+
+            let vy_orb = 0.105 * tanh(p.x / 1.10);
+            vel = -vy_orb * ((phi_yp - phi_ym) / (2.0 * dx_i));
+        }
     } else {
         let sep = 0.20 * u_box;
         let w0 = 0.065 * u_box;
@@ -747,6 +798,164 @@ fn main(
         wg_stats[wid] = vec2<f32>(s_max[0], s_sum[0]);
     }
 }
+"""
+
+
+_DEFAULT_HAM_WGSL = (
+    "(0.5 * (dt_phi1*dt_phi1 + dt_phi2*dt_phi2 + dt_phi3*dt_phi3)"
+    " + 0.5 * (c_w*c_w) * ("
+    "dx_phi1*dx_phi1 + dy_phi1*dy_phi1 + dz_phi1*dz_phi1 + "
+    "dx_phi2*dx_phi2 + dy_phi2*dy_phi2 + dz_phi2*dz_phi2 + "
+    "dx_phi3*dx_phi3 + dy_phi3*dy_phi3 + dz_phi3*dz_phi3)"
+    " + 0.5 * (m_eff*m_eff) * (phi1*phi1 + phi2*phi2 + phi3*phi3))"
+)
+
+
+def _build_step_tension_wave_wgsl(ham_wgsl_expr: str) -> str:
+    """
+    Emits a cross-platform WGSL compute shader advancing causal hyperbolic weave tension
+    `d^2 U / dt^2 = c_gw^2 * (nabla^2 U + kappa * rho_{H,0})` with 1st-order spherical
+    Sommerfeld / Bayliss-Turkel non-reflecting boundary conditions `(d_t + c_gw d_r)(r U) = 0`.
+    """
+    expr = ham_wgsl_expr.strip() if ham_wgsl_expr and ham_wgsl_expr.strip() else _DEFAULT_HAM_WGSL
+    return f"""
+struct UWaveParams {{
+    N: u32,
+    dx: f32,
+    dt: f32,
+    half_box: f32,
+    kappa: f32,
+    c_gw: f32,
+    c_w: f32,
+    m_eff: f32,
+    g4: f32,
+    g6: f32,
+    k_skyrme: f32,
+    pad0: f32,
+}};
+
+@group(0) @binding(0) var<uniform> uparams: UWaveParams;
+@group(0) @binding(1) var<storage, read> phi_in: array<f32>;
+@group(0) @binding(2) var<storage, read> vel_in: array<f32>;
+@group(0) @binding(3) var<storage, read> u_in: array<f32>;
+@group(0) @binding(4) var<storage, read_write> ut_io: array<f32>;
+@group(0) @binding(5) var<storage, read_write> u_out: array<f32>;
+
+fn idx_wrap(x: i32, y: i32, z: i32, n: i32) -> u32 {{
+    let xm = (x + n) % n;
+    let ym = (y + n) % n;
+    let zm = (z + n) % n;
+    return u32((zm * n + ym) * n + xm);
+}}
+
+fn idx_clamp(x: i32, y: i32, z: i32, n: i32) -> u32 {{
+    let xc = clamp(x, 0, n - 1);
+    let yc = clamp(y, 0, n - 1);
+    let zc = clamp(z, 0, n - 1);
+    return u32((zc * n + yc) * n + xc);
+}}
+
+fn load_phi(idx: u32) -> vec3<f32> {{
+    let b = idx * 3u;
+    return vec3<f32>(phi_in[b], phi_in[b + 1u], phi_in[b + 2u]);
+}}
+
+fn load_vel(idx: u32) -> vec3<f32> {{
+    let b = idx * 3u;
+    return vec3<f32>(vel_in[b], vel_in[b + 1u], vel_in[b + 2u]);
+}}
+
+fn eval_ham_rest(c: vec3<f32>, v: vec3<f32>, gx: vec3<f32>, gy: vec3<f32>, gz: vec3<f32>) -> f32 {{
+    let U: f32 = 0.0;
+    let c_w: f32 = uparams.c_w;
+    let m_eff: f32 = uparams.m_eff;
+    let g4: f32 = uparams.g4;
+    let g6: f32 = uparams.g6;
+    let k_skyrme: f32 = uparams.k_skyrme;
+    let phi1: f32 = c.x; let phi2: f32 = c.y; let phi3: f32 = c.z;
+    let dt_phi1: f32 = v.x; let dt_phi2: f32 = v.y; let dt_phi3: f32 = v.z;
+    let dx_phi1: f32 = gx.x; let dy_phi1: f32 = gy.x; let dz_phi1: f32 = gz.x;
+    let dx_phi2: f32 = gx.y; let dy_phi2: f32 = gy.y; let dz_phi2: f32 = gz.y;
+    let dx_phi3: f32 = gx.z; let dy_phi3: f32 = gy.z; let dz_phi3: f32 = gz.z;
+    return {expr};
+}}
+
+fn sample_trilinear_u(fc: vec3<f32>, n: i32) -> f32 {{
+    let i0 = vec3<i32>(floor(fc));
+    let t = fc - vec3<f32>(i0);
+    let c000 = u_in[idx_clamp(i0.x,     i0.y,     i0.z,     n)];
+    let c100 = u_in[idx_clamp(i0.x + 1, i0.y,     i0.z,     n)];
+    let c010 = u_in[idx_clamp(i0.x,     i0.y + 1, i0.z,     n)];
+    let c110 = u_in[idx_clamp(i0.x + 1, i0.y + 1, i0.z,     n)];
+    let c001 = u_in[idx_clamp(i0.x,     i0.y,     i0.z + 1, n)];
+    let c101 = u_in[idx_clamp(i0.x + 1, i0.y,     i0.z + 1, n)];
+    let c011 = u_in[idx_clamp(i0.x,     i0.y + 1, i0.z + 1, n)];
+    let c111 = u_in[idx_clamp(i0.x + 1, i0.y + 1, i0.z + 1, n)];
+    let c00 = mix(c000, c100, t.x);
+    let c10 = mix(c010, c110, t.x);
+    let c01 = mix(c001, c101, t.x);
+    let c11 = mix(c011, c111, t.x);
+    return mix(mix(c00, c10, t.y), mix(c01, c11, t.y), t.z);
+}}
+
+@compute @workgroup_size(8, 8, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let n_u = uparams.N;
+    if (gid.x >= n_u || gid.y >= n_u || gid.z >= n_u) {{
+        return;
+    }}
+    let n = i32(n_u);
+    let gx = i32(gid.x);
+    let gy = i32(gid.y);
+    let gz = i32(gid.z);
+    let c_idx = u32((gz * n + gy) * n + gx);
+    let h = uparams.dx;
+    let u_c = u_in[c_idx];
+
+    if (gx == 0 || gx == n - 1 || gy == 0 || gy == n - 1 || gz == 0 || gz == n - 1) {{
+        let p_cell = (vec3<f32>(f32(gx), f32(gy), f32(gz)) + vec3<f32>(0.5)) * h - vec3<f32>(uparams.half_box);
+        let r = max(length(p_cell), h);
+        let r_in = max(r - h, 0.5 * h);
+        let p_in = p_cell * (r_in / r);
+        let fc = clamp(
+            (p_in + vec3<f32>(uparams.half_box)) / h - vec3<f32>(0.5),
+            vec3<f32>(0.0),
+            vec3<f32>(f32(n - 1) - 1e-4)
+        );
+        let u_inner = sample_trilinear_u(fc, n);
+        let u_target = (r_in / r) * u_inner;
+        let alpha = (uparams.c_gw * uparams.dt) / h;
+        let u_next = (u_c + alpha * u_target) / (1.0 + alpha);
+        ut_io[c_idx] = (u_next - u_c) / max(uparams.dt, 1e-12);
+        u_out[c_idx] = u_next;
+        return;
+    }}
+
+    let inv_dx = 1.0 / h;
+    let inv_dx2 = inv_dx * inv_dx;
+    let c = load_phi(c_idx);
+    let v = load_vel(c_idx);
+    let xp = load_phi(idx_wrap(gx + 1, gy, gz, n));
+    let xm = load_phi(idx_wrap(gx - 1, gy, gz, n));
+    let yp = load_phi(idx_wrap(gx, gy + 1, gz, n));
+    let ym = load_phi(idx_wrap(gx, gy - 1, gz, n));
+    let zp = load_phi(idx_wrap(gx, gy, gz + 1, n));
+    let zm = load_phi(idx_wrap(gx, gy, gz - 1, n));
+
+    let hp = eval_ham_rest(c, v, (xp - c) * inv_dx, (yp - c) * inv_dx, (zp - c) * inv_dx);
+    let hm = eval_ham_rest(c, v, (c - xm) * inv_dx, (c - ym) * inv_dx, (c - zm) * inv_dx);
+    let rho_h0 = max(0.5 * (hp + hm), 0.0);
+
+    let sum_nb = u_in[idx_clamp(gx - 1, gy, gz, n)] + u_in[idx_clamp(gx + 1, gy, gz, n)]
+               + u_in[idx_clamp(gx, gy - 1, gz, n)] + u_in[idx_clamp(gx, gy + 1, gz, n)]
+               + u_in[idx_clamp(gx, gy, gz - 1, n)] + u_in[idx_clamp(gx, gy, gz + 1, n)];
+    let lap = (sum_nb - 6.0 * u_c) * inv_dx2;
+    let acc_u = (uparams.c_gw * uparams.c_gw) * (lap + uparams.kappa * rho_h0);
+    let ut_next = ut_io[c_idx] + uparams.dt * acc_u;
+    let u_next = u_c + uparams.dt * ut_next;
+    ut_io[c_idx] = ut_next;
+    u_out[c_idx] = u_next;
+}}
 """
 
 _LIMIT_KEYS_FOR_COMPUTE = (
@@ -908,6 +1117,8 @@ class WgpuComputeEngine:
         readback_full_field: Optional[bool] = None,
         solve_tension_u: bool = False,
         u_field_override: Optional[np.ndarray] = None,
+        zero_init_tension_u: bool = False,
+        readback_tension_u: bool = False,
     ) -> Dict[str, object]:
         """
         Executes `n_steps` of the compiled 3D WGSL PDE kernel on GPU using packed 3-float (`12` B/voxel)
@@ -941,6 +1152,9 @@ class WgpuComputeEngine:
         buf_b: Optional[wgpu.GPUBuffer] = None
         buf_vel: Optional[wgpu.GPUBuffer] = None
         buf_u: Optional[wgpu.GPUBuffer] = None
+        buf_u_b: Optional[wgpu.GPUBuffer] = None
+        buf_ut: Optional[wgpu.GPUBuffer] = None
+        buf_u_uni: Optional[wgpu.GPUBuffer] = None
         buf_uni: Optional[wgpu.GPUBuffer] = None
         buf_init_uni: Optional[wgpu.GPUBuffer] = None
         phi0_3_cpu: Optional[np.ndarray] = None
@@ -998,7 +1212,9 @@ class WgpuComputeEngine:
                 dt = compute_safe_symplectic_dt(dx, mod, compiled=compiled, peak_rho_est=init_peak)
 
             g_knot_val = float(getattr(mod.parameters, "g_knot", 0.0))
+            retarded_active = False
             use_tension_u32 = 0
+            nbytes_u = total_vox * 4
             if u_field_override is not None:
                 u_arr_32 = np.ascontiguousarray(u_field_override, dtype=np.float32)
                 if u_arr_32.shape != (grid_n, grid_n, grid_n):
@@ -1006,35 +1222,48 @@ class WgpuComputeEngine:
                 buf_u = self.device.create_buffer_with_data(data=u_arr_32.tobytes(), usage=usage_storage)
                 use_tension_u32 = 1
             elif solve_tension_u and abs(g_knot_val) > 1.0e-12 and grid_n <= 128:
-                if phi0_3_cpu is None or vel0_3_cpu is None:
-                    raw_p0 = self.device.queue.read_buffer(buf_a, size=nbytes_vec3)
-                    raw_v0 = self.device.queue.read_buffer(buf_vel, size=nbytes_vec3)
-                    phi0_3_cpu = np.frombuffer(raw_p0, dtype=np.float32).reshape((grid_n, grid_n, grid_n, 3))
-                    vel0_3_cpu = np.frombuffer(raw_v0, dtype=np.float32).reshape((grid_n, grid_n, grid_n, 3))
-                p_c = np.moveaxis(phi0_3_cpu, -1, 0)
-                v_c = np.moveaxis(vel0_3_cpu, -1, 0)
-                grad_c = np.stack(
-                    [
-                        (np.roll(p_c, -1, axis=3) - np.roll(p_c, 1, axis=3)) / (2.0 * dx),
-                        (np.roll(p_c, -1, axis=2) - np.roll(p_c, 1, axis=2)) / (2.0 * dx),
-                        (np.roll(p_c, -1, axis=1) - np.roll(p_c, 1, axis=1)) / (2.0 * dx),
-                    ],
-                    axis=1,
-                )
-                assert compiled.hamiltonian_numpy_fn is not None
-                rho_h0 = compiled.hamiltonian_numpy_fn(
-                    p_c,
-                    v_c,
-                    grad_c,
-                    float(mod.parameters.c_w),
-                    float(mod.parameters.m_eff),
-                    float(mod.parameters.g4),
-                    float(mod.parameters.g6),
-                    float(mod.parameters.k_skyrme),
-                )
-                u_solved = solve_3d_weave_tension_u_cpu(rho_h0, box_size=box_size, g_knot=g_knot_val)
-                buf_u = self.device.create_buffer_with_data(data=u_solved.tobytes(), usage=usage_storage)
+                if zero_init_tension_u:
+                    buf_u = self.device.create_buffer_with_data(
+                        data=np.zeros(total_vox, dtype=np.float32).tobytes(),
+                        usage=usage_storage,
+                    )
+                else:
+                    if phi0_3_cpu is None or vel0_3_cpu is None:
+                        raw_p0 = self.device.queue.read_buffer(buf_a, size=nbytes_vec3)
+                        raw_v0 = self.device.queue.read_buffer(buf_vel, size=nbytes_vec3)
+                        phi0_3_cpu = np.frombuffer(raw_p0, dtype=np.float32).reshape((grid_n, grid_n, grid_n, 3))
+                        vel0_3_cpu = np.frombuffer(raw_v0, dtype=np.float32).reshape((grid_n, grid_n, grid_n, 3))
+                    p_c = np.moveaxis(phi0_3_cpu, -1, 0)
+                    v_c = np.moveaxis(vel0_3_cpu, -1, 0)
+                    grad_c = np.stack(
+                        [
+                            (np.roll(p_c, -1, axis=3) - np.roll(p_c, 1, axis=3)) / (2.0 * dx),
+                            (np.roll(p_c, -1, axis=2) - np.roll(p_c, 1, axis=2)) / (2.0 * dx),
+                            (np.roll(p_c, -1, axis=1) - np.roll(p_c, 1, axis=1)) / (2.0 * dx),
+                        ],
+                        axis=1,
+                    )
+                    assert compiled.hamiltonian_numpy_fn is not None
+                    rho_h0 = compiled.hamiltonian_numpy_fn(
+                        p_c,
+                        v_c,
+                        grad_c,
+                        float(mod.parameters.c_w),
+                        float(mod.parameters.m_eff),
+                        float(mod.parameters.g4),
+                        float(mod.parameters.g6),
+                        float(mod.parameters.k_skyrme),
+                    )
+                    u_solved = solve_3d_weave_tension_u_cpu(rho_h0, box_size=box_size, g_knot=g_knot_val)
+                    buf_u = self.device.create_buffer_with_data(data=u_solved.tobytes(), usage=usage_storage)
                 use_tension_u32 = 1
+                if bool(getattr(mod.parameters, "retarded_weave_u", True)) and n_steps > 0:
+                    retarded_active = True
+                    buf_u_b = self.device.create_buffer(size=nbytes_u, usage=usage_storage)
+                    buf_ut = self.device.create_buffer_with_data(
+                        data=np.zeros(total_vox, dtype=np.float32).tobytes(),
+                        usage=usage_storage,
+                    )
             else:
                 buf_u = self.device.create_buffer_with_data(
                     data=np.zeros(4, dtype=np.float32).tobytes(),
@@ -1062,7 +1291,60 @@ class WgpuComputeEngine:
                 usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
             )
 
+            u_wave_pipe = None
+            bg_u_ab = None
+            bg_u_ba = None
+            if retarded_active:
+                assert buf_u_b is not None and buf_ut is not None
+                u_wave_src = _build_step_tension_wave_wgsl(getattr(compiled, "hamiltonian_wgsl_expr", ""))
+                u_wave_pipe = self._get_pipeline(u_wave_src)
+                c_gw_val = compute_effective_gw_speed(mod, compiled)
+                u_uni_bytes = struct.pack(
+                    "<I11f",
+                    int(grid_n),
+                    float(dx),
+                    float(dt),
+                    float(box_size) * 0.5,
+                    float(WEAVE_KAPPA_SCALE * g_knot_val),
+                    float(c_gw_val),
+                    float(mod.parameters.c_w),
+                    float(mod.parameters.m_eff),
+                    float(mod.parameters.g4),
+                    float(mod.parameters.g6),
+                    float(mod.parameters.k_skyrme),
+                    0.0,
+                )
+                buf_u_uni = self.device.create_buffer_with_data(
+                    data=u_uni_bytes,
+                    usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+                )
+                u_layout = u_wave_pipe.get_bind_group_layout(0)
+                bg_u_ab = self.device.create_bind_group(
+                    layout=u_layout,
+                    entries=[
+                        {"binding": 0, "resource": {"buffer": buf_u_uni}},
+                        {"binding": 1, "resource": {"buffer": buf_a}},
+                        {"binding": 2, "resource": {"buffer": buf_vel}},
+                        {"binding": 3, "resource": {"buffer": buf_u}},
+                        {"binding": 4, "resource": {"buffer": buf_ut}},
+                        {"binding": 5, "resource": {"buffer": buf_u_b}},
+                    ],
+                )
+                bg_u_ba = self.device.create_bind_group(
+                    layout=u_layout,
+                    entries=[
+                        {"binding": 0, "resource": {"buffer": buf_u_uni}},
+                        {"binding": 1, "resource": {"buffer": buf_b}},
+                        {"binding": 2, "resource": {"buffer": buf_vel}},
+                        {"binding": 3, "resource": {"buffer": buf_u_b}},
+                        {"binding": 4, "resource": {"buffer": buf_ut}},
+                        {"binding": 5, "resource": {"buffer": buf_u}},
+                    ],
+                )
+
             bind_layout = pipe.get_bind_group_layout(0)
+            u_for_ab = buf_u_b if (retarded_active and buf_u_b is not None) else buf_u
+            u_for_ba = buf_u
             bg_ab = self.device.create_bind_group(
                 layout=bind_layout,
                 entries=[
@@ -1070,7 +1352,7 @@ class WgpuComputeEngine:
                     {"binding": 1, "resource": {"buffer": buf_a}},
                     {"binding": 2, "resource": {"buffer": buf_vel}},
                     {"binding": 3, "resource": {"buffer": buf_b}},
-                    {"binding": 4, "resource": {"buffer": buf_u}},
+                    {"binding": 4, "resource": {"buffer": u_for_ab}},
                 ],
             )
             bg_ba = self.device.create_bind_group(
@@ -1080,7 +1362,7 @@ class WgpuComputeEngine:
                     {"binding": 1, "resource": {"buffer": buf_b}},
                     {"binding": 2, "resource": {"buffer": buf_vel}},
                     {"binding": 3, "resource": {"buffer": buf_a}},
-                    {"binding": 4, "resource": {"buffer": buf_u}},
+                    {"binding": 4, "resource": {"buffer": u_for_ba}},
                 ],
             )
 
@@ -1088,15 +1370,36 @@ class WgpuComputeEngine:
             if n_steps > 0:
                 encoder = self.device.create_command_encoder()
                 cpass = encoder.begin_compute_pass()
-                cpass.set_pipeline(pipe)
-                for _ in range(n_steps):
-                    cpass.set_bind_group(0, bg_ab if cur_in_a else bg_ba)
-                    cpass.dispatch_workgroups(wg_xy, wg_xy, wg_z)
-                    cur_in_a = not cur_in_a
+                if retarded_active and u_wave_pipe is not None:
+                    for _ in range(n_steps):
+                        cpass.set_pipeline(u_wave_pipe)
+                        cpass.set_bind_group(0, bg_u_ab if cur_in_a else bg_u_ba)
+                        cpass.dispatch_workgroups(wg_xy, wg_xy, wg_z)
+                        cpass.set_pipeline(pipe)
+                        cpass.set_bind_group(0, bg_ab if cur_in_a else bg_ba)
+                        cpass.dispatch_workgroups(wg_xy, wg_xy, wg_z)
+                        cur_in_a = not cur_in_a
+                else:
+                    cpass.set_pipeline(pipe)
+                    for _ in range(n_steps):
+                        cpass.set_bind_group(0, bg_ab if cur_in_a else bg_ba)
+                        cpass.dispatch_workgroups(wg_xy, wg_xy, wg_z)
+                        cur_in_a = not cur_in_a
                 cpass.end()
                 self.device.queue.submit([encoder.finish()])
 
             final_buf = buf_a if cur_in_a else buf_b
+            final_u_buf = (buf_u if cur_in_a else buf_u_b) if retarded_active else buf_u
+            u_final_arr: Optional[np.ndarray] = None
+            udot_final_arr: Optional[np.ndarray] = None
+            if readback_tension_u and use_tension_u32 == 1 and final_u_buf is not None:
+                raw_u = self.device.queue.read_buffer(final_u_buf, size=nbytes_u)
+                u_final_arr = np.frombuffer(raw_u, dtype=np.float32).reshape((grid_n, grid_n, grid_n)).copy()
+                if buf_ut is not None:
+                    raw_ut = self.device.queue.read_buffer(buf_ut, size=nbytes_u)
+                    udot_final_arr = np.frombuffer(raw_ut, dtype=np.float32).reshape((grid_n, grid_n, grid_n)).copy()
+                else:
+                    udot_final_arr = np.zeros((grid_n, grid_n, grid_n), dtype=np.float32)
 
             if readback_full_field:
                 phi_final: Optional[np.ndarray] = np.empty((grid_n, grid_n, grid_n, 4), dtype=np.float32)
@@ -1154,11 +1457,13 @@ class WgpuComputeEngine:
                 "final_l2_norm": final_l2,
                 "phi_final": phi_final,
                 "vel_final": vel_final,
+                "u_final": u_final_arr,
+                "udot_final": udot_final_arr,
                 "mid_slice_xy": mid_slice_xy,
                 "elapsed_ms": elapsed_ms,
             }
         finally:
-            for buf_obj in (buf_a, buf_b, buf_vel, buf_u, buf_uni, buf_init_uni):
+            for buf_obj in (buf_a, buf_b, buf_vel, buf_u, buf_u_b, buf_ut, buf_u_uni, buf_uni, buf_init_uni):
                 if buf_obj is not None:
                     buf_obj.destroy()
 

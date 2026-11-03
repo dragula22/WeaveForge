@@ -129,6 +129,7 @@ _COUPLING_PARAM_FIELDS: Tuple[str, ...] = (
     "g6",
     "k_skyrme",
     "g_knot",
+    "retarded_weave_u",
     "a0_si",
     "has_cdm_halo",
     "cdm_halo_scale",
@@ -500,6 +501,7 @@ class WeaveForgeStudioApp:
                 "slice_x": float(self.arena1.slice_x),
                 "damping": float(self.arena1.damping),
                 "color_mode": int(self.arena1.color_mode),
+                "show_gw_ripples": bool(self.arena1.show_gw_ripples),
             },
             1: {
                 "submode": int(self.arena2.submode),
@@ -1001,7 +1003,7 @@ class WeaveForgeStudioApp:
         """Returns `True` if `working_mod.parameters.<param_name>` differs from `_pristine_mod`."""
         cur = getattr(self.working_mod.parameters, param_name)
         base = getattr(self._pristine_mod.parameters, param_name)
-        if isinstance(base, bool) or param_name == "has_cdm_halo":
+        if isinstance(base, bool) or param_name in ("has_cdm_halo", "retarded_weave_u"):
             return bool(cur) != bool(base)
         if param_name == "a0_si":
             return not math.isclose(float(cur) * 1.0e10, float(base) * 1.0e10, rel_tol=1e-4, abs_tol=1e-4)
@@ -1031,7 +1033,7 @@ class WeaveForgeStudioApp:
         setattr(self.working_mod.parameters, param_name, default_val)
         if param_name == "has_cdm_halo":
             self.working_mod.parameters.cdm_halo_scale = float(self._pristine_mod.parameters.cdm_halo_scale)
-        if param_name in ("c_w", "m_eff", "g4", "g6", "k_skyrme", "g_knot", "a0_si"):
+        if param_name in ("c_w", "m_eff", "g4", "g6", "k_skyrme", "g_knot", "retarded_weave_u", "a0_si"):
             self._recompile_working_mod()
         else:
             self._refresh_crucible_fast()
@@ -1077,7 +1079,7 @@ class WeaveForgeStudioApp:
     def reset_active_camera(self) -> None:
         """Resets the active 3D arena camera to its canonical orbit pose."""
         idx = int(np.clip(self._active_arena, 0, 3))
-        if idx == 0 and int(getattr(self.arena1, "preset_idx", 0)) in (4, 5):
+        if idx == 0 and int(getattr(self.arena1, "preset_idx", 0)) in (4, 5, 6):
             self.cameras[0].reset(yaw=0.34, pitch=0.32, distance=19.2)
         elif idx == 1:
             sub = int(getattr(self.arena2, "submode", 0))
@@ -2053,7 +2055,7 @@ class WeaveForgeStudioApp:
                     if ch:
                         self._clear_replay_backup(0)
                         self.arena1.reset_field(new_p)
-                        if new_p in (4, 5):
+                        if new_p in (4, 5, 6):
                             self.cameras[0].reset(yaw=0.34, pitch=0.32, distance=19.2)
                         else:
                             self.cameras[0].reset(*_DEFAULT_CAMERA_POSES[0])
@@ -2083,6 +2085,9 @@ class WeaveForgeStudioApp:
                     _, self.arena1.density_gain = imgui.slider_float("Glow Gain", self.arena1.density_gain, 0.6, 6.0)
                     _, self.arena1.slice_x = imgui.slider_float("X Cutaway", self.arena1.slice_x, -0.8, 1.0)
                     _, self.arena1.damping = imgui.slider_float("Cooling", self.arena1.damping, 0.0, 0.8)
+                    _, self.arena1.show_gw_ripples = imgui.checkbox(
+                        "3D Gravitational-Wave Ripples (dU/dt)", bool(self.arena1.show_gw_ripples)
+                    )
                     imgui.push_text_wrap_pos(0.0)
                     imgui.text_colored(
                         COL_PASS if self.arena1.retention_ratio > 0.70 else COL_WARN,
@@ -2299,6 +2304,32 @@ class WeaveForgeStudioApp:
                 else:
                     ch6 = False
                 ch_gk, _ = self._draw_coupling_slider_float("Weave Gravity G_knot", "g_knot", 0.0, 2.5)
+                ch_ret, new_ret_u = imgui.checkbox(
+                    "Retarded Weave Waves (Box U at c_w)", bool(getattr(p, "retarded_weave_u", True))
+                )
+                if ch_ret:
+                    p.retarded_weave_u = bool(new_ret_u)
+                if self.is_parameter_modified("retarded_weave_u"):
+                    imgui.same_line()
+                    imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(0.68, 0.42, 0.08, 0.95))
+                    imgui.push_style_color(imgui.Col_.button_hovered, imgui.ImVec4(0.84, 0.56, 0.14, 1.00))
+                    imgui.push_style_color(imgui.Col_.button_active, imgui.ImVec4(0.94, 0.66, 0.20, 1.00))
+                    if imgui.small_button("R##rst_retarded_weave_u"):
+                        self.reset_single_parameter("retarded_weave_u")
+                        ch_ret = False
+                    rmin_r = imgui.get_item_rect_min()
+                    rmax_r = imgui.get_item_rect_max()
+                    self._last_slider_reset_rects["retarded_weave_u"] = (
+                        float(rmin_r.x),
+                        float(rmin_r.y),
+                        float(rmax_r.x),
+                        float(rmax_r.y),
+                    )
+                    imgui.pop_style_color(3)
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip(
+                            f"Reset to default ({self._pristine_mod.parameters.retarded_weave_u})"
+                        )
                 ch7, _ = self._draw_coupling_slider_float(
                     "Pinned Pleat Coupling", "pinned_pleat_coupling", 0.0, 1.5
                 )
@@ -2309,10 +2340,23 @@ class WeaveForgeStudioApp:
                 ch10, _ = self._draw_coupling_slider_float("Dark Energy wa", "wa_de", -1.5, 1.0)
 
                 changed_any = (
-                    ch1 or ch_m or ch2 or ch3 or ch_ks or ch_gk or ch4 or ch5 or ch6 or ch7 or ch8 or ch9 or ch10
+                    ch1
+                    or ch_m
+                    or ch2
+                    or ch3
+                    or ch_ks
+                    or ch_gk
+                    or ch_ret
+                    or ch4
+                    or ch5
+                    or ch6
+                    or ch7
+                    or ch8
+                    or ch9
+                    or ch10
                 )
                 if changed_any:
-                    if ch1 or ch_m or ch2 or ch3 or ch_ks or ch_gk or ch4:
+                    if ch1 or ch_m or ch2 or ch3 or ch_ks or ch_gk or ch_ret or ch4:
                         self._recompile_working_mod()
                     else:
                         self._refresh_crucible_fast()

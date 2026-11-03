@@ -573,7 +573,7 @@ def test_arena1_live_two_knot_presets_scattering_and_annihilation() -> None:
 
         a1.update_compiled_action(tnap_comp, mod=tnap_grav)
         a1.reset_field(5)
-        a1.step(tnap_grav, tnap_comp, n_substeps=28500)
+        a1.step(tnap_grav, tnap_comp, n_substeps=30500)
         phi5_grav, _ = _readback_arena1_phi_vel_zyx3(a1)
         _, cv5_grav = _sep_and_core(phi5_grav, a1.box_size)
         a1._sample_diagnostics()

@@ -22,6 +22,7 @@ m_eff = 2.50
 g4 = 3.20
 g6 = 3.10
 k_skyrme = 0.0
+retarded_weave_u = false      # Non-relativistic elliptic action-at-a-distance (nabla^2 U = -kappa * rho_H)
 a0_si = 1.20e-10
 has_cdm_halo = false
 cdm_halo_scale = 0.0

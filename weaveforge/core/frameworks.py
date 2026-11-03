@@ -60,6 +60,7 @@ class ModParameters:
     g6: float = 3.10
     k_skyrme: float = 0.0
     g_knot: float = 0.0
+    retarded_weave_u: bool = True
     a0_si: float = 1.202712e-10
     has_cdm_halo: bool = False
     cdm_halo_scale: float = 0.0
@@ -129,6 +130,7 @@ class PhysicsMod:
             f"g6 = {float(p.g6):.6g}",
             f"k_skyrme = {float(p.k_skyrme):.6g}",
             f"g_knot = {float(p.g_knot):.6g}",
+            f"retarded_weave_u = {'true' if p.retarded_weave_u else 'false'}",
             f"a0_si = {float(p.a0_si):.6e}",
             f"has_cdm_halo = {'true' if p.has_cdm_halo else 'false'}",
             f"cdm_halo_scale = {float(p.cdm_halo_scale):.6g}",
@@ -167,6 +169,7 @@ class PhysicsMod:
             g6=float(par_d.get("g6", 0.0)),
             k_skyrme=float(par_d.get("k_skyrme", 0.0)),
             g_knot=float(par_d.get("g_knot", 0.0)),
+            retarded_weave_u=bool(par_d.get("retarded_weave_u", True)),
             a0_si=float(par_d.get("a0_si", 1.202712e-10)),
             has_cdm_halo=bool(par_d.get("has_cdm_halo", False)),
             cdm_halo_scale=float(par_d.get("cdm_halo_scale", 0.0)),

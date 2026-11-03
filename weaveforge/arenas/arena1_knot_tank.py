@@ -26,7 +26,11 @@ import moderngl
 import numpy as np
 from OpenGL import GL
 
-from weaveforge.compute.wgpu_engine import WEAVE_KAPPA_SCALE, compute_safe_symplectic_dt
+from weaveforge.compute.wgpu_engine import (
+    WEAVE_KAPPA_SCALE,
+    compute_effective_gw_speed,
+    compute_safe_symplectic_dt,
+)
 from weaveforge.core.camera import Camera3D
 from weaveforge.core.frameworks import PhysicsMod
 from weaveforge.core.symbolic_compiler import CompiledMasterAction
@@ -91,7 +95,7 @@ def _unbind_arena1_gl_slots() -> None:
         for slot in (0, 1, 2, 3):
             GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, slot, 0)
         GL.glBindImageTexture(0, 0, 0, GL.GL_TRUE, 0, GL.GL_WRITE_ONLY, GL.GL_RGBA16F)
-        GL.glBindImageTexture(1, 0, 0, GL.GL_TRUE, 0, GL.GL_WRITE_ONLY, GL.GL_R32F)
+        GL.glBindImageTexture(1, 0, 0, GL.GL_TRUE, 0, GL.GL_WRITE_ONLY, GL.GL_RG32F)
         GL.glActiveTexture(GL.GL_TEXTURE1)
         GL.glBindTexture(GL.GL_TEXTURE_3D, 0)
         GL.glActiveTexture(GL.GL_TEXTURE0)
@@ -109,6 +113,7 @@ KNOT_PRESETS = [
     ("packet_smash", "3D Wave-Packet Collider (Channel A/B)"),
     ("two_matter_trefoils", "Two Matter Trefoils (+7 / +7): Emergent 1/r^2 Gravity & Scattering"),
     ("matter_antimatter_trefoils", "Matter + Antimatter Trefoils (+7 / -7): Gravitational Fall & Annihilation"),
+    ("binary_trefoil_inspiral", "Binary Trefoil Inspiral (+7 / +7): Orbiting Quadrupole GW Ripples"),
 ]
 
 KNOT_COLOR_MODES = [
@@ -303,13 +308,13 @@ void main() {
             phi = v0 * vec3(n_vec.x, n_vec.y, n_vec.z - 1.0);
         }
     }
-    else if (u_preset == 4 || u_preset == 5) {
-        // Projective Coaxial Two-Knot Superposition at rest (Preset 4: +7/+7 Q_H=+14; Preset 5: +7/-7 Q_H=0!)
-        float a0 = 0.132 * u_box;
+    else if (u_preset == 4 || u_preset == 5 || u_preset == 6) {
+        // Projective Coaxial Two-Knot Superposition (Preset 4/6: +7/+7 Q_H=+14; Preset 5: +7/-7 Q_H=0!)
+        float a0 = ((u_preset == 6) ? 0.130 : 0.132) * u_box;
         vec2 P_tot;
         vec2 Q_tot;
-        if (u_preset == 4) {
-            float x_off = 0.163 * u_box;
+        if (u_preset == 4 || u_preset == 6) {
+            float x_off = ((u_preset == 6) ? 0.145 : 0.163) * u_box;
             vec4 pq1 = eval_trefoil_pq(vec3(p.y, p.z, p.x + x_off), a0);
             float yr = -0.30901699 * p.y - 0.95105652 * p.z;
             float zr =  0.95105652 * p.y - 0.30901699 * p.z;
@@ -367,6 +372,41 @@ void main() {
     if (idx < u_num_floats) {
         buf_out[idx] = 0.0;
     }
+}
+"""
+
+_BOOST_ORBITAL_GLSL = """#version 430
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(std430, binding = 0) readonly buffer PhiBuf { float phi_in[]; };
+layout(std430, binding = 1) writeonly buffer VelBuf { float vel_out[]; };
+
+uniform int u_N;
+uniform float u_box;
+uniform float u_v_orb;
+
+vec3 load_p(int x, int y, int z, int N) {
+    int xm = (x + N) % N;
+    int ym = (y + N) % N;
+    int zm = (z + N) % N;
+    int b = ((zm * N + ym) * N + xm) * 3;
+    return vec3(phi_in[b], phi_in[b + 1], phi_in[b + 2]);
+}
+
+void main() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    if (gid.x >= u_N || gid.y >= u_N || gid.z >= u_N) return;
+    int N = u_N;
+    float dx = u_box / float(N);
+    vec3 p_pos = ((vec3(gid) + 0.5) / float(N) - 0.5) * u_box;
+    vec3 yp = load_p(gid.x, gid.y + 1, gid.z, N);
+    vec3 ym = load_p(gid.x, gid.y - 1, gid.z, N);
+    float vy = u_v_orb * tanh(p_pos.x / 1.10);
+    vec3 v = -vy * ((yp - ym) / (2.0 * dx));
+    int b = ((gid.z * N + gid.y) * N + gid.x) * 3;
+    vel_out[b]     = v.x;
+    vel_out[b + 1] = v.y;
+    vel_out[b + 2] = v.z;
 }
 """
 
@@ -739,21 +779,107 @@ void main() {
 """
 
 
+_U_WAVE_STEP_GLSL = """#version 430
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(std430, binding = 0) readonly buffer RhsBuf   { float rhs_in[]; };
+layout(std430, binding = 1) readonly buffer UInBuf   { float u_in[]; };
+layout(std430, binding = 2) buffer UTIOBuf           { float ut_io[]; };
+layout(std430, binding = 3) writeonly buffer UOutBuf { float u_out[]; };
+
+uniform int u_M;
+uniform float u_half_box;
+uniform float u_dt;
+uniform float u_c_gw;
+
+int cidx_clamp(int x, int y, int z, int M) {
+    int xc = clamp(x, 0, M - 1);
+    int yc = clamp(y, 0, M - 1);
+    int zc = clamp(z, 0, M - 1);
+    return (zc * M + yc) * M + xc;
+}
+
+float sample_trilinear_u(vec3 fc, int M) {
+    ivec3 i0 = ivec3(floor(fc));
+    vec3 t = fc - vec3(i0);
+    float c000 = u_in[cidx_clamp(i0.x,     i0.y,     i0.z,     M)];
+    float c100 = u_in[cidx_clamp(i0.x + 1, i0.y,     i0.z,     M)];
+    float c010 = u_in[cidx_clamp(i0.x,     i0.y + 1, i0.z,     M)];
+    float c110 = u_in[cidx_clamp(i0.x + 1, i0.y + 1, i0.z,     M)];
+    float c001 = u_in[cidx_clamp(i0.x,     i0.y,     i0.z + 1, M)];
+    float c101 = u_in[cidx_clamp(i0.x + 1, i0.y,     i0.z + 1, M)];
+    float c011 = u_in[cidx_clamp(i0.x,     i0.y + 1, i0.z + 1, M)];
+    float c111 = u_in[cidx_clamp(i0.x + 1, i0.y + 1, i0.z + 1, M)];
+    float c00 = mix(c000, c100, t.x);
+    float c10 = mix(c010, c110, t.x);
+    float c01 = mix(c001, c101, t.x);
+    float c11 = mix(c011, c111, t.x);
+    return mix(mix(c00, c10, t.y), mix(c01, c11, t.y), t.z);
+}
+
+void main() {
+    ivec3 g = ivec3(gl_GlobalInvocationID);
+    if (g.x >= u_M || g.y >= u_M || g.z >= u_M) return;
+
+    int M = u_M;
+    int id = (g.z * M + g.y) * M + g.x;
+    float h = (2.0 * u_half_box) / float(M);
+    float u_c = u_in[id];
+
+    // 1st-order spherical Bayliss-Turkel / Sommerfeld outflow (d_t + c_gw d_r)(r * U) = 0:
+    // Exact zero-drift annihilator for static C / r monopoles AND non-reflecting for outgoing GWs!
+    if (g.x == 0 || g.x == M - 1 || g.y == 0 || g.y == M - 1 || g.z == 0 || g.z == M - 1) {
+        vec3 p_cell = (vec3(g) + 0.5) * h - vec3(u_half_box);
+        float r = max(length(p_cell), h);
+        float r_in = max(r - h, 0.5 * h);
+        vec3 p_in = p_cell * (r_in / r);
+        vec3 fc = clamp(
+            (p_in + vec3(u_half_box)) / h - vec3(0.5),
+            vec3(0.0),
+            vec3(float(M - 1) - 1e-4)
+        );
+        float u_inner = sample_trilinear_u(fc, M);
+        float u_target = (r_in / r) * u_inner;
+        float alpha = (u_c_gw * u_dt) / h;
+        float u_next = (u_c + alpha * u_target) / (1.0 + alpha);
+        ut_io[id] = (u_next - u_c) / max(u_dt, 1e-12);
+        u_out[id] = u_next;
+        return;
+    }
+
+    float inv_h2 = 1.0 / (h * h);
+    float sum_nb = u_in[cidx_clamp(g.x - 1, g.y, g.z, M)] + u_in[cidx_clamp(g.x + 1, g.y, g.z, M)]
+                 + u_in[cidx_clamp(g.x, g.y - 1, g.z, M)] + u_in[cidx_clamp(g.x, g.y + 1, g.z, M)]
+                 + u_in[cidx_clamp(g.x, g.y, g.z - 1, M)] + u_in[cidx_clamp(g.x, g.y, g.z + 1, M)];
+    float lap = (sum_nb - 6.0 * u_c) * inv_h2;
+    // rhs_in[id] = -kappa * rho_{H,0} => (lap - rhs_in[id]) = nabla^2 U + kappa * rho_{H,0}
+    float acc_u = (u_c_gw * u_c_gw) * (lap - rhs_in[id]);
+    float ut_next = ut_io[id] + u_dt * acc_u;
+    float u_next = u_c + u_dt * ut_next;
+    ut_io[id] = ut_next;
+    u_out[id] = u_next;
+}
+"""
+
+
 _PACK_TENSION_TEX_GLSL = """#version 430
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
-layout(std430, binding = 0) readonly buffer UBuf { float u_in[]; };
-layout(r32f, binding = 1) writeonly uniform image3D u_tension_img;
+layout(std430, binding = 0) readonly buffer UBuf  { float u_in[]; };
+layout(std430, binding = 2) readonly buffer UTBuf { float ut_in[]; };
+layout(rg32f, binding = 1) writeonly uniform image3D u_tension_img;
 
 uniform int u_M;
 uniform int u_zero_mode;
+uniform int u_has_ut;
 
 void main() {
     ivec3 g = ivec3(gl_GlobalInvocationID);
     if (g.x >= u_M || g.y >= u_M || g.z >= u_M) return;
     int id = (g.z * u_M + g.y) * u_M + g.x;
     float val = (u_zero_mode == 1) ? 0.0 : clamp(u_in[id], -0.35, 0.75);
-    imageStore(u_tension_img, g, vec4(val, 0.0, 0.0, 0.0));
+    float ut_val = (u_zero_mode == 1 || u_has_ut == 0) ? 0.0 : ut_in[id];
+    imageStore(u_tension_img, g, vec4(val, ut_val, 0.0, 0.0));
 }
 """
 
@@ -779,6 +905,10 @@ uniform float g4;
 uniform float g6;
 uniform float k_skyrme;
 uniform int u_use_tension;
+uniform int u_retarded_mode;
+uniform float u_inv_kappa;
+uniform float u_inv_cgw2;
+uniform float u_box_size;
 uniform sampler3D u_tension_tex;
 
 shared float s_max_rho[256];
@@ -846,16 +976,30 @@ void main() {{
             );
         }} else {{
             vec3 uvw = (vec3(sgid) + 0.5) / float(N);
-            float u_c = clamp(texture(u_tension_tex, uvw).r, -0.35, 0.75);
+            vec2 ut_tex = texture(u_tension_tex, uvw).rg;
+            float u_c = clamp(ut_tex.r, -0.35, 0.75);
             float H_mat = 0.5 * (
                 eval_ham_density(c, v, gx_p, gy_p, gz_p, u_c)
                 + eval_ham_density(c, v, gx_m, gy_m, gz_m, u_c)
             );
-            float H_rest = 0.5 * (
-                eval_ham_density(c, v, gx_p, gy_p, gz_p, 0.0)
-                + eval_ham_density(c, v, gx_m, gy_m, gz_m, 0.0)
-            );
-            H_val = H_mat + 0.5 * u_c * H_rest;
+            if (u_retarded_mode == 1 && u_inv_kappa > 0.0) {{
+                float eps_u = 1.0 / 64.0;
+                float inv_2hu = 32.0 / max(u_box_size, 1.0);
+                vec3 grad_u = vec3(
+                    texture(u_tension_tex, uvw + vec3(eps_u, 0.0, 0.0)).r - texture(u_tension_tex, uvw - vec3(eps_u, 0.0, 0.0)).r,
+                    texture(u_tension_tex, uvw + vec3(0.0, eps_u, 0.0)).r - texture(u_tension_tex, uvw - vec3(0.0, eps_u, 0.0)).r,
+                    texture(u_tension_tex, uvw + vec3(0.0, 0.0, eps_u)).r - texture(u_tension_tex, uvw - vec3(0.0, 0.0, eps_u)).r
+                ) * inv_2hu;
+                float u_dot = ut_tex.g;
+                float H_wave = 0.5 * u_inv_kappa * ((u_dot * u_dot) * u_inv_cgw2 + dot(grad_u, grad_u));
+                H_val = H_mat + H_wave;
+            }} else {{
+                float H_rest = 0.5 * (
+                    eval_ham_density(c, v, gx_p, gy_p, gz_p, 0.0)
+                    + eval_ham_density(c, v, gx_m, gy_m, gz_m, 0.0)
+                );
+                H_val = H_mat + 0.5 * u_c * H_rest;
+            }}
         }}
         loc_max = rho;
         loc_rho = rho;
@@ -898,6 +1042,7 @@ in vec2 v_uv;
 out vec4 frag_color;
 
 uniform sampler3D u_vol_tex;
+uniform sampler3D u_tension_tex;
 uniform vec3 u_cam_eye;
 uniform vec3 u_cam_fwd;
 uniform vec3 u_cam_right;
@@ -910,6 +1055,8 @@ uniform float u_slice_x;       // < 0.99 slices open the 3D knot interior!
 uniform int u_color_mode;      // 0 = Sapphire-Gold Phase Weave, 1 = Rainbow Phase, 2 = Thermal Energy Density
 uniform float u_time;
 uniform float u_rho_floor;
+uniform int u_show_gw_ripples;
+uniform float u_gw_vis_gain;
 
 vec3 aces_tonemap(vec3 x) {
     const float a = 2.51;
@@ -1067,6 +1214,23 @@ void main() {
                 float alpha = 1.0 - exp(-sigma * dt_ray);
                 accum_rgb += transmittance * alpha * lit_c;
                 transmittance *= (1.0 - alpha);
+            } else if (u_show_gw_ripples == 1) {
+                float u_dot = texture(u_tension_tex, uvw).g * u_gw_vis_gain;
+                float abs_ud = abs(u_dot);
+                if (abs_ud > 0.0011) {
+                    float box_inf = max(abs(pos.x), max(abs(pos.y), abs(pos.z)));
+                    float wall_fade = 1.0 - smoothstep(u_box_half * 0.80, u_box_half * 0.98, box_inf);
+                    float r_center = length(pos);
+                    float halo_mask = (1.0 - smoothstep(0.18 * rho_cut, 0.78 * rho_cut, rho))
+                                    * (0.25 + 0.75 * smoothstep(1.35, 3.10, r_center));
+                    float eq_sheet = 0.18 + 0.82 * exp(-0.55 * pos.z * pos.z);
+                    float gw_norm = clamp((abs_ud - 0.0011) / 0.0115, 0.0, 1.0);
+                    vec3 gw_col = (u_dot >= 0.0) ? vec3(1.35, 0.84, 0.18) : vec3(0.10, 0.86, 1.38);
+                    float sigma_gw = pow(gw_norm, 1.35) * wall_fade * halo_mask * eq_sheet * 0.16;
+                    float alpha_gw = 1.0 - exp(-sigma_gw * dt_ray);
+                    accum_rgb += transmittance * alpha_gw * (gw_col * (0.75 + 0.85 * gw_norm));
+                    transmittance *= (1.0 - 0.12 * alpha_gw);
+                }
             }
             t += dt_ray;
         }
@@ -1347,6 +1511,8 @@ class Arena1KnotTank:
         self.color_mode = 0
         self.damping = 0.0
         self.sponge_strength = 4.5
+        self.show_gw_ripples: bool = True
+        self.gw_ripple_gain: float = 1.0
         self.substeps_per_frame = 2
         self.sim_time = 0.0
         self.step_count = 0
@@ -1374,10 +1540,12 @@ class Arena1KnotTank:
         self._hib_phi_ram: Optional[np.ndarray] = None
         self._hib_vel_ram: Optional[np.ndarray] = None
         self._hib_u_ram: Optional[np.ndarray] = None
+        self._hib_ut_ram: Optional[np.ndarray] = None
         self._hib_u_warm: bool = False
 
         self._init_prog = self.ctx.compute_shader(_INIT_KNOT_GLSL)
         self._zero_buf_prog = self.ctx.compute_shader(_ZERO_BUF_GLSL)
+        self._boost_orbital_prog = self.ctx.compute_shader(_BOOST_ORBITAL_GLSL)
         self._pack_prog = self.ctx.compute_shader(_PACK_VOL_GLSL)
         self._ref_relax_prog: Optional[moderngl.ComputeShader] = None
         self._pack_fp16_prog = self.ctx.compute_shader(_PACK_FP16_CHUNK_GLSL)
@@ -1394,6 +1562,7 @@ class Arena1KnotTank:
         self._u_mg_smooth_prog = self.ctx.compute_shader(_U_MG_SMOOTH_GLSL)
         self._u_mg_restrict_prog = self.ctx.compute_shader(_U_MG_RESTRICT_GLSL)
         self._u_mg_prolong_prog = self.ctx.compute_shader(_U_MG_PROLONG_ADD_GLSL)
+        self._u_wave_step_prog = self.ctx.compute_shader(_U_WAVE_STEP_GLSL)
         self._pack_tension_prog = self.ctx.compute_shader(_PACK_TENSION_TEX_GLSL)
         self._ray_prog = self.ctx.program(
             vertex_shader=_FULLSCREEN_VERT,
@@ -1406,7 +1575,7 @@ class Arena1KnotTank:
         self._reduce_prog: Optional[moderngl.ComputeShader] = None
         self._deposit_u_prog: Optional[moderngl.ComputeShader] = None
         self._compiled_ham_expr: str = ""
-        self._ham_params_tuple: Optional[tuple[float, float, float, float, float, float]] = None
+        self._ham_params_tuple: Optional[tuple[object, ...]] = None
         self._pending_ham_baseline_reset: bool = False
         self._active_mod: Optional[PhysicsMod] = mod
         self._active_compiled: Optional[CompiledMasterAction] = compiled
@@ -1414,9 +1583,11 @@ class Arena1KnotTank:
         self._mg_rhs_bufs: list[moderngl.Buffer] = []
         self._mg_u_bufs: list[moderngl.Buffer] = []
         self._mg_scratch_bufs: list[moderngl.Buffer] = []
+        self._mg_ut_buf: Optional[moderngl.Buffer] = None
         self._mg_moments_buf: Optional[moderngl.Buffer] = None
         self._tension_tex: Optional[moderngl.Texture3D] = None
         self._u_warm_valid: bool = False
+        self._zero_wave_init_active: bool = False
         self._external_tension_u_active: bool = False
 
         self._buf_a: Optional[moderngl.Buffer] = None
@@ -1459,7 +1630,7 @@ class Arena1KnotTank:
     def box_size(self) -> float:
         if self._box_size_override is not None:
             return self._box_size_override
-        return 16.8 if self.preset_idx in (4, 5) else 12.0
+        return 16.8 if self.preset_idx in (4, 5, 6) else 12.0
 
     @box_size.setter
     def box_size(self, val: Optional[float]) -> None:
@@ -1480,16 +1651,21 @@ class Arena1KnotTank:
             total_bytes += int(self._hib_vel_ram.nbytes)
         if self._hib_u_ram is not None:
             total_bytes += int(self._hib_u_ram.nbytes)
+        if self._hib_ut_ram is not None:
+            total_bytes += int(self._hib_ut_ram.nbytes)
         if self._live_backup is not None:
             phi_bk = self._live_backup.get("phi")
             vel_bk = self._live_backup.get("vel")
             u_bk = self._live_backup.get("u_grid")
+            ut_bk = self._live_backup.get("ut_grid")
             if isinstance(phi_bk, np.ndarray):
                 total_bytes += int(phi_bk.nbytes)
             if isinstance(vel_bk, np.ndarray):
                 total_bytes += int(vel_bk.nbytes)
             if isinstance(u_bk, np.ndarray):
                 total_bytes += int(u_bk.nbytes)
+            if isinstance(ut_bk, np.ndarray):
+                total_bytes += int(ut_bk.nbytes)
         for frm in self._replay_frames:
             total_bytes += int(frm.nbytes)
         return float(total_bytes) / (1024.0 * 1024.0)
@@ -1554,9 +1730,26 @@ class Arena1KnotTank:
         self._replay_gpu_pack_buf = None
         self._replay_stage_buf = None
 
+    def _pack_tension_tex_gpu(self, zero_mode: bool = False, has_ut: bool = False) -> None:
+        assert self._tension_tex is not None and len(self._mg_u_bufs) > 0 and self._mg_ut_buf is not None
+        m0 = _MG_LEVELS_U[0]
+        self._mg_u_bufs[0].bind_to_storage_buffer(0)
+        self._mg_ut_buf.bind_to_storage_buffer(2)
+        self._tension_tex.bind_to_image(1, read=False, write=True)
+        self._set_uniform_safe(self._pack_tension_prog, "u_M", m0)
+        self._set_uniform_safe(self._pack_tension_prog, "u_zero_mode", 1 if zero_mode else 0)
+        self._set_uniform_safe(self._pack_tension_prog, "u_has_ut", 1 if has_ut else 0)
+        wg = (m0 + 3) // 4
+        self._pack_tension_prog.run(wg, wg, wg)
+        self.ctx.memory_barrier()
+
     def _ensure_mg_resources(self) -> None:
-        """Allocates the 5-level `64³ -> 4³` Multigrid buffers and `GL_R32F` 3D texture for `U(x)`."""
-        if self._tension_tex is not None and len(self._mg_u_bufs) == len(_MG_LEVELS_U):
+        """Allocates the 5-level `64³ -> 4³` Multigrid + hyperbolic wave buffers and `GL_RG32F` 3D texture `(U, dU/dt)`."""
+        if (
+            self._tension_tex is not None
+            and len(self._mg_u_bufs) == len(_MG_LEVELS_U)
+            and self._mg_ut_buf is not None
+        ):
             return
         self._release_mg_resources()
         for m in _MG_LEVELS_U:
@@ -1564,22 +1757,18 @@ class Arena1KnotTank:
             self._mg_rhs_bufs.append(self.ctx.buffer(reserve=nbytes))
             self._mg_u_bufs.append(self.ctx.buffer(reserve=nbytes))
             self._mg_scratch_bufs.append(self.ctx.buffer(reserve=nbytes))
-        self._mg_moments_buf = self.ctx.buffer(reserve=32)
         m0 = _MG_LEVELS_U[0]
-        tex = self.ctx.texture3d((m0, m0, m0), components=1, dtype="f4")
+        self._mg_ut_buf = self.ctx.buffer(reserve=m0 * m0 * m0 * 4)
+        self._zero_ssbo(self._mg_ut_buf, m0 * m0 * m0)
+        self._mg_moments_buf = self.ctx.buffer(reserve=32)
+        tex = self.ctx.texture3d((m0, m0, m0), components=2, dtype="f4")
         tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         tex.repeat_x = False
         tex.repeat_y = False
         tex.repeat_z = False
         self._tension_tex = tex
         self._u_warm_valid = False
-        self._mg_u_bufs[0].bind_to_storage_buffer(0)
-        self._tension_tex.bind_to_image(1, read=False, write=True)
-        self._set_uniform_safe(self._pack_tension_prog, "u_M", m0)
-        self._set_uniform_safe(self._pack_tension_prog, "u_zero_mode", 1)
-        wg = (m0 + 3) // 4
-        self._pack_tension_prog.run(wg, wg, wg)
-        self.ctx.memory_barrier()
+        self._pack_tension_tex_gpu(zero_mode=True, has_ut=False)
 
     def _release_mg_resources(self) -> None:
         for lst in (self._mg_rhs_bufs, self._mg_u_bufs, self._mg_scratch_bufs):
@@ -1587,6 +1776,9 @@ class Arena1KnotTank:
                 if b is not None:
                     b.release()
             lst.clear()
+        if self._mg_ut_buf is not None:
+            self._mg_ut_buf.release()
+            self._mg_ut_buf = None
         if self._mg_moments_buf is not None:
             self._mg_moments_buf.release()
             self._mg_moments_buf = None
@@ -1649,13 +1841,9 @@ class Arena1KnotTank:
         if use_t == 0:
             if self._u_warm_valid:
                 m0 = _MG_LEVELS_U[0]
-                self._mg_u_bufs[0].bind_to_storage_buffer(0)
-                self._tension_tex.bind_to_image(1, read=False, write=True)
-                self._set_uniform_safe(self._pack_tension_prog, "u_M", m0)
-                self._set_uniform_safe(self._pack_tension_prog, "u_zero_mode", 1)
-                wg0 = (m0 + 3) // 4
-                self._pack_tension_prog.run(wg0, wg0, wg0)
-                self.ctx.memory_barrier()
+                if self._mg_ut_buf is not None:
+                    self._zero_ssbo(self._mg_ut_buf, m0 * m0 * m0)
+                self._pack_tension_tex_gpu(zero_mode=True, has_ut=False)
                 self._u_warm_valid = False
             return 0
 
@@ -1729,24 +1917,105 @@ class Arena1KnotTank:
                 self.ctx.memory_barrier()
                 self._smooth_u_level(lvl, n_iters=smooth_sweeps, zero_first=False)
 
-        self._mg_u_bufs[0].bind_to_storage_buffer(0)
-        self._tension_tex.bind_to_image(1, read=False, write=True)
-        self._set_uniform_safe(self._pack_tension_prog, "u_M", m0)
-        self._set_uniform_safe(self._pack_tension_prog, "u_zero_mode", 0)
-        self._pack_tension_prog.run(wg0, wg0, wg0)
-        self.ctx.memory_barrier()
+        if self._mg_ut_buf is not None:
+            self._zero_ssbo(self._mg_ut_buf, m0 * m0 * m0)
+        self._pack_tension_tex_gpu(zero_mode=False, has_ut=False)
+        self._zero_wave_init_active = False
         self._u_warm_valid = True
         return 1
+
+    def _step_tension_u_wave_gpu(
+        self,
+        mod: PhysicsMod,
+        compiled: Optional[CompiledMasterAction],
+        dt_u: float,
+    ) -> int:
+        """
+        Advances causal hyperbolic weave tension `d^2 U / dt^2 = c_gw^2 * (nabla^2 U + kappa * rho_{H,0})`
+        on the `64³` GPU grid with 1st-order spherical Bayliss-Turkel non-reflecting boundary conditions
+        and packs `(U, dU/dt)` into `GL_RG32F` `_tension_tex` (`~0.06 ms` total, 0 CPU readback!).
+        """
+        if self.is_hibernated or self._buf_a is None or self._buf_b is None or self._buf_vel is None:
+            return 0
+        self._ensure_mg_resources()
+        assert self._tension_tex is not None and self._mg_ut_buf is not None
+        if self._external_tension_u_active:
+            return 1
+
+        use_t, g_k = self._current_use_tension(mod)
+        if use_t == 0:
+            return self._solve_tension_u_gpu(mod)
+        if not self._u_warm_valid:
+            self._solve_tension_u_gpu(mod, n_vcycles=4, zero_init_fine=True)
+
+        p = mod.parameters
+        dep_prog = self._deposit_u_prog if self._deposit_u_prog is not None else self._default_deposit_u_prog
+        latest_buf = self._buf_a if self._cur_in_a else self._buf_b
+
+        m0 = _MG_LEVELS_U[0]
+        n = int(self.grid_n)
+        dx = float(self.box_size) / float(n)
+        half_box = float(self.box_size) * 0.5
+        kappa = float(WEAVE_KAPPA_SCALE) * float(g_k)
+        c_gw = compute_effective_gw_speed(mod, compiled)
+
+        latest_buf.bind_to_storage_buffer(0)
+        self._buf_vel.bind_to_storage_buffer(1)
+        self._mg_rhs_bufs[0].bind_to_storage_buffer(2)
+        self._set_uniform_safe(dep_prog, "u_N", n)
+        self._set_uniform_safe(dep_prog, "u_M", m0)
+        self._set_uniform_safe(dep_prog, "u_dx", dx)
+        self._set_uniform_safe(dep_prog, "u_kappa", kappa)
+        self._set_uniform_safe(dep_prog, "c_w", float(p.c_w))
+        self._set_uniform_safe(dep_prog, "m_eff", float(p.m_eff))
+        self._set_uniform_safe(dep_prog, "g4", float(p.g4))
+        self._set_uniform_safe(dep_prog, "g6", float(p.g6))
+        self._set_uniform_safe(dep_prog, "k_skyrme", float(getattr(p, "k_skyrme", 0.0)))
+        wg0 = (m0 + 3) // 4
+        dep_prog.run(wg0, wg0, wg0)
+        self.ctx.memory_barrier()
+
+        self._mg_rhs_bufs[0].bind_to_storage_buffer(0)
+        self._mg_u_bufs[0].bind_to_storage_buffer(1)
+        self._mg_ut_buf.bind_to_storage_buffer(2)
+        self._mg_scratch_bufs[0].bind_to_storage_buffer(3)
+        self._set_uniform_safe(self._u_wave_step_prog, "u_M", m0)
+        self._set_uniform_safe(self._u_wave_step_prog, "u_half_box", half_box)
+        self._set_uniform_safe(self._u_wave_step_prog, "u_dt", float(dt_u))
+        self._set_uniform_safe(self._u_wave_step_prog, "u_c_gw", float(c_gw))
+        self._u_wave_step_prog.run(wg0, wg0, wg0)
+        self.ctx.memory_barrier()
+
+        # Swap ping-pong fine U buffer so _mg_u_bufs[0] always holds the latest U(x, t)!
+        self._mg_u_bufs[0], self._mg_scratch_bufs[0] = self._mg_scratch_bufs[0], self._mg_u_bufs[0]
+        self._pack_tension_tex_gpu(zero_mode=False, has_ut=True)
+        self._u_warm_valid = True
+        return 1
+
+    def zero_tension_wave_state(self) -> None:
+        """Initializes flat weave tension `U(x, 0) = 0`, `dU/dt(x, 0) = 0` for causal light-cone turn-on tests."""
+        if self.is_hibernated or self._buf_a is None:
+            self.wake_from_ram()
+        self._ensure_mg_resources()
+        assert self._mg_ut_buf is not None
+        m0 = _MG_LEVELS_U[0]
+        self._zero_ssbo(self._mg_u_bufs[0], m0 * m0 * m0)
+        self._zero_ssbo(self._mg_ut_buf, m0 * m0 * m0)
+        self._pack_tension_tex_gpu(zero_mode=False, has_ut=True)
+        self._external_tension_u_active = False
+        self._zero_wave_init_active = True
+        self._u_warm_valid = True
 
     def set_external_tension_u(self, u_zyx: Optional[np.ndarray]) -> None:
         """Uploads an explicit `(64, 64, 64)` `float32` tension field `U(x)` (or clears override when `None`)."""
         if self.is_hibernated or self._buf_a is None:
             self.wake_from_ram()
         self._ensure_mg_resources()
-        assert self._tension_tex is not None
+        assert self._tension_tex is not None and self._mg_ut_buf is not None
         m0 = _MG_LEVELS_U[0]
         if u_zyx is None:
             self._external_tension_u_active = False
+            self._zero_wave_init_active = False
             self._u_warm_valid = False
             self._solve_tension_u_gpu(self._active_mod, n_vcycles=4, zero_init_fine=True)
             return
@@ -1754,14 +2023,10 @@ class Arena1KnotTank:
         if arr.shape != (m0, m0, m0):
             raise ValueError(f"Expected external tension U shape ({m0}, {m0}, {m0}), got {arr.shape}")
         self._mg_u_bufs[0].write(arr)
-        self._mg_u_bufs[0].bind_to_storage_buffer(0)
-        self._tension_tex.bind_to_image(1, read=False, write=True)
-        self._set_uniform_safe(self._pack_tension_prog, "u_M", m0)
-        self._set_uniform_safe(self._pack_tension_prog, "u_zero_mode", 0)
-        wg0 = (m0 + 3) // 4
-        self._pack_tension_prog.run(wg0, wg0, wg0)
-        self.ctx.memory_barrier()
+        self._zero_ssbo(self._mg_ut_buf, m0 * m0 * m0)
+        self._pack_tension_tex_gpu(zero_mode=False, has_ut=False)
         self._external_tension_u_active = True
+        self._zero_wave_init_active = False
         self._u_warm_valid = False
 
     def readback_tension_u_grid(self) -> np.ndarray:
@@ -1773,6 +2038,14 @@ class Arena1KnotTank:
         if not self._external_tension_u_active and not self._u_warm_valid:
             self._solve_tension_u_gpu(self._active_mod, n_vcycles=4, zero_init_fine=True)
         return self._copy_ssbo_to_ram_f32(self._mg_u_bufs[0], m0 * m0 * m0).reshape((m0, m0, m0))
+
+    def readback_tension_udot_grid(self) -> np.ndarray:
+        """Reads back the active `64³` `(Z, Y, X)` `float32` gravitational-wave strain rate `dU/dt(x, t)`."""
+        m0 = _MG_LEVELS_U[0]
+        use_t, _ = self._current_use_tension(self._active_mod)
+        if self.is_hibernated or self._tension_tex is None or self._mg_ut_buf is None or use_t == 0:
+            return np.zeros((m0, m0, m0), dtype=np.float32)
+        return self._copy_ssbo_to_ram_f32(self._mg_ut_buf, m0 * m0 * m0).reshape((m0, m0, m0))
 
     def _copy_ssbo_to_ram_f32(self, src_buf: moderngl.Buffer, num_floats: int) -> np.ndarray:
         """Copies a GDDR7 SSBO into a contiguous DDR5 `float32` array in 16 MiB chunks without demotion."""
@@ -1989,11 +2262,17 @@ class Arena1KnotTank:
                 if (self._u_warm_valid and len(self._mg_u_bufs) > 0)
                 else None
             )
+            ut_bk = (
+                self._copy_ssbo_to_ram_f32(self._mg_ut_buf, m0_bk * m0_bk * m0_bk)
+                if (self._u_warm_valid and self._mg_ut_buf is not None)
+                else None
+            )
             self._live_backup = {
                 "grid_n": int(self.grid_n),
                 "phi": self._copy_ssbo_to_ram_f32(live_buf, num_floats),
                 "vel": self._copy_ssbo_to_ram_f32(self._buf_vel, num_floats),
                 "u_grid": u_bk,
+                "ut_grid": ut_bk,
                 "u_warm": bool(self._u_warm_valid),
                 "sim_time": float(self.sim_time),
                 "step_count": int(self.step_count),
@@ -2084,19 +2363,20 @@ class Arena1KnotTank:
             self._pack_prog.run(wg_xy, wg_xy, wg_z)
             self.ctx.memory_barrier()
             u_bk_arr = bk.get("u_grid")
+            ut_bk_arr = bk.get("ut_grid")
             use_t_cur, _ = self._current_use_tension(self._active_mod)
             if bool(bk.get("u_warm")) and isinstance(u_bk_arr, np.ndarray) and use_t_cur == 1:
                 self._ensure_mg_resources()
-                assert self._tension_tex is not None
+                assert self._tension_tex is not None and self._mg_ut_buf is not None
                 m0 = _MG_LEVELS_U[0]
                 self._mg_u_bufs[0].write(np.ascontiguousarray(u_bk_arr, dtype=np.float32))
-                self._mg_u_bufs[0].bind_to_storage_buffer(0)
-                self._tension_tex.bind_to_image(1, read=False, write=True)
-                self._set_uniform_safe(self._pack_tension_prog, "u_M", m0)
-                self._set_uniform_safe(self._pack_tension_prog, "u_zero_mode", 0)
-                wg0 = (m0 + 3) // 4
-                self._pack_tension_prog.run(wg0, wg0, wg0)
-                self.ctx.memory_barrier()
+                if isinstance(ut_bk_arr, np.ndarray) and ut_bk_arr.size == m0 * m0 * m0:
+                    self._mg_ut_buf.write(np.ascontiguousarray(ut_bk_arr, dtype=np.float32))
+                    has_ut_bk = True
+                else:
+                    self._zero_ssbo(self._mg_ut_buf, m0 * m0 * m0)
+                    has_ut_bk = False
+                self._pack_tension_tex_gpu(zero_mode=False, has_ut=has_ut_bk)
                 self._u_warm_valid = True
             else:
                 self._solve_tension_u_gpu(self._active_mod, n_vcycles=8, zero_init_fine=True)
@@ -2130,9 +2410,15 @@ class Arena1KnotTank:
         if self._u_warm_valid and len(self._mg_u_bufs) > 0:
             m0 = _MG_LEVELS_U[0]
             self._hib_u_ram = self._copy_ssbo_to_ram_f32(self._mg_u_bufs[0], m0 * m0 * m0)
+            self._hib_ut_ram = (
+                self._copy_ssbo_to_ram_f32(self._mg_ut_buf, m0 * m0 * m0)
+                if self._mg_ut_buf is not None
+                else None
+            )
             self._hib_u_warm = True
         else:
             self._hib_u_ram = None
+            self._hib_ut_ram = None
             self._hib_u_warm = False
 
         _unbind_arena1_gl_slots()
@@ -2164,10 +2450,12 @@ class Arena1KnotTank:
         saved_phi = self._hib_phi_ram
         saved_vel = self._hib_vel_ram
         saved_u = self._hib_u_ram
+        saved_ut = self._hib_ut_ram
         saved_u_warm = self._hib_u_warm
         self._hib_phi_ram = None
         self._hib_vel_ram = None
         self._hib_u_ram = None
+        self._hib_ut_ram = None
         self._hib_u_warm = False
         self.is_hibernated = False
 
@@ -2199,16 +2487,16 @@ class Arena1KnotTank:
             use_t_cur, _ = self._current_use_tension(self._active_mod)
             if saved_u is not None and saved_u_warm and not reset_base and use_t_cur == 1:
                 self._ensure_mg_resources()
-                assert self._tension_tex is not None
+                assert self._tension_tex is not None and self._mg_ut_buf is not None
                 m0 = _MG_LEVELS_U[0]
                 self._mg_u_bufs[0].write(np.ascontiguousarray(saved_u, dtype=np.float32))
-                self._mg_u_bufs[0].bind_to_storage_buffer(0)
-                self._tension_tex.bind_to_image(1, read=False, write=True)
-                self._set_uniform_safe(self._pack_tension_prog, "u_M", m0)
-                self._set_uniform_safe(self._pack_tension_prog, "u_zero_mode", 0)
-                wg0 = (m0 + 3) // 4
-                self._pack_tension_prog.run(wg0, wg0, wg0)
-                self.ctx.memory_barrier()
+                if saved_ut is not None and saved_ut.size == m0 * m0 * m0:
+                    self._mg_ut_buf.write(np.ascontiguousarray(saved_ut, dtype=np.float32))
+                    has_ut_hib = True
+                else:
+                    self._zero_ssbo(self._mg_ut_buf, m0 * m0 * m0)
+                    has_ut_hib = False
+                self._pack_tension_tex_gpu(zero_mode=False, has_ut=has_ut_hib)
                 self._u_warm_valid = True
             else:
                 self._solve_tension_u_gpu(self._active_mod, n_vcycles=8, zero_init_fine=True)
@@ -2299,6 +2587,7 @@ class Arena1KnotTank:
             self._hib_phi_ram = None
             self._hib_vel_ram = None
             self._hib_u_ram = None
+            self._hib_ut_ram = None
             self._hib_u_warm = False
             self.is_hibernated = False
             self.clear_replay_buffer()
@@ -2311,7 +2600,7 @@ class Arena1KnotTank:
         self._active_compiled = compiled
         if mod is not None:
             self._active_mod = mod
-        new_params: Optional[tuple[float, float, float, float, float, float]] = None
+        new_params: Optional[tuple[object, ...]] = None
         if self._active_mod is not None:
             mp = self._active_mod.parameters
             new_params = (
@@ -2321,6 +2610,8 @@ class Arena1KnotTank:
                 float(mp.g6),
                 float(getattr(mp, "k_skyrme", 0.0)),
                 float(getattr(mp, "g_knot", 0.0)),
+                bool(getattr(mp, "retarded_weave_u", True)),
+                float(getattr(compiled, "gw_speed_ratio_val", 1.0)),
             )
 
         if compiled.glsl_compute_source != self._compiled_glsl_src:
@@ -2361,7 +2652,19 @@ class Arena1KnotTank:
             # Refresh Hamiltonian baseline if GPU buffers are awake; otherwise defer until wake!
             if not self.is_hibernated and self._buf_a is not None:
                 self._pending_ham_baseline_reset = False
-                self._solve_tension_u_gpu(self._active_mod, n_vcycles=4, zero_init_fine=True)
+                use_t_upd, _ = self._current_use_tension(self._active_mod)
+                ret_upd = (
+                    bool(getattr(self._active_mod.parameters, "retarded_weave_u", True))
+                    if self._active_mod is not None
+                    else True
+                )
+                if (
+                    use_t_upd == 0
+                    or (not ret_upd)
+                    or (not self._u_warm_valid)
+                    or (self.step_count == 0 and not self._zero_wave_init_active)
+                ):
+                    self._solve_tension_u_gpu(self._active_mod, n_vcycles=4, zero_init_fine=True)
                 self._sample_diagnostics(is_initial=(self.step_count == 0), reset_ham_baseline=True)
             else:
                 self._pending_ham_baseline_reset = True
@@ -2374,6 +2677,7 @@ class Arena1KnotTank:
             self._hib_phi_ram = None
             self._hib_vel_ram = None
             self._hib_u_ram = None
+            self._hib_ut_ram = None
             self._hib_u_warm = False
             self.is_hibernated = False
             self._allocate_grid(self.grid_n)
@@ -2381,6 +2685,7 @@ class Arena1KnotTank:
         self._clear_async_fences()
         self.clear_replay_buffer()
         self._external_tension_u_active = False
+        self._zero_wave_init_active = False
         self._u_warm_valid = False
 
         assert self._buf_a is not None and self._buf_vel is not None and self._vol_tex is not None
@@ -2400,6 +2705,15 @@ class Arena1KnotTank:
 
         self._cur_in_a = True
         self._relax_initial_hopfion_t0()
+        if self.preset_idx == 6:
+            latest_b = self._buf_a if self._cur_in_a else self._buf_b
+            latest_b.bind_to_storage_buffer(0)
+            self._buf_vel.bind_to_storage_buffer(1)
+            self._set_uniform_safe(self._boost_orbital_prog, "u_N", n)
+            self._set_uniform_safe(self._boost_orbital_prog, "u_box", float(self.box_size))
+            self._set_uniform_safe(self._boost_orbital_prog, "u_v_orb", 0.105)
+            self._boost_orbital_prog.run(wg_xy, wg_xy, wg_z)
+            self.ctx.memory_barrier()
         self._solve_tension_u_gpu(self._active_mod, n_vcycles=4, zero_init_fine=True)
         self.sim_time = 0.0
         self.step_count = 0
@@ -2420,7 +2734,7 @@ class Arena1KnotTank:
         TNaP action, followed by exact GPU zeroing of `_buf_vel` (`vel_0 === 0`), so all physics mods
         (`tnap_weave`, `lambda_cdm`, etc.) start from the bit-for-bit identical `t = 0` initial state!
         """
-        if self.preset_idx not in (0, 1, 2, 4, 5) or self.grid_n < 48:
+        if self.preset_idx not in (0, 1, 2, 4, 5, 6) or self.grid_n < 48:
             return
         assert (
             self._buf_a is not None
@@ -2531,6 +2845,24 @@ class Arena1KnotTank:
         self._tension_tex.use(location=1)
 
         p = self._active_mod.parameters if self._active_mod is not None else None
+        use_t, g_k = self._current_use_tension(self._active_mod)
+        kappa = float(WEAVE_KAPPA_SCALE) * float(g_k)
+        ret_mode = (
+            1
+            if (
+                use_t == 1
+                and not self._external_tension_u_active
+                and p is not None
+                and bool(getattr(p, "retarded_weave_u", True))
+                and abs(kappa) > 1e-9
+            )
+            else 0
+        )
+        c_gw = (
+            compute_effective_gw_speed(self._active_mod, self._active_compiled)
+            if self._active_mod is not None
+            else 1.0
+        )
         self._set_uniform_safe(red_prog, "u_N", n)
         self._set_uniform_safe(red_prog, "u_stride", stride)
         self._set_uniform_safe(red_prog, "u_dx", dx)
@@ -2540,6 +2872,10 @@ class Arena1KnotTank:
         self._set_uniform_safe(red_prog, "g6", float(p.g6) if p else 3.10)
         self._set_uniform_safe(red_prog, "k_skyrme", float(getattr(p, "k_skyrme", 0.0)) if p else 0.22)
         self._set_uniform_safe(red_prog, "u_use_tension", use_t)
+        self._set_uniform_safe(red_prog, "u_retarded_mode", ret_mode)
+        self._set_uniform_safe(red_prog, "u_inv_kappa", (1.0 / abs(kappa)) if abs(kappa) > 1e-9 else 0.0)
+        self._set_uniform_safe(red_prog, "u_inv_cgw2", 1.0 / max(c_gw * c_gw, 1e-8))
+        self._set_uniform_safe(red_prog, "u_box_size", float(self.box_size))
         self._set_uniform_safe(red_prog, "u_tension_tex", 1)
 
         red_prog.run(wg_x, wg_y, wg_z)
@@ -2630,11 +2966,23 @@ class Arena1KnotTank:
         self.last_dt = dt
         steps = int(n_substeps if n_substeps is not None else self.substeps_per_frame)
 
-        use_t = self._solve_tension_u_gpu(
-            use_mod,
-            n_vcycles=(2 if self._u_warm_valid else 4),
-            zero_init_fine=(not self._u_warm_valid),
+        use_t, _ = self._current_use_tension(use_mod)
+        retarded_on = (
+            use_t == 1
+            and bool(getattr(use_mod.parameters, "retarded_weave_u", True))
+            and (not self._external_tension_u_active)
         )
+        if use_t == 0 or self._external_tension_u_active:
+            use_t = self._solve_tension_u_gpu(use_mod)
+        elif not retarded_on:
+            use_t = self._solve_tension_u_gpu(
+                use_mod,
+                n_vcycles=(2 if self._u_warm_valid else 4),
+                zero_init_fine=(not self._u_warm_valid),
+            )
+        elif not self._u_warm_valid:
+            use_t = self._solve_tension_u_gpu(use_mod, n_vcycles=4, zero_init_fine=True)
+
         assert self._tension_tex is not None
         self._tension_tex.use(location=1)
 
@@ -2658,7 +3006,22 @@ class Arena1KnotTank:
         self._buf_vel.bind_to_storage_buffer(1)
         prev_step_count = self.step_count
 
-        for _ in range(steps):
+        for sub_i in range(steps):
+            if retarded_on:
+                if n <= 64 or steps == 1:
+                    self._step_tension_u_wave_gpu(use_mod, use_comp, dt_u=dt)
+                    self._buf_vel.bind_to_storage_buffer(1)
+                    self._tension_tex.use(location=1)
+                elif (sub_i % 2) == 0:
+                    dt_u_pair = (2.0 * dt) if (sub_i + 1 < steps) else dt
+                    self._step_tension_u_wave_gpu(use_mod, use_comp, dt_u=dt_u_pair)
+                    self._buf_vel.bind_to_storage_buffer(1)
+                    self._tension_tex.use(location=1)
+            elif use_t == 1 and (not self._external_tension_u_active) and sub_i > 0 and (sub_i % 16) == 0:
+                self._solve_tension_u_gpu(use_mod, n_vcycles=2, zero_init_fine=False)
+                self._buf_vel.bind_to_storage_buffer(1)
+                self._tension_tex.use(location=1)
+
             if self._cur_in_a:
                 self._buf_a.bind_to_storage_buffer(0)
                 self._buf_b.bind_to_storage_buffer(2)
@@ -2728,9 +3091,21 @@ class Arena1KnotTank:
         aspect = float(w) / max(float(h), 1.0)
         fov_tan = math.tan(math.radians(camera.fov_deg) * 0.5)
 
+        self._ensure_mg_resources()
+        assert self._tension_tex is not None
+        use_t_r, _ = self._current_use_tension(self._active_mod)
+        ret_r = (
+            bool(getattr(self._active_mod.parameters, "retarded_weave_u", True))
+            if self._active_mod is not None
+            else True
+        )
+        show_gw = 1 if (self.show_gw_ripples and use_t_r == 1 and ret_r) else 0
+
         self._vol_tex.use(location=0)
+        self._tension_tex.use(location=1)
         for uname, uval in (
             ("u_vol_tex", 0),
+            ("u_tension_tex", 1),
             ("u_cam_eye", tuple(float(v) for v in eye)),
             ("u_cam_fwd", tuple(float(v) for v in fwd)),
             ("u_cam_right", tuple(float(v) for v in right)),
@@ -2742,7 +3117,9 @@ class Arena1KnotTank:
             ("u_slice_x", float(self.slice_x)),
             ("u_color_mode", int(self.color_mode)),
             ("u_time", float(wall_time)),
-            ("u_rho_floor", 0.72 if self.preset_idx == 5 else (0.18 if self.preset_idx == 3 else 1.15)),
+            ("u_rho_floor", 0.72 if self.preset_idx in (5, 6) else (0.18 if self.preset_idx == 3 else 1.15)),
+            ("u_show_gw_ripples", show_gw),
+            ("u_gw_vis_gain", float(self.gw_ripple_gain)),
         ):
             if uname in self._ray_prog:
                 self._ray_prog[uname].value = uval
@@ -2783,12 +3160,14 @@ class Arena1KnotTank:
             self._u_mg_smooth_prog,
             self._u_mg_restrict_prog,
             self._u_mg_prolong_prog,
+            self._u_wave_step_prog,
             self._pack_tension_prog,
             self._pack_fp16_prog,
             self._unpack_fp16_prog,
             self._pack_replay_prog,
             self._unpack_replay_prog,
             self._zero_buf_prog,
+            self._boost_orbital_prog,
             self._init_prog,
             self._pack_prog,
             self._empty_vao,
@@ -2804,6 +3183,7 @@ class Arena1KnotTank:
         self._hib_phi_ram = None
         self._hib_vel_ram = None
         self._hib_u_ram = None
+        self._hib_ut_ram = None
         self._hib_u_warm = False
         self.clear_replay_buffer()
 
