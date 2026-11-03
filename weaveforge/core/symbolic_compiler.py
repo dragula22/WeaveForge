@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 import math
 import threading
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import minimize_scalar
@@ -333,11 +333,11 @@ def _emit_gpu_accel_block(acc_sym_list: List[sp.Expr], lang: str) -> Tuple[str, 
 
 
 def _emit_gpu_octant_vec3_helper(fn_name: str, vec_exprs: List[sp.Expr], lang: str) -> str:
-    """Emits a CSE-lowered `vec3` / `vec3<f32>` helper `(p, gx, gy, gz)` for exact discrete variational octant fluxes."""
+    """Emits a CSE-lowered `vec3` / `vec3<f32>` helper `(p, gx, gy, gz, U)` for exact discrete variational octant fluxes."""
     cse_block, (e1, e2, e3) = _emit_gpu_accel_block(vec_exprs, lang=lang)
     if lang == "wgsl":
         return f"""
-fn {fn_name}(p: vec3<f32>, gx: vec3<f32>, gy: vec3<f32>, gz: vec3<f32>) -> vec3<f32> {{
+fn {fn_name}(p: vec3<f32>, gx: vec3<f32>, gy: vec3<f32>, gz: vec3<f32>, U: f32) -> vec3<f32> {{
     let c_w = params.c_w;
     let m_eff = params.m_eff;
     let g4 = params.g4;
@@ -351,11 +351,34 @@ fn {fn_name}(p: vec3<f32>, gx: vec3<f32>, gy: vec3<f32>, gz: vec3<f32>) -> vec3<
 }}
 """
     return f"""
-vec3 {fn_name}(vec3 p, vec3 gx, vec3 gy, vec3 gz) {{
+vec3 {fn_name}(vec3 p, vec3 gx, vec3 gy, vec3 gz, float U) {{
     float phi1 = p.x; float phi2 = p.y; float phi3 = p.z;
     float dx_phi1 = gx.x; float dy_phi1 = gy.x; float dz_phi1 = gz.x;
     float dx_phi2 = gx.y; float dy_phi2 = gy.y; float dz_phi2 = gz.y;
     float dx_phi3 = gx.z; float dy_phi3 = gy.z; float dz_phi3 = gz.z;{cse_block}
+    return vec3({e1}, {e2}, {e3});
+}}
+"""
+
+
+def _emit_gpu_kinv_helper(kinv_exprs: List[sp.Expr], lang: str) -> str:
+    """Emits `_apply_kinv(rhs, U)` applying `K^{-1}(U_c)` outside discrete flux divergence to preserve exact energy conservation."""
+    cse_block, (e1, e2, e3) = _emit_gpu_accel_block(kinv_exprs, lang=lang)
+    if lang == "wgsl":
+        return f"""
+fn _apply_kinv(rhs: vec3<f32>, U: f32) -> vec3<f32> {{
+    let c_w = params.c_w;
+    let m_eff = params.m_eff;
+    let g4 = params.g4;
+    let g6 = params.g6;
+    let k_skyrme = params.k_skyrme;
+    let r1_el = rhs.x; let r2_el = rhs.y; let r3_el = rhs.z;{cse_block}
+    return vec3<f32>({e1}, {e2}, {e3});
+}}
+"""
+    return f"""
+vec3 _apply_kinv(vec3 rhs, float U) {{
+    float r1_el = rhs.x; float r2_el = rhs.y; float r3_el = rhs.z;{cse_block}
     return vec3({e1}, {e2}, {e3});
 }}
 """
@@ -379,12 +402,20 @@ def _build_glsl_3d_pde_shader(
     extra_stencil = ""
     if octant_helpers_glsl:
         f_pot_line = (
-            "0.5 * (_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp) + _eval_dL_dphi(c, gx_cm, gy_cm, gz_cm))"
+            "0.5 * (_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp, u_c) + _eval_dL_dphi(c, gx_cm, gy_cm, gz_cm, u_c))"
             if dL_dphi_has_grad
-            else "_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp)"
+            else "_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp, u_c)"
         )
         accel_body = f"""
-    // Exact discrete variational (+,+,+) & (-,-,-) octant Euler-Lagrange flux divergence (J == J^T):
+    // Exact discrete variational (+,+,+) & (-,-,-) octant Euler-Lagrange flux divergence (J == J^T) coupled to U(x):
+    float u_c  = sample_U(gid.x, gid.y, gid.z, N);
+    float u_xp = sample_U(gid.x + 1, gid.y, gid.z, N);
+    float u_xm = sample_U(gid.x - 1, gid.y, gid.z, N);
+    float u_yp = sample_U(gid.x, gid.y + 1, gid.z, N);
+    float u_ym = sample_U(gid.x, gid.y - 1, gid.z, N);
+    float u_zp = sample_U(gid.x, gid.y, gid.z + 1, N);
+    float u_zm = sample_U(gid.x, gid.y, gid.z - 1, N);
+
     vec3 xmyp = load_phi(idx3(gid.x - 1, gid.y + 1, gid.z, N));
     vec3 xpym = load_phi(idx3(gid.x + 1, gid.y - 1, gid.z, N));
     vec3 xmzp = load_phi(idx3(gid.x - 1, gid.y, gid.z + 1, N));
@@ -399,23 +430,24 @@ def _build_glsl_3d_pde_shader(
     vec3 gy_cm = (c - ym) * inv_dx;
     vec3 gz_cm = (c - zm) * inv_dx;
 
-    vec3 pi_x_cp  = _eval_pi_x(c,  gx_cp, gy_cp, gz_cp);
-    vec3 pi_y_cp  = _eval_pi_y(c,  gx_cp, gy_cp, gz_cp);
-    vec3 pi_z_cp  = _eval_pi_z(c,  gx_cp, gy_cp, gz_cp);
-    vec3 pi_x_xmp = _eval_pi_x(xm, gx_cm, (xmyp - xm) * inv_dx, (xmzp - xm) * inv_dx);
-    vec3 pi_y_ymp = _eval_pi_y(ym, (xpym - ym) * inv_dx, gy_cm, (ymzp - ym) * inv_dx);
-    vec3 pi_z_zmp = _eval_pi_z(zm, (xpzm - zm) * inv_dx, (ypzm - zm) * inv_dx, gz_cm);
+    vec3 pi_x_cp  = _eval_pi_x(c,  gx_cp, gy_cp, gz_cp, u_c);
+    vec3 pi_y_cp  = _eval_pi_y(c,  gx_cp, gy_cp, gz_cp, u_c);
+    vec3 pi_z_cp  = _eval_pi_z(c,  gx_cp, gy_cp, gz_cp, u_c);
+    vec3 pi_x_xmp = _eval_pi_x(xm, gx_cm, (xmyp - xm) * inv_dx, (xmzp - xm) * inv_dx, u_xm);
+    vec3 pi_y_ymp = _eval_pi_y(ym, (xpym - ym) * inv_dx, gy_cm, (ymzp - ym) * inv_dx, u_ym);
+    vec3 pi_z_zmp = _eval_pi_z(zm, (xpzm - zm) * inv_dx, (ypzm - zm) * inv_dx, gz_cm, u_zm);
 
-    vec3 pi_x_cm  = _eval_pi_x(c,  gx_cm, gy_cm, gz_cm);
-    vec3 pi_y_cm  = _eval_pi_y(c,  gx_cm, gy_cm, gz_cm);
-    vec3 pi_z_cm  = _eval_pi_z(c,  gx_cm, gy_cm, gz_cm);
-    vec3 pi_x_xpm = _eval_pi_x(xp, gx_cp, (xp - xpym) * inv_dx, (xp - xpzm) * inv_dx);
-    vec3 pi_y_ypm = _eval_pi_y(yp, (yp - xmyp) * inv_dx, gy_cp, (yp - ypzm) * inv_dx);
-    vec3 pi_z_zpm = _eval_pi_z(zp, (zp - xmzp) * inv_dx, (zp - ymzp) * inv_dx, gz_cp);
+    vec3 pi_x_cm  = _eval_pi_x(c,  gx_cm, gy_cm, gz_cm, u_c);
+    vec3 pi_y_cm  = _eval_pi_y(c,  gx_cm, gy_cm, gz_cm, u_c);
+    vec3 pi_z_cm  = _eval_pi_z(c,  gx_cm, gy_cm, gz_cm, u_c);
+    vec3 pi_x_xpm = _eval_pi_x(xp, gx_cp, (xp - xpym) * inv_dx, (xp - xpzm) * inv_dx, u_xp);
+    vec3 pi_y_ypm = _eval_pi_y(yp, (yp - xmyp) * inv_dx, gy_cp, (yp - ypzm) * inv_dx, u_yp);
+    vec3 pi_z_zpm = _eval_pi_z(zp, (zp - xmzp) * inv_dx, (zp - ymzp) * inv_dx, gz_cp, u_zp);
 
     vec3 div_plus  = ((pi_x_cp - pi_x_xmp) + (pi_y_cp - pi_y_ymp) + (pi_z_cp - pi_z_zmp)) * inv_dx;
     vec3 div_minus = ((pi_x_xpm - pi_x_cm) + (pi_y_ypm - pi_y_cm) + (pi_z_zpm - pi_z_cm)) * inv_dx;
-    vec3 acc_vec = ({f_pot_line}) - 0.5 * (div_plus + div_minus);
+    vec3 raw_el = ({f_pot_line}) - 0.5 * (div_plus + div_minus);
+    vec3 acc_vec = _apply_kinv(raw_el, u_c);
     float acc1 = acc_vec.x;
     float acc2 = acc_vec.y;
     float acc3 = acc_vec.z;"""
@@ -457,6 +489,11 @@ def _build_glsl_3d_pde_shader(
 """
             extra_stencil = extra_stencil.replace("gz.z", "gvz.z")
         accel_body = f"""
+    float U = sample_U(gid.x, gid.y, gid.z, N);
+    float dx_U = (u_use_tension == 0) ? 0.0 : (sample_U(gid.x + 1, gid.y, gid.z, N) - sample_U(gid.x - 1, gid.y, gid.z, N)) * inv_2dx;
+    float dy_U = (u_use_tension == 0) ? 0.0 : (sample_U(gid.x, gid.y + 1, gid.z, N) - sample_U(gid.x, gid.y - 1, gid.z, N)) * inv_2dx;
+    float dz_U = (u_use_tension == 0) ? 0.0 : (sample_U(gid.x, gid.y, gid.z + 1, N) - sample_U(gid.x, gid.y, gid.z - 1, N)) * inv_2dx;
+
     float phi1 = c.x;
     float phi2 = c.y;
     float phi3 = c.z;
@@ -505,12 +542,20 @@ uniform float g6;
 uniform float k_skyrme;
 uniform float u_sponge;
 uniform float u_box_half;
+uniform int u_use_tension;
+uniform sampler3D u_tension_tex;
 
 int idx3(int x, int y, int z, int N) {{
     int xm = (x + N) % N;
     int ym = (y + N) % N;
     int zm = (z + N) % N;
     return (zm * N + ym) * N + xm;
+}}
+
+float sample_U(int x, int y, int z, int N) {{
+    if (u_use_tension == 0) return 0.0;
+    vec3 uvw = (vec3(float((x + N) % N), float((y + N) % N), float((z + N) % N)) + 0.5) / float(N);
+    return clamp(texture(u_tension_tex, uvw).r, -0.35, 0.75);
 }}
 
 vec3 load_phi(int idx) {{
@@ -597,12 +642,20 @@ def _build_wgsl_3d_pde_shader(
     extra_stencil = ""
     if octant_helpers_wgsl:
         f_pot_line = (
-            "0.5 * (_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp) + _eval_dL_dphi(c, gx_cm, gy_cm, gz_cm))"
+            "0.5 * (_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp, u_c) + _eval_dL_dphi(c, gx_cm, gy_cm, gz_cm, u_c))"
             if dL_dphi_has_grad
-            else "_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp)"
+            else "_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp, u_c)"
         )
         accel_body = f"""
-    // Exact discrete variational (+,+,+) & (-,-,-) octant Euler-Lagrange flux divergence (J == J^T):
+    // Exact discrete variational (+,+,+) & (-,-,-) octant Euler-Lagrange flux divergence (J == J^T) coupled to U(x):
+    let u_c  = sample_U(c_idx);
+    let u_xp = sample_U(idx3(gx + 1, gy, gz, n));
+    let u_xm = sample_U(idx3(gx - 1, gy, gz, n));
+    let u_yp = sample_U(idx3(gx, gy + 1, gz, n));
+    let u_ym = sample_U(idx3(gx, gy - 1, gz, n));
+    let u_zp = sample_U(idx3(gx, gy, gz + 1, n));
+    let u_zm = sample_U(idx3(gx, gy, gz - 1, n));
+
     let xmyp = load_phi(idx3(gx - 1, gy + 1, gz, n));
     let xpym = load_phi(idx3(gx + 1, gy - 1, gz, n));
     let xmzp = load_phi(idx3(gx - 1, gy, gz + 1, n));
@@ -617,23 +670,24 @@ def _build_wgsl_3d_pde_shader(
     let gy_cm = (c - ym) * inv_dx;
     let gz_cm = (c - zm) * inv_dx;
 
-    let pi_x_cp  = _eval_pi_x(c,  gx_cp, gy_cp, gz_cp);
-    let pi_y_cp  = _eval_pi_y(c,  gx_cp, gy_cp, gz_cp);
-    let pi_z_cp  = _eval_pi_z(c,  gx_cp, gy_cp, gz_cp);
-    let pi_x_xmp = _eval_pi_x(xm, gx_cm, (xmyp - xm) * inv_dx, (xmzp - xm) * inv_dx);
-    let pi_y_ymp = _eval_pi_y(ym, (xpym - ym) * inv_dx, gy_cm, (ymzp - ym) * inv_dx);
-    let pi_z_zmp = _eval_pi_z(zm, (xpzm - zm) * inv_dx, (ypzm - zm) * inv_dx, gz_cm);
+    let pi_x_cp  = _eval_pi_x(c,  gx_cp, gy_cp, gz_cp, u_c);
+    let pi_y_cp  = _eval_pi_y(c,  gx_cp, gy_cp, gz_cp, u_c);
+    let pi_z_cp  = _eval_pi_z(c,  gx_cp, gy_cp, gz_cp, u_c);
+    let pi_x_xmp = _eval_pi_x(xm, gx_cm, (xmyp - xm) * inv_dx, (xmzp - xm) * inv_dx, u_xm);
+    let pi_y_ymp = _eval_pi_y(ym, (xpym - ym) * inv_dx, gy_cm, (ymzp - ym) * inv_dx, u_ym);
+    let pi_z_zmp = _eval_pi_z(zm, (xpzm - zm) * inv_dx, (ypzm - zm) * inv_dx, gz_cm, u_zm);
 
-    let pi_x_cm  = _eval_pi_x(c,  gx_cm, gy_cm, gz_cm);
-    let pi_y_cm  = _eval_pi_y(c,  gx_cm, gy_cm, gz_cm);
-    let pi_z_cm  = _eval_pi_z(c,  gx_cm, gy_cm, gz_cm);
-    let pi_x_xpm = _eval_pi_x(xp, gx_cp, (xp - xpym) * inv_dx, (xp - xpzm) * inv_dx);
-    let pi_y_ypm = _eval_pi_y(yp, (yp - xmyp) * inv_dx, gy_cp, (yp - ypzm) * inv_dx);
-    let pi_z_zpm = _eval_pi_z(zp, (zp - xmzp) * inv_dx, (zp - ymzp) * inv_dx, gz_cp);
+    let pi_x_cm  = _eval_pi_x(c,  gx_cm, gy_cm, gz_cm, u_c);
+    let pi_y_cm  = _eval_pi_y(c,  gx_cm, gy_cm, gz_cm, u_c);
+    let pi_z_cm  = _eval_pi_z(c,  gx_cm, gy_cm, gz_cm, u_c);
+    let pi_x_xpm = _eval_pi_x(xp, gx_cp, (xp - xpym) * inv_dx, (xp - xpzm) * inv_dx, u_xp);
+    let pi_y_ypm = _eval_pi_y(yp, (yp - xmyp) * inv_dx, gy_cp, (yp - ypzm) * inv_dx, u_yp);
+    let pi_z_zpm = _eval_pi_z(zp, (zp - xmzp) * inv_dx, (zp - ymzp) * inv_dx, gz_cp, u_zp);
 
     let div_plus  = ((pi_x_cp - pi_x_xmp) + (pi_y_cp - pi_y_ymp) + (pi_z_cp - pi_z_zmp)) * inv_dx;
     let div_minus = ((pi_x_xpm - pi_x_cm) + (pi_y_ypm - pi_y_cm) + (pi_z_zpm - pi_z_cm)) * inv_dx;
-    let acc_vec = ({f_pot_line}) - 0.5 * (div_plus + div_minus);
+    let raw_el = ({f_pot_line}) - 0.5 * (div_plus + div_minus);
+    let acc_vec = _apply_kinv(raw_el, u_c);
     let acc1: f32 = acc_vec.x;
     let acc2: f32 = acc_vec.y;
     let acc3: f32 = acc_vec.z;"""
@@ -673,6 +727,11 @@ def _build_wgsl_3d_pde_shader(
     let g4 = params.g4;
     let g6 = params.g6;
     let k_skyrme = params.k_skyrme;
+
+    let U = sample_U(c_idx);
+    let dx_U = select(0.0, (sample_U(idx3(gx + 1, gy, gz, n)) - sample_U(idx3(gx - 1, gy, gz, n))) * inv_2dx, params.use_tension != 0u);
+    let dy_U = select(0.0, (sample_U(idx3(gx, gy + 1, gz, n)) - sample_U(idx3(gx, gy - 1, gz, n))) * inv_2dx, params.use_tension != 0u);
+    let dz_U = select(0.0, (sample_U(idx3(gx, gy, gz + 1, n)) - sample_U(idx3(gx, gy, gz - 1, n))) * inv_2dx, params.use_tension != 0u);
 
     let phi1 = c.x;
     let phi2 = c.y;
@@ -716,19 +775,27 @@ struct SimParams {{
     k_skyrme: f32,
     sponge: f32,
     box_half: f32,
-    pad0: f32,
+    use_tension: u32,
 }};
 
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var<storage, read> phi_in: array<f32>;
 @group(0) @binding(2) var<storage, read_write> vel_io: array<f32>;
 @group(0) @binding(3) var<storage, read_write> phi_out: array<f32>;
+@group(0) @binding(4) var<storage, read> u_buf: array<f32>;
 
 fn idx3(x: i32, y: i32, z: i32, n: i32) -> u32 {{
     let xm = (x + n) % n;
     let ym = (y + n) % n;
     let zm = (z + n) % n;
     return u32((zm * n + ym) * n + xm);
+}}
+
+fn sample_U(idx: u32) -> f32 {{
+    if (params.use_tension == 0u) {{
+        return 0.0;
+    }}
+    return clamp(u_buf[idx], -0.35, 0.75);
 }}
 
 fn load_phi(idx: u32) -> vec3<f32> {{
@@ -1017,6 +1084,10 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
     c_w, m_eff, g4, g6, k_skyrme = sp.symbols("c_w m_eff g4 g6 k_skyrme", real=True)
     param_syms = (c_w, m_eff, g4, g6, k_skyrme)
 
+    U_field = sp.Symbol("U", real=True)
+    dx_U, dy_U, dz_U = sp.symbols("dx_U dy_U dz_U", real=True)
+    grad_U = (dx_U, dy_U, dz_U)
+
     phis = (phi1, phi2, phi3)
     dt_phis = (dt_phi1, dt_phi2, dt_phi3)
     ddt_phis = (ddt_phi1, ddt_phi2, ddt_phi3)
@@ -1061,6 +1132,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         "dx_phi1": dx_phi1, "dy_phi1": dy_phi1, "dz_phi1": dz_phi1,
         "dx_phi2": dx_phi2, "dy_phi2": dy_phi2, "dz_phi2": dz_phi2,
         "dx_phi3": dx_phi3, "dy_phi3": dy_phi3, "dz_phi3": dz_phi3,
+        "U": U_field,
         "T_kin": T_inv_s,
         "G_grad": G_inv_s,
         "S_skyrme": S_skyrme_inv_s,
@@ -1077,6 +1149,20 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         isinstance(sub, sp.Pow) and (not sub.exp.is_Integer)
         for sub in sp.preorder_traversal(L_inv)
     )
+    # If the mod does not explicitly write U in field_lagrangian and has standard linear T_kin,
+    # dress invariants covariantly with exponential-weave metric (reduces identically to flat L at U=0!).
+    if (
+        U_field not in L_inv.free_symbols
+        and not (L_inv.free_symbols & (set(dt_phis) | set(ddt_phis)))
+        and not has_fractional_pow
+        and sp.diff(L_inv, T_inv_s, 2) == 0
+    ):
+        L_inv = sp.exp(2 * U_field) * L_inv.subs({
+            T_inv_s: sp.exp(2 * U_field) * T_inv_s,
+            G_inv_s: sp.exp(-2 * U_field) * G_inv_s,
+            S_skyrme_inv_s: sp.exp(-4 * U_field) * S_skyrme_inv_s,
+        })
+
     L_raw = L_inv.subs({
         T_inv_s: T_kin_expr,
         G_inv_s: G_grad_expr,
@@ -1089,6 +1175,11 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
 
     momenta_unreg = [sp.diff(L_unreg, dtp) for dtp in dt_phis]
     K_mat_unreg = sp.Matrix([[sp.diff(momenta_unreg[a], dt_phis[b]) for b in range(3)] for a in range(3)])
+
+    # Evaluate vacuum health audit gates at Minkowski spatial infinity (U = 0)
+    L_unreg_u0 = L_unreg.subs(U_field, 0)
+    momenta_unreg_u0 = [sp.diff(L_unreg_u0, dtp) for dtp in dt_phis]
+    K_mat_unreg_u0 = sp.Matrix([[sp.diff(momenta_unreg_u0[a], dt_phis[b]) for b in range(3)] for a in range(3)])
 
     vacuum_field_syms = (
         phi1, phi2, phi3,
@@ -1118,7 +1209,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         [
             [
                 _eval_vacuum_hessian_entry(
-                    K_mat_unreg[a, b], init_vac_subs, init_param_subs, vacuum_field_syms, f"K_mat[{a},{b}]"
+                    K_mat_unreg_u0[a, b], init_vac_subs, init_param_subs, vacuum_field_syms, f"K_mat[{a},{b}]"
                 )
                 for b in range(3)
             ]
@@ -1134,7 +1225,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
     k_entries = [
         [
             _make_vacuum_entry_eval(
-                K_mat_unreg[a, b], f"K_mat[{a},{b}]", zero_field_int_subs, e1_field_subs, e2_field_subs, param_syms
+                K_mat_unreg_u0[a, b], f"K_mat[{a},{b}]", zero_field_int_subs, e1_field_subs, e2_field_subs, param_syms
             )
             for b in range(3)
         ]
@@ -1144,7 +1235,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         [
             [
                 _make_vacuum_entry_eval(
-                    -sp.diff(L_unreg, grad_phis[a][axis_i], grad_phis[b][axis_i]),
+                    -sp.diff(L_unreg_u0, grad_phis[a][axis_i], grad_phis[b][axis_i]),
                     f"G_axis[{axis_i},{a},{b}]",
                     zero_field_int_subs,
                     e1_field_subs,
@@ -1177,7 +1268,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
     rhs_forces: List[sp.Expr] = []
     needs_full_hessian = False
     needs_grad_vel = False
-    k_is_const = not bool(K_mat.free_symbols - {c_w, m_eff, g4, g6, k_skyrme})
+    k_is_const = not bool(K_mat.free_symbols - {c_w, m_eff, g4, g6, k_skyrme, U_field})
 
     for a in range(3):
         dL_dphi_a = sp.diff(L_expr, phis[a])
@@ -1200,6 +1291,9 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
             flux_ai = flux_vec_a[axis_i]
             if flux_ai == 0:
                 continue
+            d2_grad_U = sp.diff(flux_ai, U_field)
+            if d2_grad_U != 0:
+                div_flux_a += d2_grad_U * grad_U[axis_i]
             for b in range(3):
                 d2_grad_phi = sp.diff(flux_ai, phis[b])
                 if d2_grad_phi != 0:
@@ -1259,13 +1353,14 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         ]
         H_sym = sp.expand(sum(momenta[a] * dt_phis[a] for a in range(3)) - L_expr)
 
-    # Pre-compile 1D Gate-5 vacuum potential V(phi1; c_w, m_eff, g4, g6, k_skyrme)
+    # Pre-compile 1D Gate-5 vacuum potential V(phi1; c_w, m_eff, g4, g6, k_skyrme) at Minkowski infinity (U = 0)
     V_sym_unsub = -L_expr.subs({
         dt_phi1: 0, dt_phi2: 0, dt_phi3: 0,
         dx_phi1: 0, dy_phi1: 0, dz_phi1: 0,
         dx_phi2: 0, dy_phi2: 0, dz_phi2: 0,
         dx_phi3: 0, dy_phi3: 0, dz_phi3: 0,
         phi2: 0, phi3: 0,
+        U_field: 0,
     })
     v_fn_param = sp.lambdify((phi1, c_w, m_eff, g4, g6, k_skyrme), V_sym_unsub, modules="numpy")
 
@@ -1373,6 +1468,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
     oct_np_pi_x: List[Callable] = []
     oct_np_pi_y: List[Callable] = []
     oct_np_pi_z: List[Callable] = []
+    oct_np_kinv: List[Callable] = []
 
     cpu_modules = [{"_cpu_clamp_pos": lambda x: np.maximum(np.abs(x), 1e-12)}, "numpy"]
 
@@ -1383,29 +1479,30 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         pi_y_raw = [sp.diff(L_expr, grad_phis[b][1]) for b in range(3)]
         pi_z_raw = [sp.diff(L_expr, grad_phis[b][2]) for b in range(3)]
 
-        kinv_dL_dphi = [sum(K_inv_oct[a, b] * dL_dphi_raw[b] for b in range(3)) for a in range(3)]
-        kinv_pi_x = [sum(K_inv_oct[a, b] * pi_x_raw[b] for b in range(3)) for a in range(3)]
-        kinv_pi_y = [sum(K_inv_oct[a, b] * pi_y_raw[b] for b in range(3)) for a in range(3)]
-        kinv_pi_z = [sum(K_inv_oct[a, b] * pi_z_raw[b] for b in range(3)) for a in range(3)]
+        r1_el, r2_el, r3_el = sp.symbols("r1_el r2_el r3_el", real=True)
+        r_el_syms = (r1_el, r2_el, r3_el)
+        kinv_apply_exprs = [sum(K_inv_oct[a, b] * r_el_syms[b] for b in range(3)) for a in range(3)]
 
         grad_sym_set = {
             dx_phi1, dy_phi1, dz_phi1,
             dx_phi2, dy_phi2, dz_phi2,
             dx_phi3, dy_phi3, dz_phi3,
         }
-        dL_dphi_has_grad = any(bool(expr.free_symbols & grad_sym_set) for expr in kinv_dL_dphi)
+        dL_dphi_has_grad = any(bool(expr.free_symbols & grad_sym_set) for expr in dL_dphi_raw)
 
         octant_helpers_glsl = (
-            _emit_gpu_octant_vec3_helper("_eval_dL_dphi", kinv_dL_dphi, "glsl")
-            + _emit_gpu_octant_vec3_helper("_eval_pi_x", kinv_pi_x, "glsl")
-            + _emit_gpu_octant_vec3_helper("_eval_pi_y", kinv_pi_y, "glsl")
-            + _emit_gpu_octant_vec3_helper("_eval_pi_z", kinv_pi_z, "glsl")
+            _emit_gpu_octant_vec3_helper("_eval_dL_dphi", dL_dphi_raw, "glsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_x", pi_x_raw, "glsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_y", pi_y_raw, "glsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_z", pi_z_raw, "glsl")
+            + _emit_gpu_kinv_helper(kinv_apply_exprs, "glsl")
         )
         octant_helpers_wgsl = (
-            _emit_gpu_octant_vec3_helper("_eval_dL_dphi", kinv_dL_dphi, "wgsl")
-            + _emit_gpu_octant_vec3_helper("_eval_pi_x", kinv_pi_x, "wgsl")
-            + _emit_gpu_octant_vec3_helper("_eval_pi_y", kinv_pi_y, "wgsl")
-            + _emit_gpu_octant_vec3_helper("_eval_pi_z", kinv_pi_z, "wgsl")
+            _emit_gpu_octant_vec3_helper("_eval_dL_dphi", dL_dphi_raw, "wgsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_x", pi_x_raw, "wgsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_y", pi_y_raw, "wgsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_z", pi_z_raw, "wgsl")
+            + _emit_gpu_kinv_helper(kinv_apply_exprs, "wgsl")
         )
         glsl_cse_block, glsl_accs = "", ("0.0", "0.0", "0.0")
         wgsl_cse_block, wgsl_accs = "", ("0.0", "0.0", "0.0")
@@ -1415,19 +1512,28 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
             dx_phi1, dy_phi1, dz_phi1,
             dx_phi2, dy_phi2, dz_phi2,
             dx_phi3, dy_phi3, dz_phi3,
+            U_field,
+            c_w, m_eff, g4, g6, k_skyrme,
+        )
+        kinv_vars = (
+            r1_el, r2_el, r3_el,
+            U_field,
             c_w, m_eff, g4, g6, k_skyrme,
         )
         oct_np_dL_dphi = [
-            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in kinv_dL_dphi
+            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in dL_dphi_raw
         ]
         oct_np_pi_x = [
-            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in kinv_pi_x
+            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in pi_x_raw
         ]
         oct_np_pi_y = [
-            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in kinv_pi_y
+            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in pi_y_raw
         ]
         oct_np_pi_z = [
-            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in kinv_pi_z
+            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in pi_z_raw
+        ]
+        oct_np_kinv = [
+            sp.lambdify(kinv_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in kinv_apply_exprs
         ]
         acc_np_fns = []
     else:
@@ -1441,6 +1547,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
                 dx_phi2, dy_phi2, dz_phi2,
                 dx_phi3, dy_phi3, dz_phi3,
                 lap_phi1, lap_phi2, lap_phi3,
+                U_field, dx_U, dy_U, dz_U,
                 c_w, m_eff, g4, g6, k_skyrme,
             )
             acc_np_fns = [
@@ -1461,6 +1568,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
                 dx_dt_phi1, dy_dt_phi1, dz_dt_phi1,
                 dx_dt_phi2, dy_dt_phi2, dz_dt_phi2,
                 dx_dt_phi3, dy_dt_phi3, dz_dt_phi3,
+                U_field, dx_U, dy_U, dz_U,
                 c_w, m_eff, g4, g6, k_skyrme,
             )
             acc_np_fns = [
@@ -1496,30 +1604,16 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         vel_arr: Optional[np.ndarray] = None,
         dx_step: Optional[float] = None,
         p_k_skyrme: Optional[float] = None,
+        u_arr: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Evaluates exact 3-component Euler-Lagrange accelerations on 3D NumPy grids `(3, Z, Y, X)`."""
         ks_val = float(mod.parameters.k_skyrme) if p_k_skyrme is None else float(p_k_skyrme)
         v_use = np.zeros_like(phi_arr) if vel_arr is None else vel_arr
-        if not needs_full_hessian:
-            args = (
-                phi_arr[0], phi_arr[1], phi_arr[2],
-                v_use[0], v_use[1], v_use[2],
-                grad_arr[0, 0], grad_arr[0, 1], grad_arr[0, 2],
-                grad_arr[1, 0], grad_arr[1, 1], grad_arr[1, 2],
-                grad_arr[2, 0], grad_arr[2, 1], grad_arr[2, 2],
-                lap_arr[0], lap_arr[1], lap_arr[2],
-                p_cw, p_meff, p_g4, p_g6, ks_val,
-            )
-            out = np.empty_like(phi_arr)
-            for comp_i, fn in enumerate(acc_np_fns):
-                val = fn(*args)
-                out[comp_i] = val if isinstance(val, np.ndarray) else np.full_like(phi_arr[0], float(val))
-            return out
 
         h = 1.0
         if dx_step is not None:
             h = float(dx_step)
-        elif phi_arr.ndim == 4 and grad_arr.ndim == 5 and phi_arr.shape[-1] >= 4:
+        elif (needs_full_hessian or u_arr is not None) and phi_arr.ndim == 4 and grad_arr.ndim == 5 and phi_arr.shape[-1] >= 4:
             for c_i in range(min(3, phi_arr.shape[0])):
                 gx = grad_arr[c_i, 0]
                 mask = np.abs(gx) > 1.0e-4
@@ -1531,6 +1625,34 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
                         h = h_mean
                         break
 
+        if not needs_full_hessian:
+            if u_arr is None:
+                u_val: Any = 0.0
+                dx_u: Any = 0.0
+                dy_u: Any = 0.0
+                dz_u: Any = 0.0
+            else:
+                u_val = np.clip(np.asarray(u_arr, dtype=phi_arr.dtype), -0.35, 0.75)
+                inv_2h = 0.5 / h
+                dx_u = (np.roll(u_val, -1, axis=2) - np.roll(u_val, 1, axis=2)) * inv_2h
+                dy_u = (np.roll(u_val, -1, axis=1) - np.roll(u_val, 1, axis=1)) * inv_2h
+                dz_u = (np.roll(u_val, -1, axis=0) - np.roll(u_val, 1, axis=0)) * inv_2h
+            args = (
+                phi_arr[0], phi_arr[1], phi_arr[2],
+                v_use[0], v_use[1], v_use[2],
+                grad_arr[0, 0], grad_arr[0, 1], grad_arr[0, 2],
+                grad_arr[1, 0], grad_arr[1, 1], grad_arr[1, 2],
+                grad_arr[2, 0], grad_arr[2, 1], grad_arr[2, 2],
+                lap_arr[0], lap_arr[1], lap_arr[2],
+                u_val, dx_u, dy_u, dz_u,
+                p_cw, p_meff, p_g4, p_g6, ks_val,
+            )
+            out = np.empty_like(phi_arr)
+            for comp_i, fn in enumerate(acc_np_fns):
+                val = fn(*args)
+                out[comp_i] = val if isinstance(val, np.ndarray) else np.full_like(phi_arr[0], float(val))
+            return out
+
         if use_variational_octant_flux:
             inv_dx = 1.0 / h
             c = phi_arr
@@ -1540,6 +1662,23 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
             ym = np.roll(c, 1, axis=2)
             zp = np.roll(c, -1, axis=1)
             zm = np.roll(c, 1, axis=1)
+
+            if u_arr is None:
+                u_c: Any = 0.0
+                u_xp: Any = 0.0
+                u_xm: Any = 0.0
+                u_yp: Any = 0.0
+                u_ym: Any = 0.0
+                u_zp: Any = 0.0
+                u_zm: Any = 0.0
+            else:
+                u_c = np.clip(np.asarray(u_arr, dtype=phi_arr.dtype), -0.35, 0.75)
+                u_xp = np.roll(u_c, -1, axis=2)
+                u_xm = np.roll(u_c, 1, axis=2)
+                u_yp = np.roll(u_c, -1, axis=1)
+                u_ym = np.roll(u_c, 1, axis=1)
+                u_zp = np.roll(u_c, -1, axis=0)
+                u_zm = np.roll(u_c, 1, axis=0)
 
             xmyp = np.roll(xm, -1, axis=2)
             xpym = np.roll(xp, 1, axis=2)
@@ -1555,12 +1694,20 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
             gy_cm = (c - ym) * inv_dx
             gz_cm = (c - zm) * inv_dx
 
-            def _eval_oct_vec(fns: List[Callable], p_v: np.ndarray, gx_v: np.ndarray, gy_v: np.ndarray, gz_v: np.ndarray) -> np.ndarray:
+            def _eval_oct_vec(
+                fns: List[Callable],
+                p_v: np.ndarray,
+                gx_v: np.ndarray,
+                gy_v: np.ndarray,
+                gz_v: np.ndarray,
+                u_v: Any,
+            ) -> np.ndarray:
                 o_args = (
                     p_v[0], p_v[1], p_v[2],
                     gx_v[0], gy_v[0], gz_v[0],
                     gx_v[1], gy_v[1], gz_v[1],
                     gx_v[2], gy_v[2], gz_v[2],
+                    u_v,
                     p_cw, p_meff, p_g4, p_g6, ks_val,
                 )
                 res = np.empty_like(phi_arr)
@@ -1569,31 +1716,37 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
                     res[a_i] = v_a if isinstance(v_a, np.ndarray) else np.full_like(phi_arr[0], float(v_a))
                 return res
 
-            pi_x_cp = _eval_oct_vec(oct_np_pi_x, c, gx_cp, gy_cp, gz_cp)
-            pi_y_cp = _eval_oct_vec(oct_np_pi_y, c, gx_cp, gy_cp, gz_cp)
-            pi_z_cp = _eval_oct_vec(oct_np_pi_z, c, gx_cp, gy_cp, gz_cp)
-            pi_x_xmp = _eval_oct_vec(oct_np_pi_x, xm, gx_cm, (xmyp - xm) * inv_dx, (xmzp - xm) * inv_dx)
-            pi_y_ymp = _eval_oct_vec(oct_np_pi_y, ym, (xpym - ym) * inv_dx, gy_cm, (ymzp - ym) * inv_dx)
-            pi_z_zmp = _eval_oct_vec(oct_np_pi_z, zm, (xpzm - zm) * inv_dx, (ypzm - zm) * inv_dx, gz_cm)
+            pi_x_cp = _eval_oct_vec(oct_np_pi_x, c, gx_cp, gy_cp, gz_cp, u_c)
+            pi_y_cp = _eval_oct_vec(oct_np_pi_y, c, gx_cp, gy_cp, gz_cp, u_c)
+            pi_z_cp = _eval_oct_vec(oct_np_pi_z, c, gx_cp, gy_cp, gz_cp, u_c)
+            pi_x_xmp = _eval_oct_vec(oct_np_pi_x, xm, gx_cm, (xmyp - xm) * inv_dx, (xmzp - xm) * inv_dx, u_xm)
+            pi_y_ymp = _eval_oct_vec(oct_np_pi_y, ym, (xpym - ym) * inv_dx, gy_cm, (ymzp - ym) * inv_dx, u_ym)
+            pi_z_zmp = _eval_oct_vec(oct_np_pi_z, zm, (xpzm - zm) * inv_dx, (ypzm - zm) * inv_dx, gz_cm, u_zm)
 
-            pi_x_cm = _eval_oct_vec(oct_np_pi_x, c, gx_cm, gy_cm, gz_cm)
-            pi_y_cm = _eval_oct_vec(oct_np_pi_y, c, gx_cm, gy_cm, gz_cm)
-            pi_z_cm = _eval_oct_vec(oct_np_pi_z, c, gx_cm, gy_cm, gz_cm)
-            pi_x_xpm = _eval_oct_vec(oct_np_pi_x, xp, gx_cp, (xp - xpym) * inv_dx, (xp - xpzm) * inv_dx)
-            pi_y_ypm = _eval_oct_vec(oct_np_pi_y, yp, (yp - xmyp) * inv_dx, gy_cp, (yp - ypzm) * inv_dx)
-            pi_z_zpm = _eval_oct_vec(oct_np_pi_z, zp, (zp - xmzp) * inv_dx, (zp - ymzp) * inv_dx, gz_cp)
+            pi_x_cm = _eval_oct_vec(oct_np_pi_x, c, gx_cm, gy_cm, gz_cm, u_c)
+            pi_y_cm = _eval_oct_vec(oct_np_pi_y, c, gx_cm, gy_cm, gz_cm, u_c)
+            pi_z_cm = _eval_oct_vec(oct_np_pi_z, c, gx_cm, gy_cm, gz_cm, u_c)
+            pi_x_xpm = _eval_oct_vec(oct_np_pi_x, xp, gx_cp, (xp - xpym) * inv_dx, (xp - xpzm) * inv_dx, u_xp)
+            pi_y_ypm = _eval_oct_vec(oct_np_pi_y, yp, (yp - xmyp) * inv_dx, gy_cp, (yp - ypzm) * inv_dx, u_yp)
+            pi_z_zpm = _eval_oct_vec(oct_np_pi_z, zp, (zp - xmzp) * inv_dx, (zp - ymzp) * inv_dx, gz_cp, u_zp)
 
             if dL_dphi_has_grad:
                 f_pot = 0.5 * (
-                    _eval_oct_vec(oct_np_dL_dphi, c, gx_cp, gy_cp, gz_cp)
-                    + _eval_oct_vec(oct_np_dL_dphi, c, gx_cm, gy_cm, gz_cm)
+                    _eval_oct_vec(oct_np_dL_dphi, c, gx_cp, gy_cp, gz_cp, u_c)
+                    + _eval_oct_vec(oct_np_dL_dphi, c, gx_cm, gy_cm, gz_cm, u_c)
                 )
             else:
-                f_pot = _eval_oct_vec(oct_np_dL_dphi, c, gx_cp, gy_cp, gz_cp)
+                f_pot = _eval_oct_vec(oct_np_dL_dphi, c, gx_cp, gy_cp, gz_cp, u_c)
 
             div_plus = ((pi_x_cp - pi_x_xmp) + (pi_y_cp - pi_y_ymp) + (pi_z_cp - pi_z_zmp)) * inv_dx
             div_minus = ((pi_x_xpm - pi_x_cm) + (pi_y_ypm - pi_y_cm) + (pi_z_zpm - pi_z_cm)) * inv_dx
-            return f_pot - 0.5 * (div_plus + div_minus)
+            raw_el = f_pot - 0.5 * (div_plus + div_minus)
+            k_args = (raw_el[0], raw_el[1], raw_el[2], u_c, p_cw, p_meff, p_g4, p_g6, ks_val)
+            out_oct = np.empty_like(phi_arr)
+            for a_i, fn_k in enumerate(oct_np_kinv):
+                v_k = fn_k(*k_args)
+                out_oct[a_i] = v_k if isinstance(v_k, np.ndarray) else np.full_like(phi_arr[0], float(v_k))
+            return out_oct
 
         inv_dx2 = 1.0 / (h * h)
         inv_4dx2 = 0.25 * inv_dx2
@@ -1633,6 +1786,13 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
             gv2 = (0.0, 0.0, 0.0)
             gv3 = (0.0, 0.0, 0.0)
 
+        if u_arr is None:
+            u_full: Any = 0.0
+            gu_full: Tuple[Any, Any, Any] = (0.0, 0.0, 0.0)
+        else:
+            u_full = np.clip(np.asarray(u_arr, dtype=phi_arr.dtype), -0.35, 0.75)
+            gu_full = _grad_comp(u_full)
+
         args = (
             phi_arr[0], phi_arr[1], phi_arr[2],
             v_use[0], v_use[1], v_use[2],
@@ -1642,6 +1802,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
             lap_arr[0], lap_arr[1], lap_arr[2],
             *h1, *h2, *h3,
             *gv1, *gv2, *gv3,
+            u_full, *gu_full,
             p_cw, p_meff, p_g4, p_g6, ks_val,
         )
 
@@ -1657,6 +1818,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         dx_phi1, dy_phi1, dz_phi1,
         dx_phi2, dy_phi2, dz_phi2,
         dx_phi3, dy_phi3, dz_phi3,
+        U_field,
         c_w, m_eff, g4, g6, k_skyrme,
     )
     ham_np_raw = sp.lambdify(ham_vars, _regularize_cpu_expr(H_sym), modules=cpu_modules)
@@ -1670,14 +1832,17 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         p_g4: float,
         p_g6: float,
         p_k_skyrme: Optional[float] = None,
+        u_arr: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         ks_val = 0.0 if p_k_skyrme is None else float(p_k_skyrme)
+        u_use: Any = 0.0 if u_arr is None else np.clip(np.asarray(u_arr, dtype=phi_arr.dtype), -0.35, 0.75)
         args = (
             phi_arr[0], phi_arr[1], phi_arr[2],
             vel_arr[0], vel_arr[1], vel_arr[2],
             grad_arr[0, 0], grad_arr[0, 1], grad_arr[0, 2],
             grad_arr[1, 0], grad_arr[1, 1], grad_arr[1, 2],
             grad_arr[2, 0], grad_arr[2, 1], grad_arr[2, 2],
+            u_use,
             p_cw, p_meff, p_g4, p_g6, ks_val,
         )
         val = ham_np_raw(*args)
@@ -1991,6 +2156,7 @@ def _evaluate_from_cached_template(tpl: _CachedSymbolicTemplate, mod: PhysicsMod
         vel_arr: Optional[np.ndarray] = None,
         dx_step: Optional[float] = None,
         p_k_skyrme: Optional[float] = None,
+        u_arr: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         ks_use = default_k_s if p_k_skyrme is None else float(p_k_skyrme)
         return raw_accel_fn(
@@ -2004,6 +2170,7 @@ def _evaluate_from_cached_template(tpl: _CachedSymbolicTemplate, mod: PhysicsMod
             vel_arr=vel_arr,
             dx_step=dx_step,
             p_k_skyrme=ks_use,
+            u_arr=u_arr,
         )
 
     def hamiltonian_numpy_bound(
@@ -2015,6 +2182,7 @@ def _evaluate_from_cached_template(tpl: _CachedSymbolicTemplate, mod: PhysicsMod
         g4_arg: float,
         g6_arg: float,
         p_k_skyrme: Optional[float] = None,
+        u_arr: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         ks_use = default_k_s if p_k_skyrme is None else float(p_k_skyrme)
         return raw_ham_fn(
@@ -2026,6 +2194,7 @@ def _evaluate_from_cached_template(tpl: _CachedSymbolicTemplate, mod: PhysicsMod
             g4_arg,
             g6_arg,
             p_k_skyrme=ks_use,
+            u_arr=u_arr,
         )
 
     return CompiledMasterAction(

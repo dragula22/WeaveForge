@@ -7,11 +7,10 @@ author = "David Stoler & TNaP Open-Science Collective"
 summary = "One continuous, unbreakable standing-wave weave: 3D knots/braids = matter, Hubble-clamped Bose-Einstein Unruh pullback a0 = c*H0/(sqrt(3)*pi) = 1.203e-10 m/s^2 (0% Dark Matter, zero free galactic knobs!), exponential optical metric n(r)=exp(2U) (+4.63% BHEX shadow), Planck-tension R=2GM/c^2 (1.000000) spool, and CPT hourglass waist clamping."
 
 [action]
-# Self-trapping 3D nonlinear topological knot/braid wave weave in Coleman (1985) + Skyrme-Faddeev regime:
-# Scale-invariant Faddeev-Niemi unit-sphere twist stiffness (-k_skyrme * (...) * S_skyrme) + S^2 vacuum shell
-# lock 3D Trefoil knots (Q_H=+7), Z_3 braids (Q_H=+9), & Linked Hopfions (Q_H=-6) into Derrick-balanced
-# 3D topological equilibrium while keeping empty space phi=0 globally stable (V >= 0)!
-field_lagrangian = "T_kin - c_w**2 * G_grad - k_skyrme * (0.7098 / (0.8425 + rho + 1.70 * phi3)**2) * S_skyrme - 0.5 * m_eff**2 * rho + 0.25 * g4 * (rho + 1.70 * phi3)**2 - (1.0/6.0) * g6 * rho * (rho + 1.70 * phi3)**2 - 80.0 * phi3**2 * (rho + 1.70 * phi3)**2 - 120.0 * (rho + 1.70 * phi3)**2 / (1.0 + 0.25 * (rho + 1.70 * phi3)**6) - 12000.0 * (exp(-9.0 * (0.7225 + rho + 1.70 * phi3)) - 0.0014996858)**2"
+# Self-trapping 3D nonlinear topological knot/braid wave weave coupled to massless tension channel U(x):
+# Exact exponential-weave density exp(+4U)*T_kin - c_w^2*G_grad - exp(-2U)*L_Skyrme - exp(+2U)*V(phi)
+# paired with nabla^2 U = -g_knot * rho_H produces BOTH emergent 1/r^2 gravity AND n(U)=exp(2U) lensing!
+field_lagrangian = "exp(4 * U) * T_kin - c_w**2 * G_grad - exp(-2 * U) * k_skyrme * (0.7098 / (0.8425 + rho + 1.70 * phi3)**2) * S_skyrme - exp(2 * U) * (0.5 * m_eff**2 * rho - 0.25 * g4 * (rho + 1.70 * phi3)**2 + (1.0/6.0) * g6 * rho * (rho + 1.70 * phi3)**2 + 80.0 * phi3**2 * (rho + 1.70 * phi3)**2 + 120.0 * (rho + 1.70 * phi3)**2 / (1.0 + 0.25 * (rho + 1.70 * phi3)**6) + 12000.0 * (exp(-9.0 * (0.7225 + rho + 1.70 * phi3)) - 0.0014996858)**2)"
 # Exponential Optical Weave Metric: n(U) = exp(2*U), A(U) = exp(-2*U), where U = GM/(r*c^2)
 # -> Exact 1PN match (PPN gamma = 1, beta = 1; ISS -24.57 us/day, 3,189.1 km = 0.00 us/day, GPS +38.64 us/day)
 # -> Falsifiable 2PN prediction: Photon-ring shadow = 2*e * r_g = 5.43656 r_g (+4.63% wider for BHEX!)
@@ -29,6 +28,7 @@ m_eff = 0.72
 g4 = 0.80
 g6 = 3.10
 k_skyrme = 1.55
+g_knot = 0.90                 # Massless weave-tension Poisson coupling nabla^2 U = -g_knot * rho_H!
 a0_si = 1.202712e-10          # Locked: c * H0 / (sqrt(3) * pi) from Planck 2018 H0 = 67.36 (Zenodo 10.5281/zenodo.23919217)!
 has_cdm_halo = false
 cdm_halo_scale = 0.0
