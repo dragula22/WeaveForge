@@ -847,7 +847,7 @@ def evaluate_observational_crucible(
         round(wa, 3),
     )
 
-    # 4. Gaia DR4 Wide-Binary |z_gal| Curves
+    # 4. Gaia DR4 Wide-Binary |z_gal| Curves (Conservative 3D Two-Body QUMOND, Zenodo 10.5281/zenodo.23919217)
     wb = compute_wide_binary_efe_curves(
         compiled.nu_numpy_fn,
         mod.parameters.a0_si,
@@ -855,6 +855,11 @@ def evaluate_observational_crucible(
     )
     disk_boost = float(wb["boost_disk_15k_pct"])
     halo_boost = float(wb["boost_halo_15k_pct"])
+    inner_boost = float(wb.get("boost_inner_disk_15k_pct", disk_boost))
+    outer_boost = float(wb.get("boost_outer_thick_15k_pct", disk_boost))
+    lower_halo_boost = float(wb.get("boost_lower_halo_15k_pct", halo_boost))
+    gc_split = float(wb.get("compass_split_15k_pct", 0.0))
+    zenodo_doi = str(wb.get("zenodo_doi", "10.5281/zenodo.23919217"))
 
     badges: List[CrucibleBadge] = []
 
@@ -976,25 +981,28 @@ def evaluate_observational_crucible(
     ))
 
     # -------------------------------------------------------------------------
-    # BADGE 5: Dec 2, 2026 Gaia DR4 Wide-Binary |z_gal| Falsification Pipeline
+    # BADGE 5: Dec 2, 2026 Gaia DR4 Wide-Binary 3D QUMOND Falsification Pipeline
     # -------------------------------------------------------------------------
     if halo_boost > 5.0:
         wb_status = "FORECAST"
+        wb_headline = f"Solar {disk_boost:+.2f}% | GC {gc_split:+.2f}%"
         wb_detail = (
-            f"LIVE FALSIFICATION (Gaia DR4 Dec 2, 2026): Predicts +{disk_boost:.1f}% boost in Disk (|z|<0.15 kpc) "
-            f"rising to +{halo_boost:.1f}% in Halo (|z|>5 kpc) at s = 15,000 AU! Zero free knobs to hide behind."
+            f"Zenodo {zenodo_doi} (Gaia DR4 Dec 2, 2026, 15k AU 3D QUMOND): Solar {disk_boost:+.2f}%, "
+            f"GC Compass {gc_split:+.2f}%, d<=2.5 kpc {inner_boost:+.2f}%->{outer_boost:+.2f}%->{lower_halo_boost:+.2f}% "
+            f"(Deep Halo {halo_boost:+.2f}%)."
         )
     else:
         wb_status = "FORECAST"
+        wb_headline = f"Solar {disk_boost:+.2f}% | GC {gc_split:+.2f}%"
         wb_detail = (
-            f"LIVE FALSIFICATION (Gaia DR4 Dec 2, 2026): Predicts {disk_boost:+.1f}% (strictly Keplerian 0% boost) "
-            f"at all galactic heights |z_gal|. Any clean halo boost > 10% falsifies pure NFW CDM at AU scales."
+            f"Zenodo {zenodo_doi} (Gaia DR4 Dec 2, 2026): Predicts {disk_boost:+.2f}% boost & {gc_split:+.2f}% GC compass "
+            f"across all environments. Any clean wide-binary boost or compass split falsifies smooth NFW CDM."
         )
     badges.append(CrucibleBadge(
         badge_id="gaia_dr4",
         dataset_name="Gaia DR4 Wide Binaries",
         status=wb_status,
-        headline_metric=f"Disk {disk_boost:+.1f}% -> Halo {halo_boost:+.1f}%",
+        headline_metric=wb_headline,
         detail_honest=wb_detail,
     ))
 

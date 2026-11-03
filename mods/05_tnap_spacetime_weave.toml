@@ -29,7 +29,7 @@ m_eff = 0.72
 g4 = 0.80
 g6 = 3.10
 k_skyrme = 1.55
-a0_si = 1.2031e-10            # Locked: c * H0 / (sqrt(3) * pi) from Astropy Planck18!
+a0_si = 1.202712e-10          # Locked: c * H0 / (sqrt(3) * pi) from Planck 2018 H0 = 67.36 (Zenodo 10.5281/zenodo.23919217)!
 has_cdm_halo = false
 cdm_halo_scale = 0.0
 waist_clamping_ell = 3.21     # Two-wing CPT catenoid Big Bang waist suppresses CAMB CMB D_2 to ~334 uK^2!

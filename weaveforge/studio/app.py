@@ -3143,29 +3143,36 @@ class WeaveForgeStudioApp:
                 )
                 implot.end_plot()
 
-            # Chart 3: Dec 2, 2026 Gaia DR4 Wide-Binary |z_gal| Velocity Boost
+            # Chart 3: Dec 2, 2026 Gaia DR4 3D QUMOND Wide-Binary Boost (Zenodo 10.5281/zenodo.23919217)
             wb = rep.wb_curves
-            if wb and implot.begin_plot("Gaia DR4 Wide-Binary Boost vs log10(s/AU)", imgui.ImVec2(-1.0, plot_h)):
+            if wb and implot.begin_plot("Gaia DR4 3D QUMOND Boost vs log10(s/AU)", imgui.ImVec2(-1.0, plot_h)):
                 implot.setup_axes("log10(s [AU])", "Boost [%]")
                 implot.setup_legend(implot.Location_.north_west, implot.LegendFlags_.horizontal)
                 log_s = np.ascontiguousarray(np.log10(np.asarray(wb["r_au"], dtype=np.float64)))
                 b_d = np.ascontiguousarray(wb["boost_disk_pct"], dtype=np.float64)
+                b_l = np.ascontiguousarray(wb.get("boost_lower_halo_pct", wb["boost_halo_pct"]), dtype=np.float64)
                 b_h = np.ascontiguousarray(wb["boost_halo_pct"], dtype=np.float64)
-                bmax = max(float(np.max(b_h)), float(np.max(b_d)), 8.0) * 1.28
+                bmax = max(float(np.max(b_h)), float(np.max(b_l)), float(np.max(b_d)), 8.0) * 1.28
                 bmin = min(float(np.min(b_d)), -1.5)
                 implot.setup_axes_limits(float(log_s[0]), float(log_s[-1]), bmin, bmax, implot.Cond_.always)
 
                 implot.plot_line(
-                    "Disk |z|~0",
+                    "Solar",
                     log_s,
                     b_d,
                     spec=implot.Spec(line_color=COL_FORECAST, line_weight=2.1 * w_scale),
                 )
                 implot.plot_line(
-                    "Halo |z|=6 kpc",
+                    "d<=2.5kpc",
+                    log_s,
+                    b_l,
+                    spec=implot.Spec(line_color=COL_PASS, line_weight=2.1 * w_scale),
+                )
+                implot.plot_line(
+                    "Deep Halo",
                     log_s,
                     b_h,
-                    spec=implot.Spec(line_color=COL_WARN, line_weight=2.5 * w_scale),
+                    spec=implot.Spec(line_color=COL_WARN, line_weight=2.4 * w_scale),
                 )
                 implot.end_plot()
 
