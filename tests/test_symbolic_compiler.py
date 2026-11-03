@@ -135,7 +135,8 @@ def test_negative_signed_fields_produce_zero_nans_in_compiled_callables() -> Non
 
 
 def test_physics_mod_toml_roundtrip() -> None:
-    orig = get_mods_by_id()["tnap_weave"]
+    orig = get_mods_by_id()["tnap_weave"].clone(new_id="roundtrip_skyrme")
+    orig.parameters.k_skyrme = 0.625
     raw = orig.to_toml_string().encode("utf-8")
     reloaded = PhysicsMod.from_toml_bytes(raw)
     assert reloaded.id == orig.id
@@ -143,6 +144,7 @@ def test_physics_mod_toml_roundtrip() -> None:
     assert reloaded.action.metric_lapse_A == orig.action.metric_lapse_A
     assert math.isclose(reloaded.parameters.a0_si, orig.parameters.a0_si, rel_tol=1e-5)
     assert reloaded.parameters.pinned_pleat_coupling == orig.parameters.pinned_pleat_coupling
+    assert math.isclose(reloaded.parameters.k_skyrme, 0.625, rel_tol=1e-9)
 
 
 def test_coleman_false_vacuum_detected_by_gate5() -> None:
@@ -228,4 +230,68 @@ def test_emit_gpu_expr_negative_and_high_odd_powers_preserve_sign() -> None:
     acc = comp.accel_numpy_fn(phi, grad, lap, 1.0, 1.0, 0.0, 0.0)
     # At phi1 = -1.2 < 0, restoring force -phi1**9 = -(-1.2)^9 = +5.15978 > 0!
     assert math.isclose(float(acc[0, 0, 0, 0]), 1.2**9, rel_tol=1e-6)
+
+
+def test_skyrme_faddeev_twist_symbol_compilation_positivity_and_self_adjoint_octant() -> None:
+    skyrme_mod = PhysicsMod(
+        id="skyrme_unit_test",
+        name="Skyrme-Faddeev Twist Test",
+        author="Pytest",
+        summary="Verifies S_skyrme symbol, positive Hamiltonian contribution, and self-adjoint octant flux",
+        action=ActionSpec(
+            field_lagrangian="T_kin - c_w**2 * G_grad - k_skyrme * S_skyrme - 0.5 * m_eff**2 * rho"
+        ),
+        parameters=ModParameters(c_w=1.0, m_eff=1.2, g4=0.0, g6=0.0, k_skyrme=0.55),
+    )
+    comp = compile_master_action(skyrme_mod)
+    assert comp.all_critical_passed is True
+    assert comp.all_gates_passed is True
+    assert "k_skyrme" in comp.glsl_compute_source
+    assert "k_skyrme" in comp.wgsl_compute_source
+    assert "_eval_pi_x" in comp.glsl_compute_source
+    assert "_eval_pi_x" in comp.wgsl_compute_source
+    assert "div_plus" in comp.glsl_compute_source
+    assert "div_plus" in comp.wgsl_compute_source
+
+    base_mod = skyrme_mod.clone(new_id="no_skyrme_ref")
+    base_mod.parameters.k_skyrme = 0.0
+    comp_zero = compile_master_action(base_mod)
+
+    rng = np.random.default_rng(123)
+    phi = rng.normal(0.0, 0.8, size=(3, 6, 6, 6)).astype(np.float64)
+    vel = np.zeros_like(phi)
+    dx = 0.5
+    grad = np.stack(
+        [
+            (np.roll(phi, -1, axis=1 + d) - np.roll(phi, 1, axis=1 + d)) / (2.0 * dx)
+            for d in range(3)
+        ],
+        axis=1,
+    )
+    ham_sk = comp.hamiltonian_numpy_fn(phi, vel, grad, 1.0, 1.2, 0.0, 0.0, 0.55)
+    ham_0 = comp_zero.hamiltonian_numpy_fn(phi, vel, grad, 1.0, 1.2, 0.0, 0.0, 0.0)
+    # Non-collinear gradients give strictly positive Skyrme Hamiltonian density everywhere!
+    assert np.all(ham_sk > ham_0 + 1e-8)
+
+    # Collinear gradients (phi1 = phi2 = phi3) have d_i phi x d_j phi == 0 -> zero Skyrme energy!
+    phi_col = np.repeat(phi[:1], 3, axis=0)
+    grad_col = np.repeat(grad[:1], 3, axis=0)
+    ham_col_sk = comp.hamiltonian_numpy_fn(phi_col, vel, grad_col, 1.0, 1.2, 0.0, 0.0, 0.55)
+    ham_col_0 = comp_zero.hamiltonian_numpy_fn(phi_col, vel, grad_col, 1.0, 1.2, 0.0, 0.0, 0.0)
+    assert np.allclose(ham_col_sk, ham_col_0, atol=1e-12)
+
+    # Verify exact discrete variational self-adjointness (J == J^T) of the octant Euler-Lagrange operator!
+    dphi_a = rng.normal(0.0, 1e-4, size=phi.shape)
+    dphi_b = rng.normal(0.0, 1e-4, size=phi.shape)
+    lap_z = np.zeros_like(phi)
+    acc_pa = comp.accel_numpy_fn(phi + dphi_a, grad, lap_z, 1.0, 1.2, 0.0, 0.0, dx_step=dx, p_k_skyrme=0.55)
+    acc_ma = comp.accel_numpy_fn(phi - dphi_a, grad, lap_z, 1.0, 1.2, 0.0, 0.0, dx_step=dx, p_k_skyrme=0.55)
+    j_a = (acc_pa - acc_ma) * 0.5
+    acc_pb = comp.accel_numpy_fn(phi + dphi_b, grad, lap_z, 1.0, 1.2, 0.0, 0.0, dx_step=dx, p_k_skyrme=0.55)
+    acc_mb = comp.accel_numpy_fn(phi - dphi_b, grad, lap_z, 1.0, 1.2, 0.0, 0.0, dx_step=dx, p_k_skyrme=0.55)
+    j_b = (acc_pb - acc_mb) * 0.5
+    inner_ab = float(np.sum(dphi_b * j_a))
+    inner_ba = float(np.sum(dphi_a * j_b))
+    assert math.isclose(inner_ab, inner_ba, rel_tol=1e-7, abs_tol=1e-11)
+
 

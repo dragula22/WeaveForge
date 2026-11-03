@@ -23,6 +23,7 @@ c_w = 1.0
 m_eff = 0.0
 g4 = 4.0
 g6 = 0.0
+k_skyrme = 0.0
 a0_si = 1.203e-10
 has_cdm_halo = false
 cdm_halo_scale = 0.0

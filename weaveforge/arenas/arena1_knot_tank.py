@@ -124,6 +124,14 @@ uniform int u_N;
 uniform int u_preset;   // 0=trefoil, 1=z3_braid, 2=hopfion, 3=packet_smash
 uniform float u_box;
 
+vec2 cmul(vec2 a, vec2 b) {
+    return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+vec2 cconj(vec2 a) {
+    return vec2(a.x, -a.y);
+}
+
 void main() {
     ivec3 gid = ivec3(gl_GlobalInvocationID);
     if (gid.x >= u_N || gid.y >= u_N || gid.z >= u_N) return;
@@ -135,82 +143,153 @@ void main() {
 
     vec3 phi = vec3(0.0);
     vec3 vel = vec3(0.0);
+    const float v0 = 0.85;
 
     if (u_preset == 0) {
-        // C-infinity smooth line-integral 3D (2, 3) Torus Trefoil Knot in Coleman Q-Ball regime!
-        float scale_r = 0.112 * u_box;
-        float tube_w = 0.052 * u_box;
-        float inv_2w2 = 1.0 / (2.0 * tube_w * tube_w);
-        const int M = 96;
-        vec2 sum_cs = vec2(0.0);
-        float sum_z = 0.0;
-        for (int k = 0; k < M; ++k) {
-            float s = 6.2831853 * float(k) / float(M);
-            vec3 c = scale_r * vec3(
-                sin(s) + 2.0 * sin(2.0 * s),
-                cos(s) - 2.0 * cos(2.0 * s),
-                -1.35 * sin(3.0 * s)
-            );
-            vec3 diff = p - c;
-            float w = exp(-dot(diff, diff) * inv_2w2);
-            sum_cs += w * vec2(cos(3.0 * s), sin(3.0 * s));
-            sum_z  += w * sin(2.0 * s);
-        }
-        float norm_k = 0.37;
-        phi.x = norm_k * sum_cs.x;
-        phi.y = norm_k * sum_cs.y;
-        phi.z = 0.45 * norm_k * sum_z;
-        float omega0 = 2.25;
-        vel.x = -omega0 * phi.y;
-        vel.y =  omega0 * phi.x;
-        vel.z =  0.35 * omega0 * phi.z;
+        // Sutcliffe (2007, Eq. 3.7) T_(3,2) Trefoil Knot Rational Map (exact Hopf charge Q_H = +7!)
+        float a0 = 0.195 * u_box;
+        float r = length(p);
+        float rn = r / a0;
+        float rn2 = rn * rn;
+        float chi = 3.14159265 * exp(-0.6931472 * rn2 - 0.095 * rn2 * rn2);
+        float sc_over_r = (r > 1e-5) ? (sin(chi) / r) : 0.0;
+        vec2 Z1 = vec2(sc_over_r * p.x, sc_over_r * p.y);
+        vec2 Z2 = vec2(sc_over_r * p.z, cos(chi));
+        vec2 Z1_2 = cmul(Z1, Z1);
+        vec2 Z2_2 = cmul(Z2, Z2);
+        vec2 Q = cmul(Z1_2, Z1) + Z2_2;
+        vec2 P = 1.95 * cmul(Z1_2, Z2);
+        float denom = max(dot(P, P) + dot(Q, Q), 1e-12);
+        vec2 PQbar = cmul(P, cconj(Q));
+        vec3 n_vec = vec3(
+            2.0 * PQbar.x / denom,
+            2.0 * PQbar.y / denom,
+            (dot(Q, Q) - dot(P, P)) / denom
+        );
+        phi = v0 * vec3(n_vec.x, n_vec.y, n_vec.z - 1.0);
     }
     else if (u_preset == 1) {
-        // 3-Ribbon Z_3 Cyclic Generation Braid (Koide rational writhe theta0 = 2/9 rad)
-        float theta0 = 0.2222222;
-        float r_braid = 0.130 * u_box;
-        float tube_w = 0.048 * u_box;
-        float kz = 1.35 * 6.2831853 / u_box;
-        float yn = p.y / (0.33 * u_box);
-        float yn2 = yn * yn;
-        float y_env = exp(-(yn2 * yn2 * yn2));
-        float omega0 = 2.20;
-        for (int s = 0; s < 3; ++s) {
-            float ang = kz * p.y + theta0 + 2.0943951 * float(s);
-            vec3 center = vec3(r_braid * cos(ang), p.y, r_braid * sin(ang));
-            vec2 dxz = p.xz - center.xz;
-            float d2 = dot(dxz, dxz);
-            float env = 1.55 * y_env * exp(-d2 / (2.0 * tube_w * tube_w));
-            phi[s] = env * (0.85 + 0.20 * cos(ang));
-            vel[s] = omega0 * env * sin(ang);
+        // 3-Ribbon Z_3 Cyclic Generation Braid Link (Koide theta0 = 2/9 rad, exact Hopf charge Q_H = +9!)
+        float r_maj = 0.195 * u_box;
+        float r_braid = 0.080 * u_box;
+        float w0 = 0.068 * u_box;
+        float w_env = 0.098 * u_box;
+        float inv_wenv2 = 1.0 / (w_env * w_env);
+        const int M = 48;
+        vec2 W_sum = vec2(0.0);
+        bool hit_core = false;
+        for (int st_i = 0; st_i < 3; ++st_i) {
+            float off = 0.2222222 + 2.0943951 * float(st_i);
+            float best_d2 = 1e20;
+            float best_s = 0.0;
+            for (int k = 0; k < M; ++k) {
+                float s = 6.2831853 * float(k) / float(M);
+                float tw = s + off;
+                float rad = r_maj + r_braid * cos(tw);
+                vec3 c = vec3(rad * cos(s), rad * sin(s), -r_braid * sin(tw));
+                vec3 diff = p - c;
+                float d2 = dot(diff, diff);
+                if (d2 < best_d2) { best_d2 = d2; best_s = s; }
+            }
+            for (int it = 0; it < 2; ++it) {
+                float tw = best_s + off;
+                float rad = r_maj + r_braid * cos(tw);
+                vec3 bc = vec3(rad * cos(best_s), rad * sin(best_s), -r_braid * sin(tw));
+                vec3 dc_ds = vec3(
+                    -r_braid * sin(tw) * cos(best_s) - rad * sin(best_s),
+                    -r_braid * sin(tw) * sin(best_s) + rad * cos(best_s),
+                    -r_braid * cos(tw)
+                );
+                float ds = dot(p - bc, dc_ds) / max(dot(dc_ds, dc_ds), 1e-6);
+                best_s += clamp(ds, -0.09, 0.09);
+            }
+            float tw = best_s + off;
+            float rad = r_maj + r_braid * cos(tw);
+            vec3 best_c = vec3(rad * cos(best_s), rad * sin(best_s), -r_braid * sin(tw));
+            vec3 best_t = normalize(vec3(
+                -r_braid * sin(tw) * cos(best_s) - rad * sin(best_s),
+                -r_braid * sin(tw) * sin(best_s) + rad * cos(best_s),
+                -r_braid * cos(tw)
+            ));
+            vec3 er_xy = vec3(cos(best_s), sin(best_s), 0.0);
+            vec3 u_hat = normalize(er_xy - dot(er_xy, best_t) * best_t);
+            vec3 v_hat = cross(best_t, u_hat);
+            vec3 d_vec = p - best_c;
+            float u_p = dot(d_vec, u_hat);
+            float v_p = dot(d_vec, v_hat);
+            float d2 = dot(d_vec, d_vec);
+            float xi = d2 * inv_wenv2;
+            float A = w0 * exp(-xi - 0.15 * xi * xi);
+            float psi = -1.0 * best_s + off;
+            float qx = u_p * cos(psi) - v_p * sin(psi);
+            float qy = u_p * sin(psi) + v_p * cos(psi);
+            if (d2 < 1e-10) { hit_core = true; }
+            else { W_sum += (A / d2) * vec2(qx, qy); }
+        }
+        if (hit_core) {
+            phi = vec3(0.0, 0.0, -2.0 * v0);
+        } else {
+            float w2 = dot(W_sum, W_sum);
+            float den = 1.0 + w2;
+            vec3 n_vec = vec3(2.0 * W_sum.x / den, 2.0 * W_sum.y / den, (1.0 - w2) / den);
+            phi = v0 * vec3(n_vec.x, n_vec.y, n_vec.z - 1.0);
         }
     }
     else if (u_preset == 2) {
-        // Two Linked 3D Hopfion / Superfluid Vortex Rings in orthogonal planes
-        float r_maj = 0.165 * u_box;
-        float tube_w = 0.046 * u_box;
-        float dr1 = length(vec2(p.x + 0.075 * u_box, p.y)) - r_maj;
-        float dr2 = length(vec2(p.x - 0.075 * u_box, p.z)) - r_maj;
-        float d1 = dr1 * dr1 + p.z * p.z;
-        float d2 = dr2 * dr2 + p.y * p.y;
-        float a1 = 1.62 * exp(-d1 / (2.0 * tube_w * tube_w));
-        float a2 = 1.62 * exp(-d2 / (2.0 * tube_w * tube_w));
-        float ang1 = atan(p.y, p.x + 0.075 * u_box);
-        float ang2 = atan(p.z, p.x - 0.075 * u_box);
-        phi.x = a1 * cos(2.0 * ang1) + a2 * cos(2.0 * ang2);
-        phi.y = a1 * sin(2.0 * ang1) - a2 * sin(2.0 * ang2);
-        phi.z = 0.65 * (a1 - a2);
-        float omega0 = 2.20;
-        vel.x = -omega0 * phi.y;
-        vel.y =  omega0 * phi.x;
+        // Symmetric Orthogonal Linked 3D Hopfion Rings (6_1^2 link, exact Hopf charge Q_H = -6!)
+        float r_maj = 0.190 * u_box;
+        float x_off = 0.56 * r_maj;
+        float w0 = 0.072 * u_box;
+        float w_env = 0.102 * u_box;
+        float inv_wenv2 = 1.0 / (w_env * w_env);
+
+        float px1 = p.x + x_off;
+        float rc1_2 = px1 * px1 + p.y * p.y;
+        float reg1 = rc1_2 / (rc1_2 + 0.18 * r_maj * r_maj);
+        float s1 = atan(p.y, px1);
+        vec3 c1 = vec3(-x_off + r_maj * cos(s1), r_maj * sin(s1), 0.0);
+        vec3 u1 = vec3(cos(s1), sin(s1), 0.0);
+        vec3 v1 = vec3(0.0, 0.0, -1.0);
+        vec3 d1v = p - c1;
+        float d1_2 = dot(d1v, d1v);
+        float xi1 = d1_2 * inv_wenv2;
+        float A1 = w0 * reg1 * exp(-xi1 - 0.15 * xi1 * xi1);
+        float u1p = dot(d1v, u1); float v1p = dot(d1v, v1);
+        float psi1 = 2.0 * s1;
+        vec2 q1 = vec2(u1p * cos(psi1) - v1p * sin(psi1), u1p * sin(psi1) + v1p * cos(psi1));
+
+        float px2 = p.x - x_off;
+        float rc2_2 = px2 * px2 + p.z * p.z;
+        float reg2 = rc2_2 / (rc2_2 + 0.18 * r_maj * r_maj);
+        float s2 = atan(p.z, px2);
+        vec3 c2 = vec3(x_off + r_maj * cos(s2), 0.0, r_maj * sin(s2));
+        vec3 u2 = vec3(cos(s2), 0.0, sin(s2));
+        vec3 v2 = vec3(0.0, 1.0, 0.0);
+        vec3 d2v = p - c2;
+        float d2_2 = dot(d2v, d2v);
+        float xi2 = d2_2 * inv_wenv2;
+        float A2 = w0 * reg2 * exp(-xi2 - 0.15 * xi2 * xi2);
+        float u2p = dot(d2v, u2); float v2p = dot(d2v, v2);
+        float psi2 = 2.0 * s2;
+        vec2 q2 = vec2(u2p * cos(psi2) - v2p * sin(psi2), u2p * sin(psi2) + v2p * cos(psi2));
+
+        if (d1_2 < 1e-10 || d2_2 < 1e-10) {
+            phi = vec3(0.0, 0.0, -2.0 * v0);
+        } else {
+            vec2 W_sum = (A1 / d1_2) * q1 + (A2 / d2_2) * q2;
+            float w2 = dot(W_sum, W_sum);
+            float den = 1.0 + w2;
+            vec3 n_vec = vec3(2.0 * W_sum.x / den, 2.0 * W_sum.y / den, (1.0 - w2) / den);
+            phi = v0 * vec3(n_vec.x, n_vec.y, n_vec.z - 1.0);
+        }
     }
     else {
         // Head-on 3D Relativistic Wave-Packet Collision & Interference Fringes
         float sep = 0.20 * u_box;
         float w0 = 0.065 * u_box;
         float k_kick = 3.2;
-        float gL = 1.70 * exp(-((p.x + sep)*(p.x + sep) + p.y*p.y + p.z*p.z) / (2.0 * w0 * w0));
-        float gR = 1.70 * exp(-((p.x - sep)*(p.x - sep) + p.y*p.y + p.z*p.z) / (2.0 * w0 * w0));
+        float gL = 2.15 * exp(-((p.x + sep)*(p.x + sep) + p.y*p.y + p.z*p.z) / (2.0 * w0 * w0));
+        float gR = 2.15 * exp(-((p.x - sep)*(p.x - sep) + p.y*p.y + p.z*p.z) / (2.0 * w0 * w0));
         phi.x = gL * cos(k_kick * p.x) + gR * cos(-k_kick * p.x);
         phi.y = gL * sin(k_kick * p.x) + gR * sin(-k_kick * p.x);
         phi.z = 0.35 * (gL - gR);
@@ -227,6 +306,18 @@ void main() {
     vel_out[b + 1] = vel.y;
     vel_out[b + 2] = vel.z;
     imageStore(u_vol_tex, gid, vec4(rho, phi.x, phi.y, phi.z));
+}
+"""
+
+_ZERO_BUF_GLSL = """#version 430
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) writeonly buffer ZeroBuf { float buf_out[]; };
+uniform uint u_num_floats;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < u_num_floats) {
+        buf_out[idx] = 0.0;
+    }
 }
 """
 
@@ -269,6 +360,7 @@ uniform float c_w;
 uniform float m_eff;
 uniform float g4;
 uniform float g6;
+uniform float k_skyrme;
 
 shared float s_max_rho[256];
 shared float s_sum_rho[256];
@@ -291,6 +383,16 @@ vec3 load_vel(int idx) {{
     return vec3(vel_in[b], vel_in[b + 1], vel_in[b + 2]);
 }}
 
+float eval_ham_density(vec3 c, vec3 v, vec3 gx, vec3 gy, vec3 gz) {{
+    float phi1 = c.x; float phi2 = c.y; float phi3 = c.z;
+    float dt_phi1 = v.x; float dt_phi2 = v.y; float dt_phi3 = v.z;
+    float dx_phi1 = gx.x; float dy_phi1 = gy.x; float dz_phi1 = gz.x;
+    float dx_phi2 = gx.y; float dy_phi2 = gy.y; float dz_phi2 = gz.y;
+    float dx_phi3 = gx.z; float dy_phi3 = gy.z; float dz_phi3 = gz.z;
+    float rho = dot(c, c);
+    return {ham_expr_glsl};
+}}
+
 void main() {{
     uint lid = gl_LocalInvocationIndex;
     ivec3 sgid = ivec3(gl_GlobalInvocationID) * u_stride;
@@ -302,7 +404,7 @@ void main() {{
 
     if (sgid.x < N && sgid.y < N && sgid.z < N) {{
         int c_idx = (sgid.z * N + sgid.y) * N + sgid.x;
-        float inv_2dx = 0.5 / u_dx;
+        float inv_dx = 1.0 / u_dx;
 
         vec3 c  = load_phi(c_idx);
         vec3 v  = load_vel(c_idx);
@@ -313,19 +415,10 @@ void main() {{
         vec3 zp = load_phi(idx3(sgid.x, sgid.y, sgid.z + 1, N));
         vec3 zm = load_phi(idx3(sgid.x, sgid.y, sgid.z - 1, N));
 
-        float phi1 = c.x; float phi2 = c.y; float phi3 = c.z;
-        float dt_phi1 = v.x; float dt_phi2 = v.y; float dt_phi3 = v.z;
-
-        vec3 gx = (xp - xm) * inv_2dx;
-        vec3 gy = (yp - ym) * inv_2dx;
-        vec3 gz = (zp - zm) * inv_2dx;
-
-        float dx_phi1 = gx.x; float dy_phi1 = gy.x; float dz_phi1 = gz.x;
-        float dx_phi2 = gx.y; float dy_phi2 = gy.y; float dz_phi2 = gz.y;
-        float dx_phi3 = gx.z; float dy_phi3 = gy.z; float dz_phi3 = gz.z;
-
         float rho = dot(c, c);
-        float H_val = {ham_expr_glsl};
+        float H_plus  = eval_ham_density(c, v, (xp - c) * inv_dx, (yp - c) * inv_dx, (zp - c) * inv_dx);
+        float H_minus = eval_ham_density(c, v, (c - xm) * inv_dx, (c - ym) * inv_dx, (c - zm) * inv_dx);
+        float H_val = 0.5 * (H_plus + H_minus);
         loc_max = rho;
         loc_rho = rho;
         loc_ham = H_val;
@@ -378,6 +471,7 @@ uniform float u_density_gain;
 uniform float u_slice_x;       // < 0.99 slices open the 3D knot interior!
 uniform int u_color_mode;      // 0 = Sapphire-Gold Phase Weave, 1 = Rainbow Phase, 2 = Thermal Energy Density
 uniform float u_time;
+uniform float u_rho_floor;
 
 vec3 aces_tonemap(vec3 x) {
     const float a = 2.51;
@@ -495,6 +589,8 @@ void main() {
         vec3 light_dir = normalize(vec3(0.55, 0.78, 0.32));
         float eps_uv = 1.0 / 128.0;
 
+        float rho_cut = (u_rho_floor > 0.01) ? u_rho_floor : 1.15;
+        float rho_span = (rho_cut > 0.5) ? 1.55 : 1.85;
         for (int i = 0; i < STEPS; ++i) {
             if (t > hit.y || transmittance < 0.012) break;
             vec3 pos = ro + t * rd;
@@ -502,7 +598,7 @@ void main() {
             vec4 sample_rgba = texture(u_vol_tex, uvw);
             float rho = sample_rgba.r;
 
-            if (rho > 0.14) {
+            if (rho > rho_cut) {
                 float gx = texture(u_vol_tex, uvw + vec3(eps_uv, 0.0, 0.0)).r
                          - texture(u_vol_tex, uvw - vec3(eps_uv, 0.0, 0.0)).r;
                 float gy = texture(u_vol_tex, uvw + vec3(0.0, eps_uv, 0.0)).r
@@ -518,7 +614,7 @@ void main() {
                 vec3 half_v = normalize(light_dir - rd);
                 float spec = pow(max(dot(normal, half_v), 0.0), 34.0) * smoothstep(0.08, 0.55, g_len);
 
-                float ph_smooth = atan(sample_rgba.b - 0.5 * sample_rgba.a, sample_rgba.g - 0.5 * sample_rgba.a);
+                float ph_smooth = atan(sample_rgba.b, sample_rgba.g);
                 vec3 base_c = phase_palette(ph_smooth, rho, u_color_mode);
                 vec3 lit_c = base_c * (0.38 + 0.72 * ndotl)
                            + vec3(0.28, 0.78, 1.15) * (0.35 * fresnel)
@@ -528,7 +624,7 @@ void main() {
                     lit_c += vec3(1.15, 0.78, 0.22) * 0.85;
                 }
 
-                float dens_sculpt = pow(clamp((rho - 0.14) / 1.85, 0.0, 1.45), 1.90);
+                float dens_sculpt = pow(clamp((rho - rho_cut) / rho_span, 0.0, 1.35), 1.90);
                 float sigma = dens_sculpt * u_density_gain * 3.9;
                 float alpha = 1.0 - exp(-sigma * dt_ray);
                 accum_rgb += transmittance * alpha * lit_c;
@@ -812,6 +908,7 @@ class Arena1KnotTank:
         self.slice_x = 1.0
         self.color_mode = 0
         self.damping = 0.0
+        self.sponge_strength = 4.5
         self.substeps_per_frame = 2
         self.sim_time = 0.0
         self.step_count = 0
@@ -840,7 +937,9 @@ class Arena1KnotTank:
         self._hib_vel_ram: Optional[np.ndarray] = None
 
         self._init_prog = self.ctx.compute_shader(_INIT_KNOT_GLSL)
+        self._zero_buf_prog = self.ctx.compute_shader(_ZERO_BUF_GLSL)
         self._pack_prog = self.ctx.compute_shader(_PACK_VOL_GLSL)
+        self._ref_relax_prog: Optional[moderngl.ComputeShader] = None
         self._pack_fp16_prog = self.ctx.compute_shader(_PACK_FP16_CHUNK_GLSL)
         self._unpack_fp16_prog = self.ctx.compute_shader(_UNPACK_FP16_CHUNK_GLSL)
         self._pack_replay_prog = self.ctx.compute_shader(_PACK_REPLAY_PHASE_GLSL)
@@ -858,7 +957,7 @@ class Arena1KnotTank:
         self._compiled_glsl_src: str = ""
         self._reduce_prog: Optional[moderngl.ComputeShader] = None
         self._compiled_ham_expr: str = ""
-        self._ham_params_tuple: Optional[tuple[float, float, float, float]] = None
+        self._ham_params_tuple: Optional[tuple[float, float, float, float, float]] = None
         self._pending_ham_baseline_reset: bool = False
         self._active_mod: Optional[PhysicsMod] = mod
         self._active_compiled: Optional[CompiledMasterAction] = compiled
@@ -926,6 +1025,7 @@ class Arena1KnotTank:
     @property
     def replay_frames_count(self) -> int:
         """Number of DDR5 Time-Machine keyframes currently buffered (non-blocking harvest check)."""
+        self._poll_async_telemetry(wait=False)
         self._poll_pending_replay_snapshot(wait=False)
         return len(self._replay_frames)
 
@@ -1238,7 +1338,7 @@ class Arena1KnotTank:
                 return
         elif frame_fp16.size == num_floats:
             self._unpack_fp16_1d_to_ssbo(frame_fp16, latest_buf, num_floats)
-            self._buf_vel.clear()
+            self._zero_ssbo(self._buf_vel, num_floats)
         else:
             return
 
@@ -1462,10 +1562,16 @@ class Arena1KnotTank:
         self._active_compiled = compiled
         if mod is not None:
             self._active_mod = mod
-        new_params: Optional[tuple[float, float, float, float]] = None
+        new_params: Optional[tuple[float, float, float, float, float]] = None
         if self._active_mod is not None:
             mp = self._active_mod.parameters
-            new_params = (float(mp.c_w), float(mp.m_eff), float(mp.g4), float(mp.g6))
+            new_params = (
+                float(mp.c_w),
+                float(mp.m_eff),
+                float(mp.g4),
+                float(mp.g6),
+                float(getattr(mp, "k_skyrme", 0.0)),
+            )
 
         if compiled.glsl_compute_source != self._compiled_glsl_src:
             new_prog = self.ctx.compute_shader(compiled.glsl_compute_source)
@@ -1529,12 +1635,77 @@ class Arena1KnotTank:
         self.ctx.memory_barrier()
 
         self._cur_in_a = True
+        self._relax_initial_hopfion_t0()
         self.sim_time = 0.0
         self.step_count = 0
         self._pending_ham_baseline_reset = False
         self._sample_diagnostics(is_initial=True, reset_ham_baseline=True)
         if self.replay_enabled and self.grid_n <= 256:
             self._enqueue_replay_snapshot()
+
+    def _zero_ssbo(self, buf: moderngl.Buffer, num_floats: int) -> None:
+        buf.bind_to_storage_buffer(0)
+        self._zero_buf_prog["u_num_floats"].value = int(num_floats)
+        self._zero_buf_prog.run((num_floats + 255) // 256, 1, 1)
+        self.ctx.memory_barrier()
+
+    def _relax_initial_hopfion_t0(self) -> None:
+        """
+        Jennings (2015) t = 0 relaxation onto the discrete Faddeev-Skyrme manifold using the reference
+        TNaP action, followed by exact GPU zeroing of `_buf_vel` (`vel_0 === 0`), so all physics mods
+        (`tnap_weave`, `lambda_cdm`, etc.) start from the bit-for-bit identical `t = 0` initial state!
+        """
+        if self.preset_idx not in (0, 1, 2) or self.grid_n < 48:
+            return
+        assert (
+            self._buf_a is not None
+            and self._buf_b is not None
+            and self._buf_vel is not None
+            and self._vol_tex is not None
+        )
+        ref_mod, ref_comp = _get_default_mod_and_compiled()
+        if self._ref_relax_prog is None:
+            self._ref_relax_prog = self.ctx.compute_shader(ref_comp.glsl_compute_source)
+
+        n_loc = int(self.grid_n)
+        steps = 420 if n_loc <= 128 else (120 if n_loc <= 256 else 16)
+        mp = ref_mod.parameters
+        dx_loc = float(self.box_size) / float(n_loc)
+        dt_loc = 1.45 * compute_safe_symplectic_dt(dx_loc, ref_mod, compiled=ref_comp, peak_rho_est=2.95)
+
+        self._set_uniform_safe(self._ref_relax_prog, "u_N", n_loc)
+        self._set_uniform_safe(self._ref_relax_prog, "u_dx", dx_loc)
+        self._set_uniform_safe(self._ref_relax_prog, "u_dt", dt_loc)
+        self._set_uniform_safe(self._ref_relax_prog, "u_damping", 1.65)
+        self._set_uniform_safe(self._ref_relax_prog, "c_w", float(mp.c_w))
+        self._set_uniform_safe(self._ref_relax_prog, "m_eff", float(mp.m_eff))
+        self._set_uniform_safe(self._ref_relax_prog, "g4", float(mp.g4))
+        self._set_uniform_safe(self._ref_relax_prog, "g6", float(mp.g6))
+        self._set_uniform_safe(self._ref_relax_prog, "k_skyrme", float(getattr(mp, "k_skyrme", 1.55)))
+        self._set_uniform_safe(self._ref_relax_prog, "u_sponge", float(self.sponge_strength))
+        self._set_uniform_safe(self._ref_relax_prog, "u_box_half", float(self.box_size) * 0.5)
+
+        wg_xy = (n_loc + 7) // 8
+        wg_z = (n_loc + 3) // 4
+        self._buf_vel.bind_to_storage_buffer(1)
+        for _ in range(steps):
+            if self._cur_in_a:
+                self._buf_a.bind_to_storage_buffer(0)
+                self._buf_b.bind_to_storage_buffer(2)
+            else:
+                self._buf_b.bind_to_storage_buffer(0)
+                self._buf_a.bind_to_storage_buffer(2)
+            self._ref_relax_prog.run(wg_xy, wg_xy, wg_z)
+            self.ctx.memory_barrier()
+            self._cur_in_a = not self._cur_in_a
+
+        self._zero_ssbo(self._buf_vel, n_loc * n_loc * n_loc * 3)
+        latest = self._buf_a if self._cur_in_a else self._buf_b
+        latest.bind_to_storage_buffer(0)
+        self._vol_tex.bind_to_image(0, read=False, write=True)
+        self._pack_prog["u_N"].value = n_loc
+        self._pack_prog.run(wg_xy, wg_xy, wg_z)
+        self.ctx.memory_barrier()
 
     def _set_uniform_safe(self, prog: moderngl.ComputeShader, name: str, val: object) -> None:
         if name in prog:
@@ -1593,6 +1764,7 @@ class Arena1KnotTank:
         self._set_uniform_safe(red_prog, "m_eff", float(p.m_eff) if p else 2.50)
         self._set_uniform_safe(red_prog, "g4", float(p.g4) if p else 9.80)
         self._set_uniform_safe(red_prog, "g6", float(p.g6) if p else 3.10)
+        self._set_uniform_safe(red_prog, "k_skyrme", float(getattr(p, "k_skyrme", 0.0)) if p else 0.22)
 
         red_prog.run(wg_x, wg_y, wg_z)
         self.ctx.memory_barrier()
@@ -1689,6 +1861,9 @@ class Arena1KnotTank:
         self._set_uniform_safe(self._pde_prog, "m_eff", float(use_mod.parameters.m_eff))
         self._set_uniform_safe(self._pde_prog, "g4", float(use_mod.parameters.g4))
         self._set_uniform_safe(self._pde_prog, "g6", float(use_mod.parameters.g6))
+        self._set_uniform_safe(self._pde_prog, "k_skyrme", float(getattr(use_mod.parameters, "k_skyrme", 0.0)))
+        self._set_uniform_safe(self._pde_prog, "u_sponge", float(self.sponge_strength))
+        self._set_uniform_safe(self._pde_prog, "u_box_half", float(self.box_size) * 0.5)
 
         wg_xy = (n + 7) // 8
         wg_z = (n + 3) // 4
@@ -1780,11 +1955,13 @@ class Arena1KnotTank:
             ("u_slice_x", float(self.slice_x)),
             ("u_color_mode", int(self.color_mode)),
             ("u_time", float(wall_time)),
+            ("u_rho_floor", 0.18 if self.preset_idx == 3 else 1.15),
         ):
             if uname in self._ray_prog:
                 self._ray_prog[uname].value = uval
 
         self._empty_vao.render(moderngl.TRIANGLES, vertices=3)
+        self._poll_async_telemetry(wait=False)
         if (
             self._pending_replay_fence is not None
             and self._pending_replay_meta is not None
@@ -1809,12 +1986,14 @@ class Arena1KnotTank:
             self._async_stats_bufs[1],
             self._vol_tex,
             self._pde_prog,
+            self._ref_relax_prog,
             self._reduce_prog,
             self._default_reduce_prog,
             self._pack_fp16_prog,
             self._unpack_fp16_prog,
             self._pack_replay_prog,
             self._unpack_replay_prog,
+            self._zero_buf_prog,
             self._init_prog,
             self._pack_prog,
             self._empty_vao,

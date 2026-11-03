@@ -127,6 +127,7 @@ _COUPLING_PARAM_FIELDS: Tuple[str, ...] = (
     "m_eff",
     "g4",
     "g6",
+    "k_skyrme",
     "a0_si",
     "has_cdm_halo",
     "cdm_halo_scale",
@@ -135,6 +136,9 @@ _COUPLING_PARAM_FIELDS: Tuple[str, ...] = (
     "w0_de",
     "wa_de",
 )
+SIM_FIXED_HZ: float = 60.0
+SIM_FIXED_DT: float = 1.0 / SIM_FIXED_HZ
+MAX_PHYSICS_STEPS_PER_FRAME: int = 3
 _ACTION_EXPR_FIELDS: Tuple[str, ...] = (
     "field_lagrangian",
     "optical_metric_n",
@@ -222,6 +226,10 @@ def health_audit_header(compiled: CompiledMasterAction) -> Tuple[imgui.ImVec4, s
 
 class WeaveForgeStudioApp:
     """Main 60–120+ FPS Interactive 3D Physics Studio & Observational Crucible."""
+
+    SIM_FIXED_HZ: float = SIM_FIXED_HZ
+    SIM_FIXED_DT: float = SIM_FIXED_DT
+    MAX_PHYSICS_STEPS_PER_FRAME: int = MAX_PHYSICS_STEPS_PER_FRAME
 
     def __init__(
         self,
@@ -426,6 +434,7 @@ class WeaveForgeStudioApp:
         self._active_arena: int = int(np.clip(initial_arena - 1, 0, 3))
         self.ddr5_hibernate_enabled: bool = True
         self.paused: bool = False
+        self._sim_accum: float = 0.0
         self._arena1_needs_kernel_sync: bool = False
         self._arena3_needs_field_sync: bool = False
         self._replay_idx: Dict[int, int] = {}
@@ -742,6 +751,7 @@ class WeaveForgeStudioApp:
         now_t = time.perf_counter()
         self._prev_wall = now_t
         self._prev_swap_wall = now_t
+        self._sim_accum = 0.0
         if getattr(self, "_in_render_frame", False):
             self._one_shot_stall_in_frame = True
 
@@ -1020,7 +1030,7 @@ class WeaveForgeStudioApp:
         setattr(self.working_mod.parameters, param_name, default_val)
         if param_name == "has_cdm_halo":
             self.working_mod.parameters.cdm_halo_scale = float(self._pristine_mod.parameters.cdm_halo_scale)
-        if param_name in ("c_w", "m_eff", "g4", "g6", "a0_si"):
+        if param_name in ("c_w", "m_eff", "g4", "g6", "k_skyrme", "a0_si"):
             self._recompile_working_mod()
         else:
             self._refresh_crucible_fast()
@@ -1080,12 +1090,14 @@ class WeaveForgeStudioApp:
 
     def toggle_pause(self) -> None:
         """Toggles simulation pause/resume cleanly (exiting DDR5 replay if resuming from replay)."""
+        self._sim_accum = 0.0
         if self.paused:
             cur_ar = (self.arena1, self.arena2, self.arena3, self.arena4)[self._active_arena]
             if self._is_arena_in_replay(cur_ar, self._active_arena):
                 self._exit_replay_to_live(self._active_arena, unpause=True)
             else:
                 self.paused = False
+                self._reset_frame_pacing_clock()
         else:
             self.paused = True
 
@@ -1264,6 +1276,7 @@ class WeaveForgeStudioApp:
         self._reset_frame_pacing_clock()
 
     def _reset_active_arena(self) -> None:
+        self._sim_accum = 0.0
         if self._active_arena == 0:
             self._clear_replay_backup(0)
             self.arena1.reset_field()
@@ -1408,17 +1421,35 @@ class WeaveForgeStudioApp:
             if not self.paused:
                 if self._is_arena_in_replay(self.arena1, 0):
                     self._exit_replay_to_live(0, unpause=False)
-                self.arena1.step(self.working_mod, self.compiled)
+                self._sim_accum = min(
+                    self._sim_accum + max(float(dt), 0.0),
+                    MAX_PHYSICS_STEPS_PER_FRAME * SIM_FIXED_DT,
+                )
+                while self._sim_accum >= SIM_FIXED_DT - 1e-12:
+                    self.arena1.step(self.working_mod, self.compiled)
+                    self._sim_accum = max(self._sim_accum - SIM_FIXED_DT, 0.0)
+            else:
+                self._sim_accum = 0.0
             self.arena1.render(self._view_fbo, cam, wall_t)
         elif self._active_arena == 1:
+            self._sim_accum = 0.0
             self.arena2.render(self._view_fbo, cam, self.compiled, wall_t)
         elif self._active_arena == 2:
             if not self.paused:
                 if self._is_arena_in_replay(self.arena3, 2):
                     self._exit_replay_to_live(2, unpause=False)
-                self.arena3.step(self.working_mod, self.compiled, dt=min(dt * 1.8, 0.036))
+                self._sim_accum = min(
+                    self._sim_accum + max(float(dt), 0.0),
+                    MAX_PHYSICS_STEPS_PER_FRAME * SIM_FIXED_DT,
+                )
+                while self._sim_accum >= SIM_FIXED_DT - 1e-12:
+                    self.arena3.step(self.working_mod, self.compiled, dt=SIM_FIXED_DT * 1.8)
+                    self._sim_accum = max(self._sim_accum - SIM_FIXED_DT, 0.0)
+            else:
+                self._sim_accum = 0.0
             self.arena3.render(self._view_fbo, cam, wall_t)
         else:
+            self._sim_accum = 0.0
             self.arena4.render(self._view_fbo, cam, self.working_mod, wall_t)
 
     # =========================================================================
@@ -2221,6 +2252,7 @@ class WeaveForgeStudioApp:
                 ch_m, _ = self._draw_coupling_slider_float("Mass Gap m_eff", "m_eff", 0.0, 5.0)
                 ch2, _ = self._draw_coupling_slider_float("Quartic Binding g4", "g4", -2.0, 18.0)
                 ch3, _ = self._draw_coupling_slider_float("Planck Core g6", "g6", -1.0, 12.0)
+                ch_ks, _ = self._draw_coupling_slider_float("Skyrme Twist k_S", "k_skyrme", 0.0, 4.0)
                 ch4, _ = self._draw_coupling_slider_float("a0 (x10^-10 m/s^2)", "a0_si", 0.40, 2.50, scale=1.0e10)
 
                 ch5, new_has_cdm = imgui.checkbox("Include NFW Cold Dark Matter Halo", bool(p.has_cdm_halo))
@@ -2263,9 +2295,9 @@ class WeaveForgeStudioApp:
                 ch9, _ = self._draw_coupling_slider_float("Dark Energy w0", "w0_de", -1.6, -0.4)
                 ch10, _ = self._draw_coupling_slider_float("Dark Energy wa", "wa_de", -1.5, 1.0)
 
-                changed_any = ch1 or ch_m or ch2 or ch3 or ch4 or ch5 or ch6 or ch7 or ch8 or ch9 or ch10
+                changed_any = ch1 or ch_m or ch2 or ch3 or ch_ks or ch4 or ch5 or ch6 or ch7 or ch8 or ch9 or ch10
                 if changed_any:
-                    if ch1 or ch_m or ch2 or ch3 or ch4:
+                    if ch1 or ch_m or ch2 or ch3 or ch_ks or ch4:
                         self._recompile_working_mod()
                     else:
                         self._refresh_crucible_fast()
@@ -3195,7 +3227,11 @@ class WeaveForgeStudioApp:
     # =========================================================================
     # MAIN EVENT & RENDER LOOP
     # =========================================================================
-    def render_single_frame(self, capture_out: Optional[Path] = None) -> None:
+    def render_single_frame(
+        self,
+        capture_out: Optional[Path] = None,
+        dt_override: Optional[float] = None,
+    ) -> None:
         self._in_render_frame = True
         self._one_shot_stall_in_frame = False
         try:
@@ -3216,7 +3252,10 @@ class WeaveForgeStudioApp:
                 self._pending_theme_apply = False
 
             now = time.perf_counter()
-            sim_dt = float(np.clip(now - self._prev_wall, 1e-4, 0.05))
+            if dt_override is not None:
+                sim_dt = float(np.clip(dt_override, 0.0, 0.25))
+            else:
+                sim_dt = float(np.clip(now - self._prev_wall, 1e-4, 0.05))
             self._prev_wall = now
             wall_t = now - self._start_wall
 

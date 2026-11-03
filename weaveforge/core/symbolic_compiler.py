@@ -94,6 +94,7 @@ class CompiledMasterAction:
     u_horizon_cap: float = 1.85
     ppn_alpha_lapse: float = 1.0
     needs_full_hessian: bool = False
+    max_potential_stiffness: float = 0.0
     # Fast vectorized NumPy callables for CPU reference parity & observational crucible
     accel_numpy_fn: Optional[Callable] = field(default=None, repr=False)
     hamiltonian_numpy_fn: Optional[Callable] = field(default=None, repr=False)
@@ -312,7 +313,62 @@ def _emit_gpu_expr(expr: sp.Expr, lang: str = "wgsl") -> str:
     raise SymbolicCompilationError(f"Unsupported GPU shader function `{expr.func}` in expression `{expr}`.")
 
 
-def _build_glsl_3d_pde_shader(acc_exprs: Tuple[str, str, str], needs_full_hessian: bool = False) -> str:
+def _emit_gpu_accel_block(acc_sym_list: List[sp.Expr], lang: str) -> Tuple[str, Tuple[str, str, str]]:
+    """Lowers 3-component Euler-Lagrange accelerations with SymPy CSE into fast register-friendly GLSL/WGSL."""
+    replacements, reduced = sp.cse(acc_sym_list, symbols=sp.numbered_symbols("_cse"))
+    cse_lines: List[str] = []
+    for sym, sub_expr in replacements:
+        rhs_code = _emit_gpu_expr(sub_expr, lang=lang)
+        if lang == "wgsl":
+            cse_lines.append(f"    let {sym}: f32 = {rhs_code};")
+        else:
+            cse_lines.append(f"    float {sym} = {rhs_code};")
+    cse_block = ("\n" + "\n".join(cse_lines)) if cse_lines else ""
+    accs = (
+        _emit_gpu_expr(reduced[0], lang=lang),
+        _emit_gpu_expr(reduced[1], lang=lang),
+        _emit_gpu_expr(reduced[2], lang=lang),
+    )
+    return cse_block, accs
+
+
+def _emit_gpu_octant_vec3_helper(fn_name: str, vec_exprs: List[sp.Expr], lang: str) -> str:
+    """Emits a CSE-lowered `vec3` / `vec3<f32>` helper `(p, gx, gy, gz)` for exact discrete variational octant fluxes."""
+    cse_block, (e1, e2, e3) = _emit_gpu_accel_block(vec_exprs, lang=lang)
+    if lang == "wgsl":
+        return f"""
+fn {fn_name}(p: vec3<f32>, gx: vec3<f32>, gy: vec3<f32>, gz: vec3<f32>) -> vec3<f32> {{
+    let c_w = params.c_w;
+    let m_eff = params.m_eff;
+    let g4 = params.g4;
+    let g6 = params.g6;
+    let k_skyrme = params.k_skyrme;
+    let phi1 = p.x; let phi2 = p.y; let phi3 = p.z;
+    let dx_phi1 = gx.x; let dy_phi1 = gy.x; let dz_phi1 = gz.x;
+    let dx_phi2 = gx.y; let dy_phi2 = gy.y; let dz_phi2 = gz.y;
+    let dx_phi3 = gx.z; let dy_phi3 = gy.z; let dz_phi3 = gz.z;{cse_block}
+    return vec3<f32>({e1}, {e2}, {e3});
+}}
+"""
+    return f"""
+vec3 {fn_name}(vec3 p, vec3 gx, vec3 gy, vec3 gz) {{
+    float phi1 = p.x; float phi2 = p.y; float phi3 = p.z;
+    float dx_phi1 = gx.x; float dy_phi1 = gy.x; float dz_phi1 = gz.x;
+    float dx_phi2 = gx.y; float dy_phi2 = gy.y; float dz_phi2 = gz.y;
+    float dx_phi3 = gx.z; float dy_phi3 = gy.z; float dz_phi3 = gz.z;{cse_block}
+    return vec3({e1}, {e2}, {e3});
+}}
+"""
+
+
+def _build_glsl_3d_pde_shader(
+    acc_exprs: Tuple[str, str, str],
+    needs_full_hessian: bool = False,
+    needs_grad_vel: bool = False,
+    cse_block: str = "",
+    octant_helpers_glsl: str = "",
+    dL_dphi_has_grad: bool = False,
+) -> str:
     """
     Emits a complete OpenGL 4.3+ (`#version 430`) Symplectic Störmer-Verlet 3D Compute Shader.
     Uses tightly packed scalar `float[]` (`3` floats = `12` bytes/voxel) so `512³` (`134,217,728`
@@ -321,8 +377,51 @@ def _build_glsl_3d_pde_shader(acc_exprs: Tuple[str, str, str], needs_full_hessia
     """
     a1, a2, a3 = acc_exprs
     extra_stencil = ""
-    if needs_full_hessian:
-        extra_stencil = """
+    if octant_helpers_glsl:
+        f_pot_line = (
+            "0.5 * (_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp) + _eval_dL_dphi(c, gx_cm, gy_cm, gz_cm))"
+            if dL_dphi_has_grad
+            else "_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp)"
+        )
+        accel_body = f"""
+    // Exact discrete variational (+,+,+) & (-,-,-) octant Euler-Lagrange flux divergence (J == J^T):
+    vec3 xmyp = load_phi(idx3(gid.x - 1, gid.y + 1, gid.z, N));
+    vec3 xpym = load_phi(idx3(gid.x + 1, gid.y - 1, gid.z, N));
+    vec3 xmzp = load_phi(idx3(gid.x - 1, gid.y, gid.z + 1, N));
+    vec3 xpzm = load_phi(idx3(gid.x + 1, gid.y, gid.z - 1, N));
+    vec3 ymzp = load_phi(idx3(gid.x, gid.y - 1, gid.z + 1, N));
+    vec3 ypzm = load_phi(idx3(gid.x, gid.y + 1, gid.z - 1, N));
+
+    vec3 gx_cp = (xp - c) * inv_dx;
+    vec3 gy_cp = (yp - c) * inv_dx;
+    vec3 gz_cp = (zp - c) * inv_dx;
+    vec3 gx_cm = (c - xm) * inv_dx;
+    vec3 gy_cm = (c - ym) * inv_dx;
+    vec3 gz_cm = (c - zm) * inv_dx;
+
+    vec3 pi_x_cp  = _eval_pi_x(c,  gx_cp, gy_cp, gz_cp);
+    vec3 pi_y_cp  = _eval_pi_y(c,  gx_cp, gy_cp, gz_cp);
+    vec3 pi_z_cp  = _eval_pi_z(c,  gx_cp, gy_cp, gz_cp);
+    vec3 pi_x_xmp = _eval_pi_x(xm, gx_cm, (xmyp - xm) * inv_dx, (xmzp - xm) * inv_dx);
+    vec3 pi_y_ymp = _eval_pi_y(ym, (xpym - ym) * inv_dx, gy_cm, (ymzp - ym) * inv_dx);
+    vec3 pi_z_zmp = _eval_pi_z(zm, (xpzm - zm) * inv_dx, (ypzm - zm) * inv_dx, gz_cm);
+
+    vec3 pi_x_cm  = _eval_pi_x(c,  gx_cm, gy_cm, gz_cm);
+    vec3 pi_y_cm  = _eval_pi_y(c,  gx_cm, gy_cm, gz_cm);
+    vec3 pi_z_cm  = _eval_pi_z(c,  gx_cm, gy_cm, gz_cm);
+    vec3 pi_x_xpm = _eval_pi_x(xp, gx_cp, (xp - xpym) * inv_dx, (xp - xpzm) * inv_dx);
+    vec3 pi_y_ypm = _eval_pi_y(yp, (yp - xmyp) * inv_dx, gy_cp, (yp - ypzm) * inv_dx);
+    vec3 pi_z_zpm = _eval_pi_z(zp, (zp - xmzp) * inv_dx, (zp - ymzp) * inv_dx, gz_cp);
+
+    vec3 div_plus  = ((pi_x_cp - pi_x_xmp) + (pi_y_cp - pi_y_ymp) + (pi_z_cp - pi_z_zmp)) * inv_dx;
+    vec3 div_minus = ((pi_x_xpm - pi_x_cm) + (pi_y_ypm - pi_y_cm) + (pi_z_zpm - pi_z_cm)) * inv_dx;
+    vec3 acc_vec = ({f_pot_line}) - 0.5 * (div_plus + div_minus);
+    float acc1 = acc_vec.x;
+    float acc2 = acc_vec.y;
+    float acc3 = acc_vec.z;"""
+    else:
+        if needs_full_hessian:
+            extra_stencil = """
     float inv_4dx2 = 0.25 * inv_dx2;
     vec3 dxx = (xp - 2.0 * c + xm) * inv_dx2;
     vec3 dyy = (yp - 2.0 * c + ym) * inv_dx2;
@@ -340,7 +439,9 @@ def _build_glsl_3d_pde_shader(acc_exprs: Tuple[str, str, str], needs_full_hessia
     float dxy_phi1 = dxy.x; float dxz_phi1 = dxz.x; float dyz_phi1 = dyz.x;
     float dxy_phi2 = dxy.y; float dxz_phi2 = dxz.y; float dyz_phi2 = dyz.y;
     float dxy_phi3 = dxy.z; float dxz_phi3 = dxz.z; float dyz_phi3 = dyz.z;
-
+"""
+        if needs_grad_vel:
+            extra_stencil += """
     vec3 vxp = load_vel(idx3(gid.x + 1, gid.y, gid.z, N));
     vec3 vxm = load_vel(idx3(gid.x - 1, gid.y, gid.z, N));
     vec3 vyp = load_vel(idx3(gid.x, gid.y + 1, gid.z, N));
@@ -352,8 +453,35 @@ def _build_glsl_3d_pde_shader(acc_exprs: Tuple[str, str, str], needs_full_hessia
     vec3 gvz = (vzp - vzm) * inv_2dx;
     float dx_dt_phi1 = gvx.x; float dy_dt_phi1 = gvy.x; float dz_dt_phi1 = gvz.x;
     float dx_dt_phi2 = gvx.y; float dy_dt_phi2 = gvy.y; float dz_dt_phi2 = gvz.y;
-    float dx_dt_phi3 = gvx.z; float dy_dt_phi3 = gvy.z; float dz_dt_phi3 = gvz.z;
+    float dx_dt_phi3 = gvx.z; float dy_dt_phi3 = gvy.z; float dz_dt_phi3 = gz.z;
 """
+            extra_stencil = extra_stencil.replace("gz.z", "gvz.z")
+        accel_body = f"""
+    float phi1 = c.x;
+    float phi2 = c.y;
+    float phi3 = c.z;
+
+    float dt_phi1 = v_old.x;
+    float dt_phi2 = v_old.y;
+    float dt_phi3 = v_old.z;
+
+    vec3 grad_x = (xp - xm) * inv_2dx;
+    vec3 grad_y = (yp - ym) * inv_2dx;
+    vec3 grad_z = (zp - zm) * inv_2dx;
+    vec3 lap    = (xp + xm + yp + ym + zp + zm - 6.0 * c) * inv_dx2;
+
+    float dx_phi1 = grad_x.x; float dy_phi1 = grad_y.x; float dz_phi1 = grad_z.x;
+    float dx_phi2 = grad_x.y; float dy_phi2 = grad_y.y; float dz_phi2 = grad_z.y;
+    float dx_phi3 = grad_x.z; float dy_phi3 = grad_y.z; float dz_phi3 = grad_z.z;
+
+    float lap_phi1 = lap.x;
+    float lap_phi2 = lap.y;
+    float lap_phi3 = lap.z;{extra_stencil}{cse_block}
+
+    // Exact Euler-Lagrange accelerations compiled from Master Lagrangian:
+    float acc1 = {a1};
+    float acc2 = {a2};
+    float acc3 = {a3};"""
     return f"""#version 430
 // ============================================================================
 // AUTO-GENERATED BY WEAVEFORGE SYMBOLIC COMPILER (SymPy -> GLSL 430)
@@ -374,6 +502,9 @@ uniform float c_w;
 uniform float m_eff;
 uniform float g4;
 uniform float g6;
+uniform float k_skyrme;
+uniform float u_sponge;
+uniform float u_box_half;
 
 int idx3(int x, int y, int z, int N) {{
     int xm = (x + N) % N;
@@ -404,7 +535,7 @@ void store_phi(int idx, vec3 p) {{
     phi_out[b] = p.x;
     phi_out[b + 1] = p.y;
     phi_out[b + 2] = p.z;
-}}
+}}{octant_helpers_glsl}
 
 void main() {{
     ivec3 gid = ivec3(gl_GlobalInvocationID);
@@ -424,37 +555,24 @@ void main() {{
     vec3 zp = load_phi(idx3(gid.x, gid.y, gid.z + 1, N));
     vec3 zm = load_phi(idx3(gid.x, gid.y, gid.z - 1, N));
 
-    float phi1 = c.x;
-    float phi2 = c.y;
-    float phi3 = c.z;
+    vec3 v_old = load_vel(c_idx);{accel_body}
 
-    vec3 v_old = load_vel(c_idx);
-    float dt_phi1 = v_old.x;
-    float dt_phi2 = v_old.y;
-    float dt_phi3 = v_old.z;
-
-    vec3 grad_x = (xp - xm) * inv_2dx;
-    vec3 grad_y = (yp - ym) * inv_2dx;
-    vec3 grad_z = (zp - zm) * inv_2dx;
-    vec3 lap    = (xp + xm + yp + ym + zp + zm - 6.0 * c) * inv_dx2;
-
-    float dx_phi1 = grad_x.x; float dy_phi1 = grad_y.x; float dz_phi1 = grad_z.x;
-    float dx_phi2 = grad_x.y; float dy_phi2 = grad_y.y; float dz_phi2 = grad_z.y;
-    float dx_phi3 = grad_x.z; float dy_phi3 = grad_y.z; float dz_phi3 = grad_z.z;
-
-    float lap_phi1 = lap.x;
-    float lap_phi2 = lap.y;
-    float lap_phi3 = lap.z;{extra_stencil}
-
-    // Exact Euler-Lagrange accelerations compiled from Master Lagrangian:
-    float acc1 = {a1};
-    float acc2 = {a2};
-    float acc3 = {a3};
+    // Outer absorbing sponge boundary layer (box_frac > 0.85; strictly 0 inside <= 0.85)
+    float bh = max(u_box_half, 1.0);
+    vec3 uvw = (vec3(gid) + 0.5) / float(N);
+    vec3 pos = (uvw - 0.5) * (2.0 * bh);
+    float box_frac = max(max(abs(pos.x), abs(pos.y)), abs(pos.z)) / bh;
+    float s_ramp = clamp((box_frac - 0.85) / 0.15, 0.0, 1.0);
+    float s_smooth = s_ramp * s_ramp * (3.0 - 2.0 * s_ramp);
+    float sponge_vel = u_sponge * s_smooth;
+    float sponge_phi = 0.65 * u_sponge * s_ramp * s_smooth;
 
     vec3 v_new = (v_old + u_dt * vec3(acc1, acc2, acc3)) * (1.0 - u_damping * u_dt);
+    v_new = v_new / (1.0 + sponge_vel * u_dt);
     // Soft safety clamp against extreme user-mod blowups (e.g. intentional ghost mods)
     v_new = clamp(v_new, vec3(-50.0), vec3(50.0));
     vec3 p_new = clamp(c + u_dt * v_new, vec3(-25.0), vec3(25.0));
+    p_new = p_new / (1.0 + sponge_phi * u_dt);
 
     store_vel(c_idx, v_new);
     store_phi(c_idx, p_new);
@@ -462,7 +580,14 @@ void main() {{
 """
 
 
-def _build_wgsl_3d_pde_shader(acc_exprs: Tuple[str, str, str], needs_full_hessian: bool = False) -> str:
+def _build_wgsl_3d_pde_shader(
+    acc_exprs: Tuple[str, str, str],
+    needs_full_hessian: bool = False,
+    needs_grad_vel: bool = False,
+    cse_block: str = "",
+    octant_helpers_wgsl: str = "",
+    dL_dphi_has_grad: bool = False,
+) -> str:
     """
     Emits a complete cross-platform `WGSL` compute shader (runs on RTX 5080 & AMD RX 5700 XT!).
     Uses tightly packed `array<f32>` (`3` floats = `12` bytes/voxel) so `512³` (`1,610,612,736` B)
@@ -470,8 +595,51 @@ def _build_wgsl_3d_pde_shader(acc_exprs: Tuple[str, str, str], needs_full_hessia
     """
     a1, a2, a3 = acc_exprs
     extra_stencil = ""
-    if needs_full_hessian:
-        extra_stencil = """
+    if octant_helpers_wgsl:
+        f_pot_line = (
+            "0.5 * (_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp) + _eval_dL_dphi(c, gx_cm, gy_cm, gz_cm))"
+            if dL_dphi_has_grad
+            else "_eval_dL_dphi(c, gx_cp, gy_cp, gz_cp)"
+        )
+        accel_body = f"""
+    // Exact discrete variational (+,+,+) & (-,-,-) octant Euler-Lagrange flux divergence (J == J^T):
+    let xmyp = load_phi(idx3(gx - 1, gy + 1, gz, n));
+    let xpym = load_phi(idx3(gx + 1, gy - 1, gz, n));
+    let xmzp = load_phi(idx3(gx - 1, gy, gz + 1, n));
+    let xpzm = load_phi(idx3(gx + 1, gy, gz - 1, n));
+    let ymzp = load_phi(idx3(gx, gy - 1, gz + 1, n));
+    let ypzm = load_phi(idx3(gx, gy + 1, gz - 1, n));
+
+    let gx_cp = (xp - c) * inv_dx;
+    let gy_cp = (yp - c) * inv_dx;
+    let gz_cp = (zp - c) * inv_dx;
+    let gx_cm = (c - xm) * inv_dx;
+    let gy_cm = (c - ym) * inv_dx;
+    let gz_cm = (c - zm) * inv_dx;
+
+    let pi_x_cp  = _eval_pi_x(c,  gx_cp, gy_cp, gz_cp);
+    let pi_y_cp  = _eval_pi_y(c,  gx_cp, gy_cp, gz_cp);
+    let pi_z_cp  = _eval_pi_z(c,  gx_cp, gy_cp, gz_cp);
+    let pi_x_xmp = _eval_pi_x(xm, gx_cm, (xmyp - xm) * inv_dx, (xmzp - xm) * inv_dx);
+    let pi_y_ymp = _eval_pi_y(ym, (xpym - ym) * inv_dx, gy_cm, (ymzp - ym) * inv_dx);
+    let pi_z_zmp = _eval_pi_z(zm, (xpzm - zm) * inv_dx, (ypzm - zm) * inv_dx, gz_cm);
+
+    let pi_x_cm  = _eval_pi_x(c,  gx_cm, gy_cm, gz_cm);
+    let pi_y_cm  = _eval_pi_y(c,  gx_cm, gy_cm, gz_cm);
+    let pi_z_cm  = _eval_pi_z(c,  gx_cm, gy_cm, gz_cm);
+    let pi_x_xpm = _eval_pi_x(xp, gx_cp, (xp - xpym) * inv_dx, (xp - xpzm) * inv_dx);
+    let pi_y_ypm = _eval_pi_y(yp, (yp - xmyp) * inv_dx, gy_cp, (yp - ypzm) * inv_dx);
+    let pi_z_zpm = _eval_pi_z(zp, (zp - xmzp) * inv_dx, (zp - ymzp) * inv_dx, gz_cp);
+
+    let div_plus  = ((pi_x_cp - pi_x_xmp) + (pi_y_cp - pi_y_ymp) + (pi_z_cp - pi_z_zmp)) * inv_dx;
+    let div_minus = ((pi_x_xpm - pi_x_cm) + (pi_y_ypm - pi_y_cm) + (pi_z_zpm - pi_z_cm)) * inv_dx;
+    let acc_vec = ({f_pot_line}) - 0.5 * (div_plus + div_minus);
+    let acc1: f32 = acc_vec.x;
+    let acc2: f32 = acc_vec.y;
+    let acc3: f32 = acc_vec.z;"""
+    else:
+        if needs_full_hessian:
+            extra_stencil = """
     let inv_4dx2 = 0.25 * inv_dx2;
     let dxx = (xp - 2.0 * c + xm) * inv_dx2;
     let dyy = (yp - 2.0 * c + ym) * inv_dx2;
@@ -489,7 +657,9 @@ def _build_wgsl_3d_pde_shader(acc_exprs: Tuple[str, str, str], needs_full_hessia
     let dxy_phi1 = dxy.x; let dxz_phi1 = dxz.x; let dyz_phi1 = dyz.x;
     let dxy_phi2 = dxy.y; let dxz_phi2 = dxz.y; let dyz_phi2 = dyz.y;
     let dxy_phi3 = dxy.z; let dxz_phi3 = dxz.z; let dyz_phi3 = dyz.z;
-
+"""
+        if needs_grad_vel:
+            extra_stencil += """
     let gvx = (load_vel(idx3(gx + 1, gy, gz, n)) - load_vel(idx3(gx - 1, gy, gz, n))) * inv_2dx;
     let gvy = (load_vel(idx3(gx, gy + 1, gz, n)) - load_vel(idx3(gx, gy - 1, gz, n))) * inv_2dx;
     let gvz = (load_vel(idx3(gx, gy, gz + 1, n)) - load_vel(idx3(gx, gy, gz - 1, n))) * inv_2dx;
@@ -497,6 +667,38 @@ def _build_wgsl_3d_pde_shader(acc_exprs: Tuple[str, str, str], needs_full_hessia
     let dx_dt_phi2 = gvx.y; let dy_dt_phi2 = gvy.y; let dz_dt_phi2 = gvz.y;
     let dx_dt_phi3 = gvx.z; let dy_dt_phi3 = gvy.z; let dz_dt_phi3 = gvz.z;
 """
+        accel_body = f"""
+    let c_w = params.c_w;
+    let m_eff = params.m_eff;
+    let g4 = params.g4;
+    let g6 = params.g6;
+    let k_skyrme = params.k_skyrme;
+
+    let phi1 = c.x;
+    let phi2 = c.y;
+    let phi3 = c.z;
+
+    let dt_phi1 = v_old.x;
+    let dt_phi2 = v_old.y;
+    let dt_phi3 = v_old.z;
+
+    let grad_x = (xp - xm) * inv_2dx;
+    let grad_y = (yp - ym) * inv_2dx;
+    let grad_z = (zp - zm) * inv_2dx;
+    let lap    = (xp + xm + yp + ym + zp + zm - 6.0 * c) * inv_dx2;
+
+    let dx_phi1 = grad_x.x; let dy_phi1 = grad_y.x; let dz_phi1 = grad_z.x;
+    let dx_phi2 = grad_x.y; let dy_phi2 = grad_y.y; let dz_phi2 = grad_z.y;
+    let dx_phi3 = grad_x.z; let dy_phi3 = grad_y.z; let dz_phi3 = grad_z.z;
+
+    let lap_phi1 = lap.x;
+    let lap_phi2 = lap.y;
+    let lap_phi3 = lap.z;{extra_stencil}{cse_block}
+
+    // Exact Euler-Lagrange accelerations compiled from Master Lagrangian:
+    let acc1: f32 = {a1};
+    let acc2: f32 = {a2};
+    let acc3: f32 = {a3};"""
     return f"""// ============================================================================
 // AUTO-GENERATED BY WEAVEFORGE SYMBOLIC COMPILER (SymPy -> Cross-Platform WGSL)
 // Runs natively on Vulkan / DX12 / Metal (NVIDIA RTX 5080 + AMD RX 5700 XT!)
@@ -511,6 +713,10 @@ struct SimParams {{
     m_eff: f32,
     g4: f32,
     g6: f32,
+    k_skyrme: f32,
+    sponge: f32,
+    box_half: f32,
+    pad0: f32,
 }};
 
 @group(0) @binding(0) var<uniform> params: SimParams;
@@ -547,7 +753,7 @@ fn store_phi(idx: u32, p: vec3<f32>) {{
     phi_out[b] = p.x;
     phi_out[b + 1u] = p.y;
     phi_out[b + 2u] = p.z;
-}}
+}}{octant_helpers_wgsl}
 
 @compute @workgroup_size(8, 8, 4)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
@@ -565,11 +771,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let inv_2dx = 0.5 * inv_dx;
     let inv_dx2 = inv_dx * inv_dx;
 
-    let c_w = params.c_w;
-    let m_eff = params.m_eff;
-    let g4 = params.g4;
-    let g6 = params.g6;
-
     let c  = load_phi(c_idx);
     let xp = load_phi(idx3(gx + 1, gy, gz, n));
     let xm = load_phi(idx3(gx - 1, gy, gz, n));
@@ -578,36 +779,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let zp = load_phi(idx3(gx, gy, gz + 1, n));
     let zm = load_phi(idx3(gx, gy, gz - 1, n));
 
-    let phi1 = c.x;
-    let phi2 = c.y;
-    let phi3 = c.z;
+    let v_old = load_vel(c_idx);{accel_body}
 
-    let v_old = load_vel(c_idx);
-    let dt_phi1 = v_old.x;
-    let dt_phi2 = v_old.y;
-    let dt_phi3 = v_old.z;
-
-    let grad_x = (xp - xm) * inv_2dx;
-    let grad_y = (yp - ym) * inv_2dx;
-    let grad_z = (zp - zm) * inv_2dx;
-    let lap    = (xp + xm + yp + ym + zp + zm - 6.0 * c) * inv_dx2;
-
-    let dx_phi1 = grad_x.x; let dy_phi1 = grad_y.x; let dz_phi1 = grad_z.x;
-    let dx_phi2 = grad_x.y; let dy_phi2 = grad_y.y; let dz_phi2 = grad_z.y;
-    let dx_phi3 = grad_x.z; let dy_phi3 = grad_y.z; let dz_phi3 = grad_z.z;
-
-    let lap_phi1 = lap.x;
-    let lap_phi2 = lap.y;
-    let lap_phi3 = lap.z;{extra_stencil}
-
-    // Exact Euler-Lagrange accelerations compiled from Master Lagrangian:
-    let acc1: f32 = {a1};
-    let acc2: f32 = {a2};
-    let acc3: f32 = {a3};
+    // Outer absorbing sponge boundary layer (box_frac > 0.85; strictly 0 inside <= 0.85)
+    let bh = max(params.box_half, 1.0);
+    let uvw = (vec3<f32>(f32(gid.x), f32(gid.y), f32(gid.z)) + vec3<f32>(0.5)) / f32(n_u);
+    let pos = (uvw - vec3<f32>(0.5)) * (2.0 * bh);
+    let box_frac = max(max(abs(pos.x), abs(pos.y)), abs(pos.z)) / bh;
+    let s_ramp = clamp((box_frac - 0.85) / 0.15, 0.0, 1.0);
+    let s_smooth = s_ramp * s_ramp * (3.0 - 2.0 * s_ramp);
+    let sponge_vel = params.sponge * s_smooth;
+    let sponge_phi = 0.65 * params.sponge * s_ramp * s_smooth;
 
     var v_new = (v_old + params.dt * vec3<f32>(acc1, acc2, acc3)) * (1.0 - params.damping * params.dt);
+    v_new = v_new / (1.0 + sponge_vel * params.dt);
     v_new = clamp(v_new, vec3<f32>(-50.0), vec3<f32>(50.0));
-    let p_new = clamp(c + params.dt * v_new, vec3<f32>(-25.0), vec3<f32>(25.0));
+    var p_new = clamp(c + params.dt * v_new, vec3<f32>(-25.0), vec3<f32>(25.0));
+    p_new = p_new / (1.0 + sponge_phi * params.dt);
 
     store_vel(c_idx, v_new);
     store_phi(c_idx, p_new);
@@ -624,9 +812,9 @@ _SYMBOLIC_CACHE_LOCK = threading.RLock()
 class _VacuumEntryFastEval:
     raw_expr: sp.Expr
     label: str
-    direct_fn: Optional[Callable[[float, float, float, float], float]]
-    reg_e1_fn: Optional[Callable[[float, float, float, float], float]]
-    reg_e2_fn: Optional[Callable[[float, float, float, float], float]]
+    direct_fn: Optional[Callable[..., float]]
+    reg_e1_fn: Optional[Callable[..., float]]
+    reg_e2_fn: Optional[Callable[..., float]]
 
 
 @dataclass
@@ -636,6 +824,7 @@ class _CachedSymbolicTemplate:
     m_eff_sym: sp.Symbol
     g4_sym: sp.Symbol
     g6_sym: sp.Symbol
+    k_skyrme_sym: sp.Symbol
     vacuum_field_syms: Tuple[sp.Symbol, ...]
     has_ostrogradsky_dt: bool
     k_entries: List[List[_VacuumEntryFastEval]]
@@ -670,7 +859,7 @@ class _CachedSymbolicTemplate:
     y_sym: sp.Symbol
     interpolation_nu_compact: str
     gw_sym_expr: sp.Expr
-    gw_fast_fn: Callable[[float, float, float, float], float]
+    gw_fast_fn: Callable[..., float]
 
 
 _SYMBOLIC_ACTION_CACHE: OrderedDict[Tuple[str, str, str, str, str], _CachedSymbolicTemplate] = OrderedDict()
@@ -698,7 +887,7 @@ def _make_vacuum_entry_eval(
     zero_field_int_subs: Dict[sp.Symbol, sp.Expr],
     e1_field_subs: Dict[sp.Symbol, float],
     e2_field_subs: Dict[sp.Symbol, float],
-    param_syms: Tuple[sp.Symbol, sp.Symbol, sp.Symbol, sp.Symbol],
+    param_syms: Tuple[sp.Symbol, ...],
 ) -> _VacuumEntryFastEval:
     sub0 = expr.subs(zero_field_int_subs)
     if not sub0.has(sp.nan, sp.zoo, sp.oo, sp.I):
@@ -721,7 +910,7 @@ def _make_vacuum_entry_eval(
 
 def _run_vacuum_entry_eval(
     entry: _VacuumEntryFastEval,
-    p_tuple: Tuple[float, float, float, float],
+    p_tuple: Tuple[float, ...],
     vacuum_subs: Dict[sp.Symbol, float],
     param_subs: Dict[sp.Symbol, float],
     vacuum_field_syms: Tuple[sp.Symbol, ...],
@@ -825,8 +1014,8 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
     dx_dt_phi2, dy_dt_phi2, dz_dt_phi2 = sp.symbols("dx_dt_phi2 dy_dt_phi2 dz_dt_phi2", real=True)
     dx_dt_phi3, dy_dt_phi3, dz_dt_phi3 = sp.symbols("dx_dt_phi3 dy_dt_phi3 dz_dt_phi3", real=True)
 
-    c_w, m_eff, g4, g6 = sp.symbols("c_w m_eff g4 g6", real=True)
-    param_syms = (c_w, m_eff, g4, g6)
+    c_w, m_eff, g4, g6, k_skyrme = sp.symbols("c_w m_eff g4 g6 k_skyrme", real=True)
+    param_syms = (c_w, m_eff, g4, g6, k_skyrme)
 
     phis = (phi1, phi2, phi3)
     dt_phis = (dt_phi1, dt_phi2, dt_phi3)
@@ -852,9 +1041,19 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
     G_grad_expr = sp.Rational(1, 2) * sum(
         gx**2 + gy**2 + gz**2 for (gx, gy, gz) in grad_phis
     )
+    # Exact 3D Faddeev-Skyrme area-twist invariant: 0.5 * sum_{1 <= i < j <= 3} |d_i phi x d_j phi|^2
+    S_skyrme_expr = sp.Rational(1, 2) * sum(
+        (grad_phis[1][i] * grad_phis[2][j] - grad_phis[2][i] * grad_phis[1][j]) ** 2
+        + (grad_phis[2][i] * grad_phis[0][j] - grad_phis[0][i] * grad_phis[2][j]) ** 2
+        + (grad_phis[0][i] * grad_phis[1][j] - grad_phis[1][i] * grad_phis[0][j]) ** 2
+        for i in range(3)
+        for j in range(i + 1, 3)
+    )
     rho_expr = phi1**2 + phi2**2 + phi3**2
 
-    T_inv_s, G_inv_s, rho_inv_s = sp.symbols("_T_kin_s _G_grad_s _rho_s", real=True, nonnegative=True)
+    T_inv_s, G_inv_s, S_skyrme_inv_s, rho_inv_s = sp.symbols(
+        "_T_kin_s _G_grad_s _S_skyrme_s _rho_s", real=True, nonnegative=True
+    )
     field_locals: Dict[str, sp.Expr] = {
         "phi1": phi1, "phi2": phi2, "phi3": phi3,
         "dt_phi1": dt_phi1, "dt_phi2": dt_phi2, "dt_phi3": dt_phi3,
@@ -864,11 +1063,13 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         "dx_phi3": dx_phi3, "dy_phi3": dy_phi3, "dz_phi3": dz_phi3,
         "T_kin": T_inv_s,
         "G_grad": G_inv_s,
+        "S_skyrme": S_skyrme_inv_s,
         "rho": rho_inv_s,
         "c_w": c_w,
         "m_eff": m_eff,
         "g4": g4,
         "g6": g6,
+        "k_skyrme": k_skyrme,
     }
 
     L_inv = safe_parse_sympy(mod.action.field_lagrangian, field_locals, "field_lagrangian")
@@ -876,7 +1077,12 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         isinstance(sub, sp.Pow) and (not sub.exp.is_Integer)
         for sub in sp.preorder_traversal(L_inv)
     )
-    L_raw = L_inv.subs({T_inv_s: T_kin_expr, G_inv_s: G_grad_expr, rho_inv_s: rho_expr})
+    L_raw = L_inv.subs({
+        T_inv_s: T_kin_expr,
+        G_inv_s: G_grad_expr,
+        S_skyrme_inv_s: S_skyrme_expr,
+        rho_inv_s: rho_expr,
+    })
 
     has_ostrogradsky_dt = bool(L_raw.free_symbols & set(ddt_phis))
     L_unreg = L_raw.subs({ddt_phi1: 0, ddt_phi2: 0, ddt_phi3: 0}) if has_ostrogradsky_dt else L_raw
@@ -905,6 +1111,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         m_eff: float(mod.parameters.m_eff),
         g4: float(mod.parameters.g4),
         g6: float(mod.parameters.g6),
+        k_skyrme: float(mod.parameters.k_skyrme),
     }
     init_vac_subs = {**init_param_subs, **{sym: 0.0 for sym in vacuum_field_syms}}
     K_init_num = np.array(
@@ -953,9 +1160,12 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
 
     if has_fractional_pow:
         eps_reg = sp.Float(1.0e-12)
-        L_reg_raw = L_inv.subs(
-            {T_inv_s: T_kin_expr + eps_reg, G_inv_s: G_grad_expr + eps_reg, rho_inv_s: rho_expr + eps_reg}
-        )
+        L_reg_raw = L_inv.subs({
+            T_inv_s: T_kin_expr + eps_reg,
+            G_inv_s: G_grad_expr + eps_reg,
+            S_skyrme_inv_s: S_skyrme_expr + eps_reg,
+            rho_inv_s: rho_expr + eps_reg,
+        })
         L_expr = L_reg_raw.subs({ddt_phi1: 0, ddt_phi2: 0, ddt_phi3: 0}) if has_ostrogradsky_dt else L_reg_raw
         momenta = [sp.diff(L_expr, dtp) for dtp in dt_phis]
         K_mat = sp.Matrix([[sp.diff(momenta[a], dt_phis[b]) for b in range(3)] for a in range(3)])
@@ -966,7 +1176,8 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
 
     rhs_forces: List[sp.Expr] = []
     needs_full_hessian = False
-    k_is_const = not bool(K_mat.free_symbols - {c_w, m_eff, g4, g6})
+    needs_grad_vel = False
+    k_is_const = not bool(K_mat.free_symbols - {c_w, m_eff, g4, g6, k_skyrme})
 
     for a in range(3):
         dL_dphi_a = sp.diff(L_expr, phis[a])
@@ -979,6 +1190,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
                 d2_dt_grad = sp.diff(momenta[a], grad_phis[b][axis_i])
                 if d2_dt_grad != 0:
                     needs_full_hessian = True
+                    needs_grad_vel = True
                     coriolis_dt_a += d2_dt_grad * grad_dt_phis[b][axis_i]
 
         div_flux_a = sp.Integer(0)
@@ -995,6 +1207,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
                 d2_grad_dt = sp.diff(flux_ai, dt_phis[b])
                 if d2_grad_dt != 0:
                     needs_full_hessian = True
+                    needs_grad_vel = True
                     div_flux_a += d2_grad_dt * grad_dt_phis[b][axis_i]
 
         for b in range(3):
@@ -1010,20 +1223,32 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
             else:
                 needs_full_hessian = True
                 for i in range(3):
-                    for j in range(3):
-                        if h_mat[i][j] != 0:
-                            div_flux_a += h_mat[i][j] * hess_phis[b][i][j]
+                    if h_mat[i][i] != 0:
+                        div_flux_a += sp.expand(h_mat[i][i]) * hess_phis[b][i][i]
+                    for j in range(i + 1, 3):
+                        hij = sp.expand(h_mat[i][j] + h_mat[j][i])
+                        if hij != 0:
+                            div_flux_a += hij * hess_phis[b][i][j]
 
         raw_rhs = dL_dphi_a - coriolis_dt_a - div_flux_a
-        rhs_forces.append(sp.simplify(raw_rhs) if k_is_const else raw_rhs)
+        rhs_forces.append(
+            sp.simplify(raw_rhs) if (k_is_const and not needs_full_hessian) else raw_rhs
+        )
 
     if k_is_const:
         K_inv = K_mat.inv()
-        acc_sym_list = [
-            sp.simplify(sum(K_inv[a, b] * rhs_forces[b] for b in range(3)))
-            for a in range(3)
-        ]
-        H_sym = sp.simplify(sum(momenta[a] * dt_phis[a] for a in range(3)) - L_expr)
+        if needs_full_hessian:
+            acc_sym_list = [
+                sum(K_inv[a, b] * rhs_forces[b] for b in range(3))
+                for a in range(3)
+            ]
+            H_sym = sum(momenta[a] * dt_phis[a] for a in range(3)) - L_expr
+        else:
+            acc_sym_list = [
+                sp.simplify(sum(K_inv[a, b] * rhs_forces[b] for b in range(3)))
+                for a in range(3)
+            ]
+            H_sym = sp.simplify(sum(momenta[a] * dt_phis[a] for a in range(3)) - L_expr)
     else:
         K_adj = K_mat.adjugate()
         K_det = K_mat.det(method="berkowitz")
@@ -1034,7 +1259,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         ]
         H_sym = sp.expand(sum(momenta[a] * dt_phis[a] for a in range(3)) - L_expr)
 
-    # Pre-compile 1D Gate-5 vacuum potential V(phi1; c_w, m_eff, g4, g6)
+    # Pre-compile 1D Gate-5 vacuum potential V(phi1; c_w, m_eff, g4, g6, k_skyrme)
     V_sym_unsub = -L_expr.subs({
         dt_phi1: 0, dt_phi2: 0, dt_phi3: 0,
         dx_phi1: 0, dy_phi1: 0, dz_phi1: 0,
@@ -1042,7 +1267,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         dx_phi3: 0, dy_phi3: 0, dz_phi3: 0,
         phi2: 0, phi3: 0,
     })
-    v_fn_param = sp.lambdify((phi1, c_w, m_eff, g4, g6), V_sym_unsub, modules="numpy")
+    v_fn_param = sp.lambdify((phi1, c_w, m_eff, g4, g6, k_skyrme), V_sym_unsub, modules="numpy")
 
     # Optical metric n(U) & Temporal lapse A(U)
     U_sym = sp.Symbol("U", real=True, positive=True)
@@ -1134,53 +1359,131 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
     # Tensor GW speed ratio c_T / c
     gw_sym_expr = safe_parse_sympy(
         mod.action.gw_speed_ratio,
-        {"c_w": c_w, "m_eff": m_eff, "g4": g4, "g6": g6},
+        {"c_w": c_w, "m_eff": m_eff, "g4": g4, "g6": g6, "k_skyrme": k_skyrme},
         "gw_speed_ratio",
     )
     gw_fast_fn = sp.lambdify(param_syms, gw_sym_expr, modules="math")
 
-    # Emit Dual GPU Compute Kernels (GLSL 430 + WGSL)
-    glsl_accs = tuple(_emit_gpu_expr(expr, lang="glsl") for expr in acc_sym_list)
-    wgsl_accs = tuple(_emit_gpu_expr(expr, lang="wgsl") for expr in acc_sym_list)
-    glsl_src = _build_glsl_3d_pde_shader(glsl_accs, needs_full_hessian=needs_full_hessian)
-    wgsl_src = _build_wgsl_3d_pde_shader(wgsl_accs, needs_full_hessian=needs_full_hessian)
+    # Emit Dual GPU Compute Kernels (GLSL 430 + WGSL) with SymPy CSE register lowering
+    use_variational_octant_flux = bool(k_is_const and (not needs_grad_vel) and needs_full_hessian)
+    octant_helpers_glsl = ""
+    octant_helpers_wgsl = ""
+    dL_dphi_has_grad = False
+    oct_np_dL_dphi: List[Callable] = []
+    oct_np_pi_x: List[Callable] = []
+    oct_np_pi_y: List[Callable] = []
+    oct_np_pi_z: List[Callable] = []
 
-    # Vectorized NumPy CPU parity callables
     cpu_modules = [{"_cpu_clamp_pos": lambda x: np.maximum(np.abs(x), 1e-12)}, "numpy"]
-    if not needs_full_hessian:
-        acc_vars_fast = (
-            phi1, phi2, phi3,
-            dt_phi1, dt_phi2, dt_phi3,
+
+    if use_variational_octant_flux:
+        K_inv_oct = K_mat.inv()
+        dL_dphi_raw = [sp.diff(L_expr, phis[b]) for b in range(3)]
+        pi_x_raw = [sp.diff(L_expr, grad_phis[b][0]) for b in range(3)]
+        pi_y_raw = [sp.diff(L_expr, grad_phis[b][1]) for b in range(3)]
+        pi_z_raw = [sp.diff(L_expr, grad_phis[b][2]) for b in range(3)]
+
+        kinv_dL_dphi = [sum(K_inv_oct[a, b] * dL_dphi_raw[b] for b in range(3)) for a in range(3)]
+        kinv_pi_x = [sum(K_inv_oct[a, b] * pi_x_raw[b] for b in range(3)) for a in range(3)]
+        kinv_pi_y = [sum(K_inv_oct[a, b] * pi_y_raw[b] for b in range(3)) for a in range(3)]
+        kinv_pi_z = [sum(K_inv_oct[a, b] * pi_z_raw[b] for b in range(3)) for a in range(3)]
+
+        grad_sym_set = {
             dx_phi1, dy_phi1, dz_phi1,
             dx_phi2, dy_phi2, dz_phi2,
             dx_phi3, dy_phi3, dz_phi3,
-            lap_phi1, lap_phi2, lap_phi3,
-            c_w, m_eff, g4, g6,
+        }
+        dL_dphi_has_grad = any(bool(expr.free_symbols & grad_sym_set) for expr in kinv_dL_dphi)
+
+        octant_helpers_glsl = (
+            _emit_gpu_octant_vec3_helper("_eval_dL_dphi", kinv_dL_dphi, "glsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_x", kinv_pi_x, "glsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_y", kinv_pi_y, "glsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_z", kinv_pi_z, "glsl")
         )
-        acc_np_fns = [
-            sp.lambdify(acc_vars_fast, _regularize_cpu_expr(expr), modules=cpu_modules)
-            for expr in acc_sym_list
+        octant_helpers_wgsl = (
+            _emit_gpu_octant_vec3_helper("_eval_dL_dphi", kinv_dL_dphi, "wgsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_x", kinv_pi_x, "wgsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_y", kinv_pi_y, "wgsl")
+            + _emit_gpu_octant_vec3_helper("_eval_pi_z", kinv_pi_z, "wgsl")
+        )
+        glsl_cse_block, glsl_accs = "", ("0.0", "0.0", "0.0")
+        wgsl_cse_block, wgsl_accs = "", ("0.0", "0.0", "0.0")
+
+        oct_vars = (
+            phi1, phi2, phi3,
+            dx_phi1, dy_phi1, dz_phi1,
+            dx_phi2, dy_phi2, dz_phi2,
+            dx_phi3, dy_phi3, dz_phi3,
+            c_w, m_eff, g4, g6, k_skyrme,
+        )
+        oct_np_dL_dphi = [
+            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in kinv_dL_dphi
         ]
+        oct_np_pi_x = [
+            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in kinv_pi_x
+        ]
+        oct_np_pi_y = [
+            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in kinv_pi_y
+        ]
+        oct_np_pi_z = [
+            sp.lambdify(oct_vars, _regularize_cpu_expr(e), modules=cpu_modules) for e in kinv_pi_z
+        ]
+        acc_np_fns = []
     else:
-        acc_vars_full = (
-            phi1, phi2, phi3,
-            dt_phi1, dt_phi2, dt_phi3,
-            dx_phi1, dy_phi1, dz_phi1,
-            dx_phi2, dy_phi2, dz_phi2,
-            dx_phi3, dy_phi3, dz_phi3,
-            lap_phi1, lap_phi2, lap_phi3,
-            dxx_phi1, dyy_phi1, dzz_phi1, dxy_phi1, dxz_phi1, dyz_phi1,
-            dxx_phi2, dyy_phi2, dzz_phi2, dxy_phi2, dxz_phi2, dyz_phi2,
-            dxx_phi3, dyy_phi3, dzz_phi3, dxy_phi3, dxz_phi3, dyz_phi3,
-            dx_dt_phi1, dy_dt_phi1, dz_dt_phi1,
-            dx_dt_phi2, dy_dt_phi2, dz_dt_phi2,
-            dx_dt_phi3, dy_dt_phi3, dz_dt_phi3,
-            c_w, m_eff, g4, g6,
-        )
-        acc_np_fns = [
-            sp.lambdify(acc_vars_full, _regularize_cpu_expr(expr), modules=cpu_modules)
-            for expr in acc_sym_list
-        ]
+        glsl_cse_block, glsl_accs = _emit_gpu_accel_block(acc_sym_list, lang="glsl")
+        wgsl_cse_block, wgsl_accs = _emit_gpu_accel_block(acc_sym_list, lang="wgsl")
+        if not needs_full_hessian:
+            acc_vars_fast = (
+                phi1, phi2, phi3,
+                dt_phi1, dt_phi2, dt_phi3,
+                dx_phi1, dy_phi1, dz_phi1,
+                dx_phi2, dy_phi2, dz_phi2,
+                dx_phi3, dy_phi3, dz_phi3,
+                lap_phi1, lap_phi2, lap_phi3,
+                c_w, m_eff, g4, g6, k_skyrme,
+            )
+            acc_np_fns = [
+                sp.lambdify(acc_vars_fast, _regularize_cpu_expr(expr), modules=cpu_modules)
+                for expr in acc_sym_list
+            ]
+        else:
+            acc_vars_full = (
+                phi1, phi2, phi3,
+                dt_phi1, dt_phi2, dt_phi3,
+                dx_phi1, dy_phi1, dz_phi1,
+                dx_phi2, dy_phi2, dz_phi2,
+                dx_phi3, dy_phi3, dz_phi3,
+                lap_phi1, lap_phi2, lap_phi3,
+                dxx_phi1, dyy_phi1, dzz_phi1, dxy_phi1, dxz_phi1, dyz_phi1,
+                dxx_phi2, dyy_phi2, dzz_phi2, dxy_phi2, dxz_phi2, dyz_phi2,
+                dxx_phi3, dyy_phi3, dzz_phi3, dxy_phi3, dxz_phi3, dyz_phi3,
+                dx_dt_phi1, dy_dt_phi1, dz_dt_phi1,
+                dx_dt_phi2, dy_dt_phi2, dz_dt_phi2,
+                dx_dt_phi3, dy_dt_phi3, dz_dt_phi3,
+                c_w, m_eff, g4, g6, k_skyrme,
+            )
+            acc_np_fns = [
+                sp.lambdify(acc_vars_full, _regularize_cpu_expr(expr), modules=cpu_modules)
+                for expr in acc_sym_list
+            ]
+
+    glsl_src = _build_glsl_3d_pde_shader(
+        glsl_accs,
+        needs_full_hessian=needs_full_hessian,
+        needs_grad_vel=needs_grad_vel,
+        cse_block=glsl_cse_block,
+        octant_helpers_glsl=octant_helpers_glsl,
+        dL_dphi_has_grad=dL_dphi_has_grad,
+    )
+    wgsl_src = _build_wgsl_3d_pde_shader(
+        wgsl_accs,
+        needs_full_hessian=needs_full_hessian,
+        needs_grad_vel=needs_grad_vel,
+        cse_block=wgsl_cse_block,
+        octant_helpers_wgsl=octant_helpers_wgsl,
+        dL_dphi_has_grad=dL_dphi_has_grad,
+    )
 
     def accel_numpy(
         phi_arr: np.ndarray,
@@ -1192,8 +1495,10 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         p_g6: float,
         vel_arr: Optional[np.ndarray] = None,
         dx_step: Optional[float] = None,
+        p_k_skyrme: Optional[float] = None,
     ) -> np.ndarray:
         """Evaluates exact 3-component Euler-Lagrange accelerations on 3D NumPy grids `(3, Z, Y, X)`."""
+        ks_val = float(mod.parameters.k_skyrme) if p_k_skyrme is None else float(p_k_skyrme)
         v_use = np.zeros_like(phi_arr) if vel_arr is None else vel_arr
         if not needs_full_hessian:
             args = (
@@ -1203,54 +1508,142 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
                 grad_arr[1, 0], grad_arr[1, 1], grad_arr[1, 2],
                 grad_arr[2, 0], grad_arr[2, 1], grad_arr[2, 2],
                 lap_arr[0], lap_arr[1], lap_arr[2],
-                p_cw, p_meff, p_g4, p_g6,
+                p_cw, p_meff, p_g4, p_g6, ks_val,
             )
-        else:
-            h = float(dx_step) if dx_step is not None else 1.0
-            inv_dx2 = 1.0 / (h * h)
-            inv_4dx2 = 0.25 * inv_dx2
-            inv_2dx = 0.5 / h
+            out = np.empty_like(phi_arr)
+            for comp_i, fn in enumerate(acc_np_fns):
+                val = fn(*args)
+                out[comp_i] = val if isinstance(val, np.ndarray) else np.full_like(phi_arr[0], float(val))
+            return out
 
-            def _hess_comp(f: np.ndarray):
-                xp = np.roll(f, -1, axis=2)
-                xm = np.roll(f, 1, axis=2)
-                yp = np.roll(f, -1, axis=1)
-                ym = np.roll(f, 1, axis=1)
-                zp = np.roll(f, -1, axis=0)
-                zm = np.roll(f, 1, axis=0)
-                dxx = (xp - 2.0 * f + xm) * inv_dx2
-                dyy = (yp - 2.0 * f + ym) * inv_dx2
-                dzz = (zp - 2.0 * f + zm) * inv_dx2
-                dxy = (np.roll(xp, -1, axis=1) - np.roll(xp, 1, axis=1) - np.roll(xm, -1, axis=1) + np.roll(xm, 1, axis=1)) * inv_4dx2
-                dxz = (np.roll(xp, -1, axis=0) - np.roll(xp, 1, axis=0) - np.roll(xm, -1, axis=0) + np.roll(xm, 1, axis=0)) * inv_4dx2
-                dyz = (np.roll(yp, -1, axis=0) - np.roll(yp, 1, axis=0) - np.roll(ym, -1, axis=0) + np.roll(ym, 1, axis=0)) * inv_4dx2
-                return dxx, dyy, dzz, dxy, dxz, dyz
+        h = 1.0
+        if dx_step is not None:
+            h = float(dx_step)
+        elif phi_arr.ndim == 4 and grad_arr.ndim == 5 and phi_arr.shape[-1] >= 4:
+            for c_i in range(min(3, phi_arr.shape[0])):
+                gx = grad_arr[c_i, 0]
+                mask = np.abs(gx) > 1.0e-4
+                if int(np.count_nonzero(mask)) >= 8:
+                    diff_x = np.roll(phi_arr[c_i], -1, axis=2) - np.roll(phi_arr[c_i], 1, axis=2)
+                    ratios = diff_x[mask] / (2.0 * gx[mask])
+                    h_mean = float(np.mean(ratios))
+                    if h_mean > 1.0e-6 and float(np.std(ratios)) <= 1.0e-3 * abs(h_mean):
+                        h = h_mean
+                        break
 
-            def _grad_comp(v: np.ndarray):
-                return (
-                    (np.roll(v, -1, axis=2) - np.roll(v, 1, axis=2)) * inv_2dx,
-                    (np.roll(v, -1, axis=1) - np.roll(v, 1, axis=1)) * inv_2dx,
-                    (np.roll(v, -1, axis=0) - np.roll(v, 1, axis=0)) * inv_2dx,
+        if use_variational_octant_flux:
+            inv_dx = 1.0 / h
+            c = phi_arr
+            xp = np.roll(c, -1, axis=3)
+            xm = np.roll(c, 1, axis=3)
+            yp = np.roll(c, -1, axis=2)
+            ym = np.roll(c, 1, axis=2)
+            zp = np.roll(c, -1, axis=1)
+            zm = np.roll(c, 1, axis=1)
+
+            xmyp = np.roll(xm, -1, axis=2)
+            xpym = np.roll(xp, 1, axis=2)
+            xmzp = np.roll(xm, -1, axis=1)
+            xpzm = np.roll(xp, 1, axis=1)
+            ymzp = np.roll(ym, -1, axis=1)
+            ypzm = np.roll(yp, 1, axis=1)
+
+            gx_cp = (xp - c) * inv_dx
+            gy_cp = (yp - c) * inv_dx
+            gz_cp = (zp - c) * inv_dx
+            gx_cm = (c - xm) * inv_dx
+            gy_cm = (c - ym) * inv_dx
+            gz_cm = (c - zm) * inv_dx
+
+            def _eval_oct_vec(fns: List[Callable], p_v: np.ndarray, gx_v: np.ndarray, gy_v: np.ndarray, gz_v: np.ndarray) -> np.ndarray:
+                o_args = (
+                    p_v[0], p_v[1], p_v[2],
+                    gx_v[0], gy_v[0], gz_v[0],
+                    gx_v[1], gy_v[1], gz_v[1],
+                    gx_v[2], gy_v[2], gz_v[2],
+                    p_cw, p_meff, p_g4, p_g6, ks_val,
                 )
+                res = np.empty_like(phi_arr)
+                for a_i, fn_a in enumerate(fns):
+                    v_a = fn_a(*o_args)
+                    res[a_i] = v_a if isinstance(v_a, np.ndarray) else np.full_like(phi_arr[0], float(v_a))
+                return res
 
-            h1 = _hess_comp(phi_arr[0])
-            h2 = _hess_comp(phi_arr[1])
-            h3 = _hess_comp(phi_arr[2])
+            pi_x_cp = _eval_oct_vec(oct_np_pi_x, c, gx_cp, gy_cp, gz_cp)
+            pi_y_cp = _eval_oct_vec(oct_np_pi_y, c, gx_cp, gy_cp, gz_cp)
+            pi_z_cp = _eval_oct_vec(oct_np_pi_z, c, gx_cp, gy_cp, gz_cp)
+            pi_x_xmp = _eval_oct_vec(oct_np_pi_x, xm, gx_cm, (xmyp - xm) * inv_dx, (xmzp - xm) * inv_dx)
+            pi_y_ymp = _eval_oct_vec(oct_np_pi_y, ym, (xpym - ym) * inv_dx, gy_cm, (ymzp - ym) * inv_dx)
+            pi_z_zmp = _eval_oct_vec(oct_np_pi_z, zm, (xpzm - zm) * inv_dx, (ypzm - zm) * inv_dx, gz_cm)
+
+            pi_x_cm = _eval_oct_vec(oct_np_pi_x, c, gx_cm, gy_cm, gz_cm)
+            pi_y_cm = _eval_oct_vec(oct_np_pi_y, c, gx_cm, gy_cm, gz_cm)
+            pi_z_cm = _eval_oct_vec(oct_np_pi_z, c, gx_cm, gy_cm, gz_cm)
+            pi_x_xpm = _eval_oct_vec(oct_np_pi_x, xp, gx_cp, (xp - xpym) * inv_dx, (xp - xpzm) * inv_dx)
+            pi_y_ypm = _eval_oct_vec(oct_np_pi_y, yp, (yp - xmyp) * inv_dx, gy_cp, (yp - ypzm) * inv_dx)
+            pi_z_zpm = _eval_oct_vec(oct_np_pi_z, zp, (zp - xmzp) * inv_dx, (zp - ymzp) * inv_dx, gz_cp)
+
+            if dL_dphi_has_grad:
+                f_pot = 0.5 * (
+                    _eval_oct_vec(oct_np_dL_dphi, c, gx_cp, gy_cp, gz_cp)
+                    + _eval_oct_vec(oct_np_dL_dphi, c, gx_cm, gy_cm, gz_cm)
+                )
+            else:
+                f_pot = _eval_oct_vec(oct_np_dL_dphi, c, gx_cp, gy_cp, gz_cp)
+
+            div_plus = ((pi_x_cp - pi_x_xmp) + (pi_y_cp - pi_y_ymp) + (pi_z_cp - pi_z_zmp)) * inv_dx
+            div_minus = ((pi_x_xpm - pi_x_cm) + (pi_y_ypm - pi_y_cm) + (pi_z_zpm - pi_z_cm)) * inv_dx
+            return f_pot - 0.5 * (div_plus + div_minus)
+
+        inv_dx2 = 1.0 / (h * h)
+        inv_4dx2 = 0.25 * inv_dx2
+        inv_2dx = 0.5 / h
+
+        def _hess_comp(f: np.ndarray):
+            xp = np.roll(f, -1, axis=2)
+            xm = np.roll(f, 1, axis=2)
+            yp = np.roll(f, -1, axis=1)
+            ym = np.roll(f, 1, axis=1)
+            zp = np.roll(f, -1, axis=0)
+            zm = np.roll(f, 1, axis=0)
+            dxx = (xp - 2.0 * f + xm) * inv_dx2
+            dyy = (yp - 2.0 * f + ym) * inv_dx2
+            dzz = (zp - 2.0 * f + zm) * inv_dx2
+            dxy = (np.roll(xp, -1, axis=1) - np.roll(xp, 1, axis=1) - np.roll(xm, -1, axis=1) + np.roll(xm, 1, axis=1)) * inv_4dx2
+            dxz = (np.roll(xp, -1, axis=0) - np.roll(xp, 1, axis=0) - np.roll(xm, -1, axis=0) + np.roll(xm, 1, axis=0)) * inv_4dx2
+            dyz = (np.roll(yp, -1, axis=0) - np.roll(yp, 1, axis=0) - np.roll(ym, -1, axis=0) + np.roll(ym, 1, axis=0)) * inv_4dx2
+            return dxx, dyy, dzz, dxy, dxz, dyz
+
+        def _grad_comp(v: np.ndarray):
+            return (
+                (np.roll(v, -1, axis=2) - np.roll(v, 1, axis=2)) * inv_2dx,
+                (np.roll(v, -1, axis=1) - np.roll(v, 1, axis=1)) * inv_2dx,
+                (np.roll(v, -1, axis=0) - np.roll(v, 1, axis=0)) * inv_2dx,
+            )
+
+        h1 = _hess_comp(phi_arr[0])
+        h2 = _hess_comp(phi_arr[1])
+        h3 = _hess_comp(phi_arr[2])
+        if needs_grad_vel:
             gv1 = _grad_comp(v_use[0])
             gv2 = _grad_comp(v_use[1])
             gv3 = _grad_comp(v_use[2])
+        else:
+            gv1 = (0.0, 0.0, 0.0)
+            gv2 = (0.0, 0.0, 0.0)
+            gv3 = (0.0, 0.0, 0.0)
 
-            args = (
-                phi_arr[0], phi_arr[1], phi_arr[2],
-                v_use[0], v_use[1], v_use[2],
-                grad_arr[0, 0], grad_arr[0, 1], grad_arr[0, 2],
-                grad_arr[1, 0], grad_arr[1, 1], grad_arr[1, 2],
-                grad_arr[2, 0], grad_arr[2, 1], grad_arr[2, 2],
-                lap_arr[0], lap_arr[1], lap_arr[2],
-                *h1, *h2, *h3,
-                *gv1, *gv2, *gv3,
-                p_cw, p_meff, p_g4, p_g6,
-            )
+        args = (
+            phi_arr[0], phi_arr[1], phi_arr[2],
+            v_use[0], v_use[1], v_use[2],
+            grad_arr[0, 0], grad_arr[0, 1], grad_arr[0, 2],
+            grad_arr[1, 0], grad_arr[1, 1], grad_arr[1, 2],
+            grad_arr[2, 0], grad_arr[2, 1], grad_arr[2, 2],
+            lap_arr[0], lap_arr[1], lap_arr[2],
+            *h1, *h2, *h3,
+            *gv1, *gv2, *gv3,
+            p_cw, p_meff, p_g4, p_g6, ks_val,
+        )
 
         out = np.empty_like(phi_arr)
         for comp_i, fn in enumerate(acc_np_fns):
@@ -1264,7 +1657,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         dx_phi1, dy_phi1, dz_phi1,
         dx_phi2, dy_phi2, dz_phi2,
         dx_phi3, dy_phi3, dz_phi3,
-        c_w, m_eff, g4, g6,
+        c_w, m_eff, g4, g6, k_skyrme,
     )
     ham_np_raw = sp.lambdify(ham_vars, _regularize_cpu_expr(H_sym), modules=cpu_modules)
 
@@ -1276,14 +1669,16 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         p_meff: float,
         p_g4: float,
         p_g6: float,
+        p_k_skyrme: Optional[float] = None,
     ) -> np.ndarray:
+        ks_val = 0.0 if p_k_skyrme is None else float(p_k_skyrme)
         args = (
             phi_arr[0], phi_arr[1], phi_arr[2],
             vel_arr[0], vel_arr[1], vel_arr[2],
             grad_arr[0, 0], grad_arr[0, 1], grad_arr[0, 2],
             grad_arr[1, 0], grad_arr[1, 1], grad_arr[1, 2],
             grad_arr[2, 0], grad_arr[2, 1], grad_arr[2, 2],
-            p_cw, p_meff, p_g4, p_g6,
+            p_cw, p_meff, p_g4, p_g6, ks_val,
         )
         val = ham_np_raw(*args)
         return val if isinstance(val, np.ndarray) else np.full_like(phi_arr[0], float(val))
@@ -1294,6 +1689,7 @@ def _build_symbolic_action_template(mod: PhysicsMod) -> _CachedSymbolicTemplate:
         m_eff_sym=m_eff,
         g4_sym=g4,
         g6_sym=g6,
+        k_skyrme_sym=k_skyrme,
         vacuum_field_syms=vacuum_field_syms,
         has_ostrogradsky_dt=has_ostrogradsky_dt,
         k_entries=k_entries,
@@ -1338,13 +1734,15 @@ def _evaluate_from_cached_template(tpl: _CachedSymbolicTemplate, mod: PhysicsMod
     p_meff = float(mod.parameters.m_eff)
     p_g4 = float(mod.parameters.g4)
     p_g6 = float(mod.parameters.g6)
-    p_tuple = (p_cw, p_meff, p_g4, p_g6)
+    p_k_skyrme = float(mod.parameters.k_skyrme)
+    p_tuple = (p_cw, p_meff, p_g4, p_g6, p_k_skyrme)
 
     param_subs = {
         tpl.c_w_sym: p_cw,
         tpl.m_eff_sym: p_meff,
         tpl.g4_sym: p_g4,
         tpl.g6_sym: p_g6,
+        tpl.k_skyrme_sym: p_k_skyrme,
     }
     vacuum_subs = {**param_subs, **{sym: 0.0 for sym in tpl.vacuum_field_syms}}
 
@@ -1393,7 +1791,7 @@ def _evaluate_from_cached_template(tpl: _CachedSymbolicTemplate, mod: PhysicsMod
 
     # Gate 5: Coleman False-Vacuum & Planck-Core Asymptotic Stability Scan
     with np.errstate(all="ignore"):
-        v_probe = np.asarray(tpl.v_fn_param(_PHI_PROBE_401, p_cw, p_meff, p_g4, p_g6), dtype=float)
+        v_probe = np.asarray(tpl.v_fn_param(_PHI_PROBE_401, p_cw, p_meff, p_g4, p_g6, p_k_skyrme), dtype=float)
     if v_probe.ndim == 0:
         v_probe = np.full_like(_PHI_PROBE_401, float(v_probe))
     v_at_0 = float(v_probe[0])
@@ -1543,6 +1941,93 @@ def _evaluate_from_cached_template(tpl: _CachedSymbolicTemplate, mod: PhysicsMod
     all_passed = all(g.passed for g in gates)
     has_warn = any((not g.passed) and g.severity == "WARN" for g in gates)
 
+    raw_accel_fn = tpl.accel_numpy_fn
+    raw_ham_fn = tpl.hamiltonian_numpy_fn
+
+    # Measure local vacuum potential curvature max |d(acc)/d(phi)| for symplectic dt safety
+    max_pot_stiff = float(p_meff * p_meff)
+    try:
+        eps_p = 1.0e-3
+        p_vac_probe = np.zeros((3, 1, 1, 6), dtype=float)
+        for ax_i in range(3):
+            p_vac_probe[ax_i, 0, 0, 2 * ax_i] = eps_p
+            p_vac_probe[ax_i, 0, 0, 2 * ax_i + 1] = -eps_p
+        z_grad = np.zeros((3, 3, 1, 1, 6), dtype=float)
+        z_vec = np.zeros((3, 1, 1, 6), dtype=float)
+        with np.errstate(all="ignore"):
+            acc_probe = np.asarray(
+                raw_accel_fn(
+                    p_vac_probe,
+                    z_grad,
+                    z_vec,
+                    p_cw,
+                    p_meff,
+                    p_g4,
+                    p_g6,
+                    vel_arr=z_vec,
+                    dx_step=1.0e6,
+                    p_k_skyrme=0.0,
+                ),
+                dtype=float,
+            )
+        if acc_probe.shape == (3, 1, 1, 6) and np.all(np.isfinite(acc_probe)):
+            jac_vac = (acc_probe[:, 0, 0, 0::2] - acc_probe[:, 0, 0, 1::2]) / (2.0 * eps_p)
+            row_norm = float(np.max(np.sum(np.abs(jac_vac), axis=1)))
+            if math.isfinite(row_norm):
+                max_pot_stiff = max(max_pot_stiff, row_norm)
+    except Exception:
+        pass
+
+    default_k_s = p_k_skyrme
+
+    def accel_numpy_bound(
+        phi_arr: np.ndarray,
+        grad_arr: np.ndarray,
+        lap_arr: np.ndarray,
+        c_w_arg: float,
+        m_eff_arg: float,
+        g4_arg: float,
+        g6_arg: float,
+        vel_arr: Optional[np.ndarray] = None,
+        dx_step: Optional[float] = None,
+        p_k_skyrme: Optional[float] = None,
+    ) -> np.ndarray:
+        ks_use = default_k_s if p_k_skyrme is None else float(p_k_skyrme)
+        return raw_accel_fn(
+            phi_arr,
+            grad_arr,
+            lap_arr,
+            c_w_arg,
+            m_eff_arg,
+            g4_arg,
+            g6_arg,
+            vel_arr=vel_arr,
+            dx_step=dx_step,
+            p_k_skyrme=ks_use,
+        )
+
+    def hamiltonian_numpy_bound(
+        phi_arr: np.ndarray,
+        vel_arr: np.ndarray,
+        grad_arr: np.ndarray,
+        c_w_arg: float,
+        m_eff_arg: float,
+        g4_arg: float,
+        g6_arg: float,
+        p_k_skyrme: Optional[float] = None,
+    ) -> np.ndarray:
+        ks_use = default_k_s if p_k_skyrme is None else float(p_k_skyrme)
+        return raw_ham_fn(
+            phi_arr,
+            vel_arr,
+            grad_arr,
+            c_w_arg,
+            m_eff_arg,
+            g4_arg,
+            g6_arg,
+            p_k_skyrme=ks_use,
+        )
+
     return CompiledMasterAction(
         mod_id=mod.id,
         mod_name=mod.name,
@@ -1574,8 +2059,9 @@ def _evaluate_from_cached_template(tpl: _CachedSymbolicTemplate, mod: PhysicsMod
         u_horizon_cap=tpl.u_horizon_cap,
         ppn_alpha_lapse=ppn_alpha,
         needs_full_hessian=tpl.needs_full_hessian,
-        accel_numpy_fn=tpl.accel_numpy_fn,
-        hamiltonian_numpy_fn=tpl.hamiltonian_numpy_fn,
+        max_potential_stiffness=max_pot_stiff,
+        accel_numpy_fn=accel_numpy_bound,
+        hamiltonian_numpy_fn=hamiltonian_numpy_bound,
         nu_numpy_fn=tpl.nu_numpy_fn,
         optical_n_numpy_fn=tpl.optical_n_numpy_fn,
         lapse_A_numpy_fn=tpl.lapse_A_numpy_fn,

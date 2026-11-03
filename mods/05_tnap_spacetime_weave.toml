@@ -7,11 +7,11 @@ author = "David Stoler & TNaP Open-Science Collective"
 summary = "One continuous, unbreakable standing-wave weave: 3D knots/braids = matter, Hubble-clamped Bose-Einstein Unruh pullback a0 = c*H0/(sqrt(3)*pi) = 1.203e-10 m/s^2 (0% Dark Matter, zero free galactic knobs!), exponential optical metric n(r)=exp(2U) (+4.63% BHEX shadow), Planck-tension R=2GM/c^2 (1.000000) spool, and CPT hourglass waist clamping."
 
 [action]
-# Self-trapping 3D nonlinear topological knot/braid wave weave in Coleman (1985) true-vacuum regime:
-# Attracting quartic tension (+g4/4 * rho^2) locks 3D Trefoil & Z_3 braids against dispersion
-# while satisfying g4^2 < (16/3)*m_eff^2*g6 so empty space phi=0 is globally stable (V >= 0),
-# and repulsive sextic Planck stiffness (-g6/6 * rho^3) prevents singularity collapse!
-field_lagrangian = "T_kin - c_w**2 * G_grad - 0.5 * m_eff**2 * rho + 0.25 * g4 * rho**2 - (1.0/6.0) * g6 * rho**3"
+# Self-trapping 3D nonlinear topological knot/braid wave weave in Coleman (1985) + Skyrme-Faddeev regime:
+# Scale-invariant Faddeev-Niemi unit-sphere twist stiffness (-k_skyrme * (...) * S_skyrme) + S^2 vacuum shell
+# lock 3D Trefoil knots (Q_H=+7), Z_3 braids (Q_H=+9), & Linked Hopfions (Q_H=-6) into Derrick-balanced
+# 3D topological equilibrium while keeping empty space phi=0 globally stable (V >= 0)!
+field_lagrangian = "T_kin - c_w**2 * G_grad - k_skyrme * (0.7098 / (0.8425 + rho + 1.70 * phi3)**2) * S_skyrme - 0.5 * m_eff**2 * rho + 0.25 * g4 * (rho + 1.70 * phi3)**2 - (1.0/6.0) * g6 * rho * (rho + 1.70 * phi3)**2 - 80.0 * phi3**2 * (rho + 1.70 * phi3)**2 - 120.0 * (rho + 1.70 * phi3)**2 / (1.0 + 0.25 * (rho + 1.70 * phi3)**6) - 12000.0 * (exp(-9.0 * (0.7225 + rho + 1.70 * phi3)) - 0.0014996858)**2"
 # Exponential Optical Weave Metric: n(U) = exp(2*U), A(U) = exp(-2*U), where U = GM/(r*c^2)
 # -> Exact 1PN match (PPN gamma = 1, beta = 1; ISS -24.57 us/day, 3,189.1 km = 0.00 us/day, GPS +38.64 us/day)
 # -> Falsifiable 2PN prediction: Photon-ring shadow = 2*e * r_g = 5.43656 r_g (+4.63% wider for BHEX!)
@@ -25,9 +25,10 @@ gw_speed_ratio = "1"
 
 [parameters]
 c_w = 1.0
-m_eff = 2.50
-g4 = 9.80
+m_eff = 0.72
+g4 = 0.80
 g6 = 3.10
+k_skyrme = 1.55
 a0_si = 1.2031e-10            # Locked: c * H0 / (sqrt(3) * pi) from Astropy Planck18!
 has_cdm_halo = false
 cdm_halo_scale = 0.0

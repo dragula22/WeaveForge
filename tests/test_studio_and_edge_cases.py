@@ -613,7 +613,7 @@ def test_studio_interactive_clicks_cdm_toggle_sweep_cell_and_wasd_guard() -> Non
         app.select_left_tab(1)
         app.render_single_frame()
         app.render_single_frame()
-        for y_try in range(440, 600, 12):
+        for y_try in range(440, 660, 12):
             glfw.set_cursor_pos(app.window, 24.0, float(y_try))
             io.add_mouse_pos_event(24.0, float(y_try))
             app.render_single_frame()
@@ -1474,3 +1474,68 @@ def test_studio_60fps_video_recorder_nvenc_and_libx264_plus_4k_topbar_layout(tmp
         assert info_cpu["decoded_frames"] == 20
     finally:
         app.shutdown()
+
+
+def test_studio_skyrme_slider_reset_and_fixed_60hz_accumulator_determinism() -> None:
+    from imgui_bundle import imgui
+
+    app = WeaveForgeStudioApp(
+        width=1280,
+        height=760,
+        initial_arena=1,
+        initial_mod_id="tnap_weave",
+        vsync=False,
+        visible=False,
+    )
+    try:
+        app.arena1.set_grid_resolution(48)
+        app.arena3.set_particle_count(100_000, mod=app.working_mod, compiled=app.compiled)
+
+        # 1. Verify Skyrme Twist k_S parameter dirty-tracking, live recompilation, and [R] reset
+        default_ks = float(app._pristine_mod.parameters.k_skyrme)
+        assert default_ks == pytest.approx(1.55)
+        assert app.is_parameter_modified("k_skyrme") is False
+
+        app.working_mod.parameters.k_skyrme = 2.75
+        app._recompile_working_mod()
+        app.select_left_tab(1)
+        app.render_single_frame(dt_override=0.0)
+        app.render_single_frame(dt_override=0.0)
+        assert app.is_parameter_modified("k_skyrme") is True
+        assert "k_skyrme" in app._last_slider_reset_rects
+
+        app.reset_single_parameter("k_skyrme")
+        assert app.is_parameter_modified("k_skyrme") is False
+        assert app.working_mod.parameters.k_skyrme == pytest.approx(default_ks)
+
+        # 2. Verify fixed-60 Hz physics accumulator determinism:
+        #    240 frames @ 240 Hz (dt=1/240s) MUST execute the exact same 60 physics ticks
+        #    as 60 frames @ 60 Hz (dt=1/60s)!
+        app.paused = False
+        app.arena1.reset_field(0)
+        app._sim_accum = 0.0
+        for _ in range(240):
+            app.render_single_frame(dt_override=1.0 / 240.0)
+        steps_240hz = int(app.arena1.step_count)
+        sim_t_240hz = float(app.arena1.sim_time)
+        assert steps_240hz == 60 * int(app.arena1.substeps_per_frame)
+
+        # Tap [R] hotkey in Arena 1 and verify step_count & accumulator reset cleanly, then run 60 frames @ 60 Hz
+        io = imgui.get_io()
+        io.add_key_event(imgui.Key.r, True)
+        app.render_single_frame(dt_override=0.0)
+        io.add_key_event(imgui.Key.r, False)
+        app.render_single_frame(dt_override=0.0)
+        assert app.arena1.step_count == 0
+
+        app._sim_accum = 0.0
+        for _ in range(60):
+            app.render_single_frame(dt_override=1.0 / 60.0)
+        steps_60hz = int(app.arena1.step_count)
+        sim_t_60hz = float(app.arena1.sim_time)
+
+        assert steps_60hz == steps_240hz
+        assert sim_t_60hz == pytest.approx(sim_t_240hz, rel=1e-6, abs=1e-7)
+    finally:
+        app.shutdown()
+

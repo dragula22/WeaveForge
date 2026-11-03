@@ -84,17 +84,29 @@ def compute_safe_symplectic_dt(
     peak_rho_est: float = 2.8,
 ) -> float:
     """
-    Adaptive Courant–Friedrichs–Lewy + Klein–Gordon mass + nonlinear potential stiffness controller:
-    guarantees symplectic Störmer–Verlet stability even for stiff user Lagrangians (`g6 = 500`, high `m_eff`).
+    Adaptive Courant–Friedrichs–Lewy + Klein–Gordon mass + Skyrme & nonlinear potential stiffness controller:
+    guarantees symplectic Störmer–Verlet stability even for stiff user Lagrangians (`g6 = 500`, `k_skyrme > 0`).
     """
     cs_sq = abs(compiled.sound_speed_sq) if compiled is not None and math.isfinite(compiled.sound_speed_sq) else 1.0
     c_eff = max(abs(float(mod.parameters.c_w)), math.sqrt(max(cs_sq, 0.05)), 0.25)
-    dt_cfl = 0.22 * dx / c_eff
 
     rho_ref = max(float(peak_rho_est), 2.8)
-    m2 = float(mod.parameters.m_eff) ** 2
+    k_sk = abs(float(getattr(mod.parameters, "k_skyrme", 0.0)))
+    if k_sk > 0.0 and (compiled is None or compiled.needs_full_hessian):
+        grad_sq_est = 18.0 * rho_ref
+        c_local = math.sqrt((c_eff**2) + 4.0 * k_sk * grad_sq_est)
+    else:
+        c_local = c_eff
+    dt_cfl = 0.22 * dx / c_local
+
+    pot_stiff = (
+        abs(float(compiled.max_potential_stiffness))
+        if compiled is not None and math.isfinite(compiled.max_potential_stiffness)
+        else 0.0
+    )
+    m2 = max(float(mod.parameters.m_eff) ** 2, pot_stiff)
     stiff_nl = max(2.5 * abs(float(mod.parameters.g4)) * rho_ref, 2.5 * abs(float(mod.parameters.g6)) * (rho_ref**2))
-    omega_max_sq = (12.0 * (c_eff**2)) / max(dx * dx, 1e-8) + m2 + stiff_nl
+    omega_max_sq = (12.0 * (c_local**2)) / max(dx * dx, 1e-8) + m2 + stiff_nl
     dt_stiff = 0.42 / math.sqrt(max(omega_max_sq, 1.0))
     return min(dt_cfl, dt_stiff)
 
@@ -105,11 +117,11 @@ def build_3d_topological_initial_state(
     box_size: float = 12.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Constructs C-infinity smooth, periodic-boundary-clean 3D topological knot/braid initial fields
+    Constructs C-infinity smooth, periodic-boundary-clean 3D topological Hopfion / knot initial fields
     `(phi_init, vel_init)` of shape `(N, N, N, 4)` (`float32`), matching `_INIT_KNOT_GLSL` in Arena 1!
-      • `trefoil_knot`:  C-infinity line-integral 3D `(2, 3)` Torus Trefoil Knot (`boundary rho < 1e-5`)!
-      • `z3_braid`:      3-Ribbon `Z_3` Cyclic Generation Braid (Koide `theta0 = 2/9` triad!)
-      • `hopfion_ring`:  Linked 3D Hopfion / Superfluid Vortex Ring pair
+      • `trefoil_knot`:  Sutcliffe (2007, Eq. 3.7) `T_(3,2)` Trefoil Knot Rational Map (`Q_H = +7`)!
+      • `z3_braid`:      3-Ribbon `Z_3` Cyclic Generation Braid Link (Koide `theta0 = 2/9`, `Q_H = +9`!)
+      • `hopfion_ring`:  Symmetric Orthogonal Linked 3D Hopfion Rings (`6_1^2` link, `Q_H = -6`!)
       • `packet_smash`:  Head-on 3D relativistic wave-packet collision (`Observer Channel A/B` interference)
     """
     idx_lin = (np.arange(grid_n, dtype=np.float32) + 0.5) / float(grid_n)
@@ -118,82 +130,202 @@ def build_3d_topological_initial_state(
 
     phi = np.zeros((grid_n, grid_n, grid_n, 4), dtype=np.float32)
     vel = np.zeros((grid_n, grid_n, grid_n, 4), dtype=np.float32)
+    v0 = 0.85
 
     if preset == "trefoil_knot":
-        # Exact C-infinity smooth line-integral (2, 3) Trefoil Knot (zero Voronoi seams, boundary rho < 1e-5!)
-        n_samp = 96
-        s_vals = np.linspace(0.0, 2.0 * math.pi, n_samp, endpoint=False, dtype=np.float32)
-        scale_r = 0.112 * box_size
-        tube_w = 0.052 * box_size
-        inv_2w2 = 1.0 / (2.0 * tube_w * tube_w)
+        a0 = 0.195 * float(box_size)
+        r = np.sqrt(X * X + Y * Y + Z * Z)
+        rn = r / a0
+        rn2 = rn * rn
+        chi = 3.14159265 * np.exp(-0.6931472 * rn2 - 0.095 * rn2 * rn2)
+        sc_over_r = np.where(r > 1.0e-5, np.sin(chi) / np.maximum(r, 1.0e-5), 0.0)
+        z1_re = sc_over_r * X
+        z1_im = sc_over_r * Y
+        z2_re = sc_over_r * Z
+        z2_im = np.cos(chi)
 
-        cx = scale_r * (np.sin(s_vals) + 2.0 * np.sin(2.0 * s_vals))
-        cy = scale_r * (np.cos(s_vals) - 2.0 * np.cos(2.0 * s_vals))
-        cz = scale_r * (-1.35 * np.sin(3.0 * s_vals))
-        cos3 = np.cos(3.0 * s_vals)
-        sin3 = np.sin(3.0 * s_vals)
-        sin2 = np.sin(2.0 * s_vals)
+        z1_2_re = z1_re * z1_re - z1_im * z1_im
+        z1_2_im = 2.0 * z1_re * z1_im
+        z2_2_re = z2_re * z2_re - z2_im * z2_im
+        z2_2_im = 2.0 * z2_re * z2_im
 
-        sum_c = np.zeros((grid_n, grid_n, grid_n), dtype=np.float32)
-        sum_s = np.zeros((grid_n, grid_n, grid_n), dtype=np.float32)
-        sum_z = np.zeros((grid_n, grid_n, grid_n), dtype=np.float32)
+        q_re = (z1_2_re * z1_re - z1_2_im * z1_im) + z2_2_re
+        q_im = (z1_2_re * z1_im + z1_2_im * z1_re) + z2_2_im
+        p_re = 1.95 * (z1_2_re * z2_re - z1_2_im * z2_im)
+        p_im = 1.95 * (z1_2_re * z2_im + z1_2_im * z2_re)
 
-        for k in range(n_samp):
-            d2 = (X - cx[k]) ** 2 + (Y - cy[k]) ** 2 + (Z - cz[k]) ** 2
-            w = np.exp(-d2 * inv_2w2)
-            sum_c += w * cos3[k]
-            sum_s += w * sin3[k]
-            sum_z += w * sin2[k]
+        q2 = q_re * q_re + q_im * q_im
+        p2 = p_re * p_re + p_im * p_im
+        denom = np.maximum(p2 + q2, 1.0e-12)
+        pqbar_re = p_re * q_re + p_im * q_im
+        pqbar_im = p_im * q_re - p_re * q_im
 
-        norm_k = 0.37
-        phi[..., 0] = norm_k * sum_c
-        phi[..., 1] = norm_k * sum_s
-        phi[..., 2] = 0.45 * norm_k * sum_z
-        # Coleman Q-Ball internal phase rotation (omega0 = 2.25 < m_eff = 2.50!)
-        omega0 = 2.25
-        vel[..., 0] = -omega0 * phi[..., 1]
-        vel[..., 1] = omega0 * phi[..., 0]
-        vel[..., 2] = 0.35 * omega0 * phi[..., 2]
+        phi[..., 0] = v0 * (2.0 * pqbar_re / denom)
+        phi[..., 1] = v0 * (2.0 * pqbar_im / denom)
+        phi[..., 2] = v0 * (((q2 - p2) / denom) - 1.0)
 
     elif preset == "z3_braid":
-        theta0 = 2.0 / 9.0
-        r_braid = 0.130 * box_size
-        tube_w = 0.048 * box_size
-        kz = 1.35 * (2.0 * math.pi) / box_size
-        yn = Y / (0.33 * box_size)
-        y_env = np.exp(-(yn**6))
-        omega0 = 2.20
-        for strand in range(3):
-            ang = kz * Y + theta0 + (2.0 * math.pi * strand / 3.0)
-            cx = r_braid * np.cos(ang)
-            cz = r_braid * np.sin(ang)
-            d2 = (X - cx) ** 2 + (Z - cz) ** 2
-            env = 1.55 * y_env * np.exp(-d2 / (2.0 * (tube_w**2)))
-            phi[..., strand] = env * (0.85 + 0.20 * np.cos(ang))
-            vel[..., strand] = omega0 * env * np.sin(ang)
+        r_maj = 0.195 * float(box_size)
+        r_braid = 0.080 * float(box_size)
+        w0 = 0.068 * float(box_size)
+        w_env = 0.098 * float(box_size)
+        inv_wenv2 = 1.0 / (w_env * w_env)
+        m_samp = 48
+        s_grid = (2.0 * math.pi * np.arange(m_samp, dtype=np.float32)) / float(m_samp)
+
+        w_sum_x = np.zeros((grid_n, grid_n, grid_n), dtype=np.float32)
+        w_sum_y = np.zeros((grid_n, grid_n, grid_n), dtype=np.float32)
+        hit_core = np.zeros((grid_n, grid_n, grid_n), dtype=bool)
+
+        for st_i in range(3):
+            off = 0.2222222 + 2.0943951 * float(st_i)
+            best_d2 = np.full((grid_n, grid_n, grid_n), 1.0e20, dtype=np.float32)
+            best_s = np.zeros((grid_n, grid_n, grid_n), dtype=np.float32)
+            for k in range(m_samp):
+                s_val = float(s_grid[k])
+                tw = s_val + off
+                rad = r_maj + r_braid * math.cos(tw)
+                cx = rad * math.cos(s_val)
+                cy = rad * math.sin(s_val)
+                cz = -r_braid * math.sin(tw)
+                d2_k = (X - cx) ** 2 + (Y - cy) ** 2 + (Z - cz) ** 2
+                better = d2_k < best_d2
+                best_d2 = np.where(better, d2_k, best_d2)
+                best_s = np.where(better, s_val, best_s)
+
+            for _ in range(2):
+                tw = best_s + off
+                rad = r_maj + r_braid * np.cos(tw)
+                cs = np.cos(best_s)
+                ss = np.sin(best_s)
+                ctw = np.cos(tw)
+                stw = np.sin(tw)
+                bc_x = rad * cs
+                bc_y = rad * ss
+                bc_z = -r_braid * stw
+                dc_x = -r_braid * stw * cs - rad * ss
+                dc_y = -r_braid * stw * ss + rad * cs
+                dc_z = -r_braid * ctw
+                dc2 = np.maximum(dc_x * dc_x + dc_y * dc_y + dc_z * dc_z, 1.0e-6)
+                ds = ((X - bc_x) * dc_x + (Y - bc_y) * dc_y + (Z - bc_z) * dc_z) / dc2
+                best_s = best_s + np.clip(ds, -0.09, 0.09)
+
+            tw = best_s + off
+            rad = r_maj + r_braid * np.cos(tw)
+            cs = np.cos(best_s)
+            ss = np.sin(best_s)
+            ctw = np.cos(tw)
+            stw = np.sin(tw)
+            bc_x = rad * cs
+            bc_y = rad * ss
+            bc_z = -r_braid * stw
+            tx = -r_braid * stw * cs - rad * ss
+            ty = -r_braid * stw * ss + rad * cs
+            tz = -r_braid * ctw
+            t_norm = np.maximum(np.sqrt(tx * tx + ty * ty + tz * tz), 1.0e-8)
+            tx /= t_norm
+            ty /= t_norm
+            tz /= t_norm
+
+            er_dot_t = cs * tx + ss * ty
+            ux = cs - er_dot_t * tx
+            uy = ss - er_dot_t * ty
+            uz = -er_dot_t * tz
+            u_norm = np.maximum(np.sqrt(ux * ux + uy * uy + uz * uz), 1.0e-8)
+            ux /= u_norm
+            uy /= u_norm
+            uz /= u_norm
+
+            vx = ty * uz - tz * uy
+            vy = tz * ux - tx * uz
+            vz = tx * uy - ty * ux
+
+            dx_v = X - bc_x
+            dy_v = Y - bc_y
+            dz_v = Z - bc_z
+            u_p = dx_v * ux + dy_v * uy + dz_v * uz
+            v_p = dx_v * vx + dy_v * vy + dz_v * vz
+            d2 = dx_v * dx_v + dy_v * dy_v + dz_v * dz_v
+            xi = d2 * inv_wenv2
+            a_amp = w0 * np.exp(-xi - 0.15 * xi * xi)
+            psi_ang = -1.0 * best_s + off
+            cpsi = np.cos(psi_ang)
+            spsi = np.sin(psi_ang)
+            qx = u_p * cpsi - v_p * spsi
+            qy = u_p * spsi + v_p * cpsi
+
+            core_m = d2 < 1.0e-10
+            hit_core |= core_m
+            safe_d2 = np.maximum(d2, 1.0e-10)
+            w_sum_x += np.where(core_m, 0.0, (a_amp / safe_d2) * qx)
+            w_sum_y += np.where(core_m, 0.0, (a_amp / safe_d2) * qy)
+
+        w2 = w_sum_x * w_sum_x + w_sum_y * w_sum_y
+        den = 1.0 + w2
+        phi[..., 0] = np.where(hit_core, 0.0, v0 * (2.0 * w_sum_x / den))
+        phi[..., 1] = np.where(hit_core, 0.0, v0 * (2.0 * w_sum_y / den))
+        phi[..., 2] = np.where(hit_core, -2.0 * v0, v0 * (((1.0 - w2) / den) - 1.0))
 
     elif preset == "hopfion_ring":
-        r_maj = 0.165 * box_size
-        tube_w = 0.046 * box_size
-        d_ring1 = (np.sqrt((X + 0.075 * box_size) ** 2 + Y**2) - r_maj) ** 2 + Z**2
-        d_ring2 = (np.sqrt((X - 0.075 * box_size) ** 2 + Z**2) - r_maj) ** 2 + Y**2
-        a1 = 1.62 * np.exp(-d_ring1 / (2.0 * (tube_w**2)))
-        a2 = 1.62 * np.exp(-d_ring2 / (2.0 * (tube_w**2)))
-        ang1 = np.atan2(Y, X + 0.075 * box_size)
-        ang2 = np.atan2(Z, X - 0.075 * box_size)
-        phi[..., 0] = a1 * np.cos(2.0 * ang1) + a2 * np.cos(2.0 * ang2)
-        phi[..., 1] = a1 * np.sin(2.0 * ang1) - a2 * np.sin(2.0 * ang2)
-        phi[..., 2] = 0.65 * (a1 - a2)
-        omega0 = 2.20
-        vel[..., 0] = -omega0 * phi[..., 1]
-        vel[..., 1] = omega0 * phi[..., 0]
+        r_maj = 0.190 * float(box_size)
+        x_off = 0.56 * r_maj
+        w0 = 0.072 * float(box_size)
+        w_env = 0.102 * float(box_size)
+        inv_wenv2 = 1.0 / (w_env * w_env)
+
+        px1 = X + x_off
+        rc1_2 = px1 * px1 + Y * Y
+        reg1 = rc1_2 / (rc1_2 + 0.18 * r_maj * r_maj)
+        s1 = np.arctan2(Y, px1)
+        cs1 = np.cos(s1)
+        ss1 = np.sin(s1)
+        d1x = X - (-x_off + r_maj * cs1)
+        d1y = Y - (r_maj * ss1)
+        d1z = Z
+        d1_2 = d1x * d1x + d1y * d1y + d1z * d1z
+        xi1 = d1_2 * inv_wenv2
+        a1 = w0 * reg1 * np.exp(-xi1 - 0.15 * xi1 * xi1)
+        u1p = d1x * cs1 + d1y * ss1
+        v1p = -d1z
+        psi1 = 2.0 * s1
+        q1x = u1p * np.cos(psi1) - v1p * np.sin(psi1)
+        q1y = u1p * np.sin(psi1) + v1p * np.cos(psi1)
+
+        px2 = X - x_off
+        rc2_2 = px2 * px2 + Z * Z
+        reg2 = rc2_2 / (rc2_2 + 0.18 * r_maj * r_maj)
+        s2 = np.arctan2(Z, px2)
+        cs2 = np.cos(s2)
+        ss2 = np.sin(s2)
+        d2x = X - (x_off + r_maj * cs2)
+        d2y = Y
+        d2z = Z - (r_maj * ss2)
+        d2_2 = d2x * d2x + d2y * d2y + d2z * d2z
+        xi2 = d2_2 * inv_wenv2
+        a2 = w0 * reg2 * np.exp(-xi2 - 0.15 * xi2 * xi2)
+        u2p = d2x * cs2 + d2z * ss2
+        v2p = d2y
+        psi2 = 2.0 * s2
+        q2x = u2p * np.cos(psi2) - v2p * np.sin(psi2)
+        q2y = u2p * np.sin(psi2) + v2p * np.cos(psi2)
+
+        hit_core = (d1_2 < 1.0e-10) | (d2_2 < 1.0e-10)
+        sd1 = np.maximum(d1_2, 1.0e-10)
+        sd2 = np.maximum(d2_2, 1.0e-10)
+        wx = (a1 / sd1) * q1x + (a2 / sd2) * q2x
+        wy = (a1 / sd1) * q1y + (a2 / sd2) * q2y
+        w2 = wx * wx + wy * wy
+        den = 1.0 + w2
+        phi[..., 0] = np.where(hit_core, 0.0, v0 * (2.0 * wx / den))
+        phi[..., 1] = np.where(hit_core, 0.0, v0 * (2.0 * wy / den))
+        phi[..., 2] = np.where(hit_core, -2.0 * v0, v0 * (((1.0 - w2) / den) - 1.0))
 
     else:  # packet_smash
         sep = 0.20 * box_size
         w0 = 0.065 * box_size
         k_kick = 3.2
-        g_left = 1.70 * np.exp(-((X + sep) ** 2 + Y**2 + Z**2) / (2.0 * (w0**2)))
-        g_right = 1.70 * np.exp(-((X - sep) ** 2 + Y**2 + Z**2) / (2.0 * (w0**2)))
+        g_left = 2.15 * np.exp(-((X + sep) ** 2 + Y**2 + Z**2) / (2.0 * (w0**2)))
+        g_right = 2.15 * np.exp(-((X - sep) ** 2 + Y**2 + Z**2) / (2.0 * (w0**2)))
         phi[..., 0] = g_left * np.cos(k_kick * X) + g_right * np.cos(-k_kick * X)
         phi[..., 1] = g_left * np.sin(k_kick * X) + g_right * np.sin(-k_kick * X)
         phi[..., 2] = 0.35 * (g_left - g_right)
@@ -223,6 +355,14 @@ struct InitParams {
 @group(0) @binding(1) var<storage, read_write> phi_out: array<f32>;
 @group(0) @binding(2) var<storage, read_write> vel_out: array<f32>;
 
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+fn cconj(a: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x, -a.y);
+}
+
 @compute @workgroup_size(8, 8, 4)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = params.N;
@@ -236,86 +376,156 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var phi = vec3<f32>(0.0);
     var vel = vec3<f32>(0.0);
+    let v0: f32 = 0.85;
 
     if (params.preset == 0u) {
-        let scale_r = 0.112 * u_box;
-        let tube_w = 0.052 * u_box;
-        let inv_2w2 = 1.0 / (2.0 * tube_w * tube_w);
-        var sum_cs = vec2<f32>(0.0);
-        var sum_z: f32 = 0.0;
-        for (var k: i32 = 0; k < 96; k = k + 1) {
-            let s = 6.2831853 * f32(k) / 96.0;
-            let c = scale_r * vec3<f32>(
-                sin(s) + 2.0 * sin(2.0 * s),
-                cos(s) - 2.0 * cos(2.0 * s),
-                -1.35 * sin(3.0 * s)
-            );
-            let diff = p - c;
-            let w = exp(-dot(diff, diff) * inv_2w2);
-            sum_cs = sum_cs + w * vec2<f32>(cos(3.0 * s), sin(3.0 * s));
-            sum_z = sum_z + w * sin(2.0 * s);
+        let a0 = 0.195 * u_box;
+        let r = length(p);
+        let rn = r / a0;
+        let rn2 = rn * rn;
+        let chi = 3.14159265 * exp(-0.6931472 * rn2 - 0.095 * rn2 * rn2);
+        var sc_over_r: f32 = 0.0;
+        if (r > 1e-5) {
+            sc_over_r = sin(chi) / r;
         }
-        let norm_k = 0.37;
-        phi.x = norm_k * sum_cs.x;
-        phi.y = norm_k * sum_cs.y;
-        phi.z = 0.45 * norm_k * sum_z;
-        let omega0 = 2.25;
-        vel.x = -omega0 * phi.y;
-        vel.y = omega0 * phi.x;
-        vel.z = 0.35 * omega0 * phi.z;
+        let Z1 = vec2<f32>(sc_over_r * p.x, sc_over_r * p.y);
+        let Z2 = vec2<f32>(sc_over_r * p.z, cos(chi));
+        let Z1_2 = cmul(Z1, Z1);
+        let Z2_2 = cmul(Z2, Z2);
+        let Q_map = cmul(Z1_2, Z1) + Z2_2;
+        let P_map = 1.95 * cmul(Z1_2, Z2);
+        let denom = max(dot(P_map, P_map) + dot(Q_map, Q_map), 1e-12);
+        let PQbar = cmul(P_map, cconj(Q_map));
+        let n_vec = vec3<f32>(
+            2.0 * PQbar.x / denom,
+            2.0 * PQbar.y / denom,
+            (dot(Q_map, Q_map) - dot(P_map, P_map)) / denom
+        );
+        phi = v0 * vec3<f32>(n_vec.x, n_vec.y, n_vec.z - 1.0);
     } else if (params.preset == 1u) {
-        let theta0 = 0.2222222;
-        let r_braid = 0.130 * u_box;
-        let tube_w = 0.048 * u_box;
-        let kz = 1.35 * 6.2831853 / u_box;
-        let yn = p.y / (0.33 * u_box);
-        let yn2 = yn * yn;
-        let y_env = exp(-(yn2 * yn2 * yn2));
-        let omega0 = 2.20;
-        for (var s: i32 = 0; s < 3; s = s + 1) {
-            let ang = kz * p.y + theta0 + 2.0943951 * f32(s);
-            let cx = r_braid * cos(ang);
-            let cz = r_braid * sin(ang);
-            let dx = p.x - cx;
-            let dz = p.z - cz;
-            let d2 = dx * dx + dz * dz;
-            let env = 1.55 * y_env * exp(-d2 / (2.0 * tube_w * tube_w));
-            let pv = env * (0.85 + 0.20 * cos(ang));
-            let vv = omega0 * env * sin(ang);
-            if (s == 0) {
-                phi.x = pv;
-                vel.x = vv;
-            } else if (s == 1) {
-                phi.y = pv;
-                vel.y = vv;
+        let r_maj = 0.195 * u_box;
+        let r_braid = 0.080 * u_box;
+        let w0 = 0.068 * u_box;
+        let w_env = 0.098 * u_box;
+        let inv_wenv2 = 1.0 / (w_env * w_env);
+        var W_sum = vec2<f32>(0.0);
+        var hit_core: bool = false;
+        for (var st_i: i32 = 0; st_i < 3; st_i = st_i + 1) {
+            let off = 0.2222222 + 2.0943951 * f32(st_i);
+            var best_d2: f32 = 1e20;
+            var best_s: f32 = 0.0;
+            for (var k: i32 = 0; k < 48; k = k + 1) {
+                let s_ang = 6.2831853 * f32(k) / 48.0;
+                let tw = s_ang + off;
+                let rad = r_maj + r_braid * cos(tw);
+                let c_pt = vec3<f32>(rad * cos(s_ang), rad * sin(s_ang), -r_braid * sin(tw));
+                let diff_v = p - c_pt;
+                let d2 = dot(diff_v, diff_v);
+                if (d2 < best_d2) {
+                    best_d2 = d2;
+                    best_s = s_ang;
+                }
+            }
+            for (var it: i32 = 0; it < 2; it = it + 1) {
+                let tw = best_s + off;
+                let rad = r_maj + r_braid * cos(tw);
+                let bc = vec3<f32>(rad * cos(best_s), rad * sin(best_s), -r_braid * sin(tw));
+                let dc_ds = vec3<f32>(
+                    -r_braid * sin(tw) * cos(best_s) - rad * sin(best_s),
+                    -r_braid * sin(tw) * sin(best_s) + rad * cos(best_s),
+                    -r_braid * cos(tw)
+                );
+                let ds = dot(p - bc, dc_ds) / max(dot(dc_ds, dc_ds), 1e-6);
+                best_s = best_s + clamp(ds, -0.09, 0.09);
+            }
+            let tw = best_s + off;
+            let rad = r_maj + r_braid * cos(tw);
+            let best_c = vec3<f32>(rad * cos(best_s), rad * sin(best_s), -r_braid * sin(tw));
+            let best_t = normalize(vec3<f32>(
+                -r_braid * sin(tw) * cos(best_s) - rad * sin(best_s),
+                -r_braid * sin(tw) * sin(best_s) + rad * cos(best_s),
+                -r_braid * cos(tw)
+            ));
+            let er_xy = vec3<f32>(cos(best_s), sin(best_s), 0.0);
+            let u_hat = normalize(er_xy - dot(er_xy, best_t) * best_t);
+            let v_hat = cross(best_t, u_hat);
+            let d_vec = p - best_c;
+            let u_p = dot(d_vec, u_hat);
+            let v_p = dot(d_vec, v_hat);
+            let d2 = dot(d_vec, d_vec);
+            let xi = d2 * inv_wenv2;
+            let A_amp = w0 * exp(-xi - 0.15 * xi * xi);
+            let psi_ang = -1.0 * best_s + off;
+            let qx = u_p * cos(psi_ang) - v_p * sin(psi_ang);
+            let qy = u_p * sin(psi_ang) + v_p * cos(psi_ang);
+            if (d2 < 1e-10) {
+                hit_core = true;
             } else {
-                phi.z = pv;
-                vel.z = vv;
+                W_sum = W_sum + (A_amp / d2) * vec2<f32>(qx, qy);
             }
         }
+        if (hit_core) {
+            phi = vec3<f32>(0.0, 0.0, -2.0 * v0);
+        } else {
+            let w2 = dot(W_sum, W_sum);
+            let den = 1.0 + w2;
+            let n_vec = vec3<f32>(2.0 * W_sum.x / den, 2.0 * W_sum.y / den, (1.0 - w2) / den);
+            phi = v0 * vec3<f32>(n_vec.x, n_vec.y, n_vec.z - 1.0);
+        }
     } else if (params.preset == 2u) {
-        let r_maj = 0.165 * u_box;
-        let tube_w = 0.046 * u_box;
-        let dr1 = length(vec2<f32>(p.x + 0.075 * u_box, p.y)) - r_maj;
-        let dr2 = length(vec2<f32>(p.x - 0.075 * u_box, p.z)) - r_maj;
-        let d1 = dr1 * dr1 + p.z * p.z;
-        let d2 = dr2 * dr2 + p.y * p.y;
-        let a1 = 1.62 * exp(-d1 / (2.0 * tube_w * tube_w));
-        let a2 = 1.62 * exp(-d2 / (2.0 * tube_w * tube_w));
-        let ang1 = atan2(p.y, p.x + 0.075 * u_box);
-        let ang2 = atan2(p.z, p.x - 0.075 * u_box);
-        phi.x = a1 * cos(2.0 * ang1) + a2 * cos(2.0 * ang2);
-        phi.y = a1 * sin(2.0 * ang1) - a2 * sin(2.0 * ang2);
-        phi.z = 0.65 * (a1 - a2);
-        let omega0 = 2.20;
-        vel.x = -omega0 * phi.y;
-        vel.y = omega0 * phi.x;
+        let r_maj = 0.190 * u_box;
+        let x_off = 0.56 * r_maj;
+        let w0 = 0.072 * u_box;
+        let w_env = 0.102 * u_box;
+        let inv_wenv2 = 1.0 / (w_env * w_env);
+
+        let px1 = p.x + x_off;
+        let rc1_2 = px1 * px1 + p.y * p.y;
+        let reg1 = rc1_2 / (rc1_2 + 0.18 * r_maj * r_maj);
+        let s1 = atan2(p.y, px1);
+        let c1 = vec3<f32>(-x_off + r_maj * cos(s1), r_maj * sin(s1), 0.0);
+        let u1 = vec3<f32>(cos(s1), sin(s1), 0.0);
+        let v1 = vec3<f32>(0.0, 0.0, -1.0);
+        let d1v = p - c1;
+        let d1_2 = dot(d1v, d1v);
+        let xi1 = d1_2 * inv_wenv2;
+        let A1 = w0 * reg1 * exp(-xi1 - 0.15 * xi1 * xi1);
+        let u1p = dot(d1v, u1);
+        let v1p = dot(d1v, v1);
+        let psi1 = 2.0 * s1;
+        let q1 = vec2<f32>(u1p * cos(psi1) - v1p * sin(psi1), u1p * sin(psi1) + v1p * cos(psi1));
+
+        let px2 = p.x - x_off;
+        let rc2_2 = px2 * px2 + p.z * p.z;
+        let reg2 = rc2_2 / (rc2_2 + 0.18 * r_maj * r_maj);
+        let s2 = atan2(p.z, px2);
+        let c2 = vec3<f32>(x_off + r_maj * cos(s2), 0.0, r_maj * sin(s2));
+        let u2 = vec3<f32>(cos(s2), 0.0, sin(s2));
+        let v2 = vec3<f32>(0.0, 1.0, 0.0);
+        let d2v = p - c2;
+        let d2_2 = dot(d2v, d2v);
+        let xi2 = d2_2 * inv_wenv2;
+        let A2 = w0 * reg2 * exp(-xi2 - 0.15 * xi2 * xi2);
+        let u2p = dot(d2v, u2);
+        let v2p = dot(d2v, v2);
+        let psi2 = 2.0 * s2;
+        let q2 = vec2<f32>(u2p * cos(psi2) - v2p * sin(psi2), u2p * sin(psi2) + v2p * cos(psi2));
+
+        if (d1_2 < 1e-10 || d2_2 < 1e-10) {
+            phi = vec3<f32>(0.0, 0.0, -2.0 * v0);
+        } else {
+            let W_sum = (A1 / d1_2) * q1 + (A2 / d2_2) * q2;
+            let w2 = dot(W_sum, W_sum);
+            let den = 1.0 + w2;
+            let n_vec = vec3<f32>(2.0 * W_sum.x / den, 2.0 * W_sum.y / den, (1.0 - w2) / den);
+            phi = v0 * vec3<f32>(n_vec.x, n_vec.y, n_vec.z - 1.0);
+        }
     } else {
         let sep = 0.20 * u_box;
         let w0 = 0.065 * u_box;
         let k_kick = 3.2;
-        let gL = 1.70 * exp(-((p.x + sep) * (p.x + sep) + p.y * p.y + p.z * p.z) / (2.0 * w0 * w0));
-        let gR = 1.70 * exp(-((p.x - sep) * (p.x - sep) + p.y * p.y + p.z * p.z) / (2.0 * w0 * w0));
+        let gL = 2.15 * exp(-((p.x + sep) * (p.x + sep) + p.y * p.y + p.z * p.z) / (2.0 * w0 * w0));
+        let gR = 2.15 * exp(-((p.x - sep) * (p.x - sep) + p.y * p.y + p.z * p.z) / (2.0 * w0 * w0));
         phi.x = gL * cos(k_kick * p.x) + gR * cos(-k_kick * p.x);
         phi.y = gL * sin(k_kick * p.x) + gR * sin(-k_kick * p.x);
         phi.z = 0.35 * (gL - gR);
@@ -550,6 +760,7 @@ class WgpuComputeEngine:
         box_size: float = 12.0,
         dt: Optional[float] = None,
         damping: float = 0.0,
+        sponge: float = 0.0,
         phi_init_override: Optional[np.ndarray] = None,
         vel_init_override: Optional[np.ndarray] = None,
         readback_full_field: Optional[bool] = None,
@@ -639,7 +850,7 @@ class WgpuComputeEngine:
 
             pipe = self._get_pipeline(compiled.wgsl_compute_source)
             uniform_bytes = struct.pack(
-                "<I7f",
+                "<I11f",
                 int(grid_n),
                 float(dx),
                 float(dt),
@@ -648,6 +859,10 @@ class WgpuComputeEngine:
                 float(mod.parameters.m_eff),
                 float(mod.parameters.g4),
                 float(mod.parameters.g6),
+                float(mod.parameters.k_skyrme),
+                float(sponge),
+                float(box_size) * 0.5,
+                0.0,
             )
             buf_uni = self.device.create_buffer_with_data(
                 data=uniform_bytes,
