@@ -104,7 +104,8 @@ def _unbind_arena3_gl_slots() -> None:
     try:
         for slot in (0, 1, 2, 3, 4, 5, 7):
             GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, slot, 0)
-        GL.glBindImageTexture(0, 0, 0, GL.GL_TRUE, 0, GL.GL_WRITE_ONLY, GL.GL_RGBA16F)
+        GL.glBindImageTexture(0, 0, 0, GL.GL_TRUE, 0, GL.GL_WRITE_ONLY, GL.GL_RGBA32F)
+        GL.glBindImageTexture(1, 0, 0, GL.GL_TRUE, 0, GL.GL_WRITE_ONLY, GL.GL_RG16F)
         GL.glActiveTexture(GL.GL_TEXTURE0)
         GL.glBindTexture(GL.GL_TEXTURE_3D, 0)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
@@ -114,6 +115,69 @@ def _unbind_arena3_gl_slots() -> None:
         GL.glBindBuffer(GL.GL_COPY_WRITE_BUFFER, 0)
     except Exception:
         pass
+
+
+def _nu_expr_is_unity(nu_glsl_expr: str) -> bool:
+    cleaned = nu_glsl_expr.strip()
+    while cleaned.startswith("(") and cleaned.endswith(")"):
+        inner = cleaned[1:-1].strip()
+        # Verify balanced parens before stripping
+        depth = 0
+        ok = True
+        for ch in inner:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    ok = False
+                    break
+        if ok and depth == 0:
+            cleaned = inner
+        else:
+            break
+    return cleaned in ("1", "1.0", "1.000000000")
+
+
+def _rar_ref_nu_numpy(y: np.ndarray) -> np.ndarray:
+    y_c = np.clip(np.asarray(y, dtype=np.float64), 1.0e-6, 2500.0)
+    nu_rar = 1.0 / np.maximum(1.0 - np.exp(-np.sqrt(y_c)), 1.0e-4)
+    nu_sim = 0.5 + np.sqrt(0.25 + 1.0 / y_c)
+    return 0.5 * (nu_rar + nu_sim)
+
+
+def _compute_wall_phi_lut_bytes(
+    gm_mono: float,
+    a0_code: float,
+    half_box: float,
+    nu_fn: Optional[Callable[[np.ndarray], np.ndarray]],
+) -> bytes:
+    """
+    Computes a 64-float radial monopole potential LUT on [0.45 * half_box, 1.80 * half_box]
+    via 127-point composite Simpson integration of g_eff(r) = (G*M/r^2) * clip(nu(g_N/a0), 0.25, 250),
+    anchored at Phi(r_max) = -G*M / r_max so nu == 1 reproduces -G*M / r to ~1e-9 while MOND/TNaP
+    cleanly captures the +sqrt(G*M*a0) * ln(r) phantom-halo outer boundary!
+    """
+    r_min = 0.45 * float(half_box)
+    r_max = 1.80 * float(half_box)
+    if gm_mono <= 0.0:
+        return np.zeros(64, dtype=np.float32).tobytes()
+    if nu_fn is None:
+        r_nodes = np.linspace(r_min, r_max, 64, dtype=np.float64)
+        return (-float(gm_mono) / np.maximum(r_nodes, 1.0)).astype(np.float32).tobytes()
+
+    r_sub = np.linspace(r_min, r_max, 127, dtype=np.float64)
+    g_n = float(gm_mono) / np.maximum(r_sub * r_sub, 1.0)
+    y_val = np.clip(g_n / max(float(a0_code), 1.0e-6), 1.0e-6, 2500.0)
+    nu_val = np.clip(np.asarray(nu_fn(y_val), dtype=np.float64), 0.25, 250.0)
+    g_eff = g_n * nu_val
+
+    dr = (r_max - r_min) / 63.0
+    dphi = (dr / 6.0) * (g_eff[0:-2:2] + 4.0 * g_eff[1:-1:2] + g_eff[2::2])
+    phi = np.empty(64, dtype=np.float64)
+    phi[63] = -float(gm_mono) / max(r_max, 1.0)
+    phi[:63] = phi[63] - np.cumsum(dphi[::-1])[::-1]
+    return phi.astype(np.float32).tobytes()
 
 
 GALAXY_PRESETS = [
@@ -240,10 +304,10 @@ void main() {
         } else {
             m_part = m_bary_tot / n_bary;
             float u_kind = rand01(seed);
-            if (u_kind < 0.12) {
+            if (u_kind < 0.22) {
                 vec2 g1 = clamp(rand_gauss2(seed), vec2(-2.5), vec2(2.5));
                 vec2 g2 = clamp(rand_gauss2(seed), vec2(-2.5), vec2(2.5));
-                pos = vec3(g1.x, g1.y * 0.65, g2.x) * 1.05;
+                pos = vec3(g1.x, g1.y * 0.78, g2.x) * 1.30;
                 p_type = 0.25; // Tagged bulge star -> calibrated to p_type = 0.0
             } else {
                 bool is_gas = (u_kind > 0.72);
@@ -252,10 +316,14 @@ void main() {
                 float r_max_d = is_gas ? 22.5 : 18.0;
                 float r_disk = sample_disk_radius(seed, r_scale, 0.0, r_max_d);
                 float arm = (rand01(seed) < 0.5) ? 0.0 : 3.14159265;
+                float u_arm = rand01(seed);
+                float u_uni = rand01(seed) * 6.28318530718;
                 vec2 g_ang = clamp(rand_gauss2(seed), vec2(-2.6), vec2(2.6));
-                float spread = is_gas ? 0.46 : (0.36 + 0.028 * r_disk);
-                float theta = arm - 2.35 * log(r_disk * 0.45 + 0.35) + g_ang.x * spread;
-                float z_thick = (is_gas ? 0.20 : 0.30) * g_ang.y * (1.0 + 0.02 * r_disk);
+                float arm_prob = (is_gas ? 0.28 : 0.22) * smoothstep(2.2, 5.2, r_disk);
+                float spread = is_gas ? 0.46 : (0.42 + 0.025 * r_disk);
+                float theta_arm = arm - 2.35 * log(r_disk * 0.45 + 0.35) + g_ang.x * spread;
+                float theta = (u_arm < arm_prob) ? theta_arm : u_uni;
+                float z_thick = (is_gas ? 0.28 : 0.42) * g_ang.y * (1.0 + 0.02 * r_disk);
                 pos = vec3(r_disk * cos(theta), z_thick, r_disk * sin(theta));
             }
         }
@@ -281,7 +349,8 @@ void main() {
             float r_disk = sample_disk_radius(seed, r_scale, 0.0, r_max_d);
             float theta = rand01(seed) * 6.28318530718;
             vec2 gz = clamp(rand_gauss2(seed), vec2(-2.6), vec2(2.6));
-            pos = vec3(r_disk * cos(theta), gz.x * (is_gas ? 0.24 : 0.30), r_disk * sin(theta));
+            float z_thick = (is_gas ? 0.30 : 0.36) * gz.x * (1.0 + 0.015 * r_disk);
+            pos = vec3(r_disk * cos(theta), z_thick, r_disk * sin(theta));
         }
     }
     // -------------------------------------------------------------------------
@@ -340,12 +409,12 @@ void main() {
         }
     }
     // -------------------------------------------------------------------------
-    // PRESET 4: MILKY WAY (Barred 4-Arm Grand-Design Spiral, V_circ ~ 210-220 km/s!)
-    // Exact (1 kpc, 100 km/s, 10^9 M_sun): M_bary = 70.0e9 M_sun (Bland-Hawthorn & Gerhard 2016)
+    // PRESET 4: MILKY WAY (Barred 4-Arm Grand-Design Spiral, V_circ ~ 205-215 km/s!)
+    // Exact (1 kpc, 100 km/s, 10^9 M_sun): M_bary = 66.0e9 M_sun (Bland-Hawthorn & Gerhard 2016)
     // -------------------------------------------------------------------------
     else if (u_preset == 4) {
-        float m_bary_tot = 70.0;
-        float r_b_halo = 4.7;
+        float m_bary_tot = 66.0;
+        float r_b_halo = 4.2;
         float r_max_halo = 32.0;
         if (is_cdm_slot) {
             p_type = 2.0;
@@ -354,24 +423,32 @@ void main() {
         } else {
             m_part = m_bary_tot / n_bary;
             float u_kind = rand01(seed);
-            if (u_kind < 0.13) {
+            if (u_kind < 0.16) {
                 vec2 g1 = clamp(rand_gauss2(seed), vec2(-2.4), vec2(2.4));
                 vec2 g2 = clamp(rand_gauss2(seed), vec2(-2.4), vec2(2.4));
-                vec3 bar_p = vec3(g1.x * 1.95, g1.y * 0.46, g2.x * 0.82);
-                float cb = cos(0.47), sb = sin(0.47);
-                pos = vec3(cb * bar_p.x - sb * bar_p.z, bar_p.y, sb * bar_p.x + cb * bar_p.z);
-                p_type = 0.25; // Tagged stellar bar -> calibrated to p_type = 0.0
+                if (u_kind < 0.10) {
+                    pos = vec3(g1.x * 1.25, g1.y * 0.84, g2.x * 1.25);
+                } else {
+                    vec3 bar_p = vec3(g1.x * 1.55, g1.y * 0.68, g2.x * 1.02);
+                    float cb = cos(0.47), sb = sin(0.47);
+                    pos = vec3(cb * bar_p.x - sb * bar_p.z, bar_p.y, sb * bar_p.x + cb * bar_p.z);
+                }
+                p_type = 0.25; // Tagged bulge/bar star -> calibrated to p_type = 0.0
             } else {
                 bool is_gas = (u_kind > 0.74);
                 p_type = is_gas ? 1.0 : 0.0;
-                float r_scale = is_gas ? 6.4 : 3.20;
-                float r_max_d = is_gas ? 24.5 : 20.5;
+                float r_scale = is_gas ? 6.6 : 3.40;
+                float r_max_d = is_gas ? 25.0 : 21.0;
                 float r_disk = sample_disk_radius(seed, r_scale, 0.0, r_max_d);
                 float arm = floor(rand01(seed) * 4.0) * 1.5707963;
+                float u_arm = rand01(seed);
+                float u_uni = rand01(seed) * 6.28318530718;
                 vec2 g_ang = clamp(rand_gauss2(seed), vec2(-2.6), vec2(2.6));
-                float spread = is_gas ? 0.42 : (0.34 + 0.026 * r_disk);
-                float theta = arm - 2.65 * log(r_disk * 0.40 + 0.35) + g_ang.x * spread;
-                float z_thick = (is_gas ? 0.18 : 0.28) * g_ang.y * (1.0 + 0.02 * r_disk);
+                float arm_prob = (is_gas ? 0.34 : 0.26) * smoothstep(2.4, 5.2, r_disk);
+                float spread = is_gas ? 0.42 : (0.38 + 0.022 * r_disk);
+                float theta_arm = arm - 2.65 * log(r_disk * 0.40 + 0.35) + g_ang.x * spread;
+                float theta = (u_arm < arm_prob) ? theta_arm : u_uni;
+                float z_thick = (is_gas ? 0.28 : 0.44) * g_ang.y * (1.0 + 0.02 * r_disk);
                 pos = vec3(r_disk * cos(theta), z_thick, r_disk * sin(theta));
             }
         }
@@ -398,7 +475,7 @@ void main() {
             if (u_kind < bul_frac) {
                 vec2 g1 = clamp(rand_gauss2(seed), vec2(-2.5), vec2(2.5));
                 vec2 g2 = clamp(rand_gauss2(seed), vec2(-2.5), vec2(2.5));
-                pos = vec3(g1.x, g1.y * 0.70, g2.x) * max(0.35 * rd_kpc, 0.45);
+                pos = vec3(g1.x, g1.y * 0.72, g2.x) * max(0.35 * rd_kpc, 0.55);
                 p_type = 0.25;
             } else {
                 bool is_gas = (u_kind > (1.0 - gas_frac));
@@ -407,10 +484,14 @@ void main() {
                 float r_max_d = is_gas ? min(max(4.5 * r_gas_s, 12.0), 23.0) : min(max(5.0 * rd_kpc, 6.0), 20.0);
                 float r_disk = sample_disk_radius(seed, r_scale, 0.0, r_max_d);
                 float arm = (rand01(seed) < 0.5) ? 0.0 : 3.14159265;
+                float u_arm = rand01(seed);
+                float u_uni = rand01(seed) * 6.28318530718;
                 vec2 g_ang = clamp(rand_gauss2(seed), vec2(-2.6), vec2(2.6));
-                float spread = is_gas ? 0.50 : 0.38;
-                float theta = arm - 2.2 * log(r_disk / max(rd_kpc, 0.4) + 0.35) + g_ang.x * spread;
-                float z_thick = (is_gas ? 0.20 : 0.28) * g_ang.y * clamp(0.35 * rd_kpc, 0.22, 0.85);
+                float arm_prob = (is_gas ? 0.55 : 0.45) * smoothstep(0.6 * rd_kpc, 1.8 * rd_kpc, r_disk);
+                float spread = is_gas ? 0.42 : 0.34;
+                float theta_arm = arm - 2.2 * log(r_disk / max(rd_kpc, 0.4) + 0.35) + g_ang.x * spread;
+                float theta = (u_arm < arm_prob) ? theta_arm : u_uni;
+                float z_thick = (is_gas ? 0.28 : 0.38) * g_ang.y * clamp(0.45 * rd_kpc, 0.35, 1.05);
                 pos = vec3(r_disk * cos(theta), z_thick, r_disk * sin(theta));
             }
         }
@@ -421,9 +502,127 @@ void main() {
 }
 """
 
+_COM_REDUCE_STAGE1_GLSL = """#version 430
+// Deterministic two-component (baryon & CDM halo) workgroup tree reduction for R_CoM / V_CoM
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PosBuf     { vec4 pos_mass[]; };
+layout(std430, binding = 1) readonly buffer VelBuf     { vec4 vel_type[]; };
+layout(std430, binding = 2) writeonly buffer PartBuf   { vec4 partial_sums[]; };
+
+uniform int u_count;
+uniform int u_mode;  // 0 = position CoM, 1 = velocity CoM (net linear momentum)
+
+shared vec4 s_bary[256];
+shared vec4 s_cdm[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    vec4 b_acc = vec4(0.0);
+    vec4 c_acc = vec4(0.0);
+
+    if (gid < uint(u_count)) {
+        vec4 pm = pos_mass[gid];
+        vec4 vt = vel_type[gid];
+        float m = max(pm.w, 0.0);
+        vec3 q = (u_mode == 0) ? pm.xyz : vt.xyz;
+        if (vt.w < 1.5) {
+            b_acc = vec4(q * m, m);
+        } else {
+            c_acc = vec4(q * m, m);
+        }
+    }
+    s_bary[tid] = b_acc;
+    s_cdm[tid]  = c_acc;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            s_bary[tid] += s_bary[tid + stride];
+            s_cdm[tid]  += s_cdm[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        uint wg = gl_WorkGroupID.x;
+        partial_sums[2u * wg + 0u] = s_bary[0];
+        partial_sums[2u * wg + 1u] = s_cdm[0];
+    }
+}
+"""
+
+_COM_REDUCE_STAGE2_GLSL = """#version 430
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 2) readonly buffer PartBuf  { vec4 partial_sums[]; };
+layout(std430, binding = 3) writeonly buffer ComBuf  { vec4 com_out[]; };
+
+uniform int u_num_wg;
+
+shared vec4 s_bary[256];
+shared vec4 s_cdm[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    vec4 b_acc = vec4(0.0);
+    vec4 c_acc = vec4(0.0);
+
+    for (uint i = tid; i < uint(u_num_wg); i += 256u) {
+        b_acc += partial_sums[2u * i + 0u];
+        c_acc += partial_sums[2u * i + 1u];
+    }
+    s_bary[tid] = b_acc;
+    s_cdm[tid]  = c_acc;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            s_bary[tid] += s_bary[tid + stride];
+            s_cdm[tid]  += s_cdm[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        vec3 r_b = (s_bary[0].w > 1e-20) ? (s_bary[0].xyz / s_bary[0].w) : vec3(0.0);
+        vec3 r_c = (s_cdm[0].w  > 1e-20) ? (s_cdm[0].xyz  / s_cdm[0].w)  : vec3(0.0);
+        com_out[0] = vec4(r_b, s_bary[0].w);
+        com_out[1] = vec4(r_c, s_cdm[0].w);
+    }
+}
+"""
+
+_COM_APPLY_GLSL = """#version 430
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer PosBuf           { vec4 pos_mass[]; };
+layout(std430, binding = 1) buffer VelBuf           { vec4 vel_type[]; };
+layout(std430, binding = 3) readonly buffer ComBuf  { vec4 com_out[]; };
+
+uniform int u_count;
+uniform int u_mode;  // 0 = subtract R_CoM from pos, 1 = subtract V_CoM from vel
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uint(u_count)) return;
+
+    vec4 vt = vel_type[idx];
+    vec3 delta = (vt.w < 1.5) ? com_out[0].xyz : com_out[1].xyz;
+    if (u_mode == 0) {
+        vec4 pm = pos_mass[idx];
+        pos_mass[idx] = vec4(pm.xyz - delta, pm.w);
+    } else {
+        vel_type[idx] = vec4(vt.xyz - delta, vt.w);
+    }
+}
+"""
+
 _CALIBRATE_GALAXY_VEL_GLSL = """#version 430
 // Cheat-Free Observed-Universe t=0 Velocity Calibration (100% Independent of Active PhysicsMod!)
-// Pass 0: Calibrates Disk Stars, HI Gas, and Bulge/Bar Stars from grid-softened g_N_bary * nu_RAR_ref.
+// Pass 0: Calibrates Disk Stars, HI Gas, and Bulge/Bar Stars from conservative 3D QUMOND RAR reference (-grad Phi_eff_RAR)
+//         with Brada & Milgrom (1999) Milgromian Toomre-Q stability & grid-consistent Jeans equilibrium.
 // Pass 1: Calibrates Live NFW CDM Halo particles from grid-softened g_N_(bary+CDM) in exact Jeans equilibrium.
 layout(local_size_x = 256) in;
 
@@ -437,6 +636,9 @@ uniform int u_pass;
 uniform float u_half_box;
 uniform float u_m_bary;
 uniform float u_rd_star;
+uniform float u_r_gas;
+uniform float u_gas_frac;
+uniform float u_bul_frac;
 uniform float u_r_b_halo;
 uniform float u_r_max_halo;
 uniform float u_gm_monopole;
@@ -459,7 +661,27 @@ vec2 rand_gauss2(inout uint seed) {
     return vec2(r * cos(u2), r * sin(u2));
 }
 
-vec3 sample_grid_or_mono_accel(vec3 p) {
+float eval_nu_rar_ref(float y_ref) {
+    float yc = clamp(y_ref, 1e-6, 2500.0);
+    float nu_rar = 1.0 / max(1.0 - exp(-sqrt(yc)), 1e-4);
+    float nu_sim = 0.5 + sqrt(0.25 + 1.0 / yc);
+    return clamp(0.5 * (nu_rar + nu_sim), 0.25, 250.0);
+}
+
+vec3 sample_rar_ref_accel(vec3 p) {
+    vec3 uvw = clamp((p + vec3(u_half_box)) / (2.0 * u_half_box), vec3(0.008), vec3(0.992));
+    // Inside the box, u_force_tex ALREADY holds the conservative 3D QUMOND -grad(Phi_eff_RAR)!
+    vec3 g_grid = texture(u_force_tex, uvw).xyz;
+    float box_frac = max(max(abs(p.x), abs(p.y)), abs(p.z)) / u_half_box;
+    if (box_frac <= 0.88) return g_grid;
+    vec3 g_mono_n = -u_gm_monopole * p / pow(dot(p, p) + 1.5, 1.5);
+    float y_mono = length(g_mono_n) / 0.37123787;
+    vec3 g_mono_eff = g_mono_n * eval_nu_rar_ref(y_mono);
+    if (box_frac >= 1.0) return g_mono_eff;
+    return mix(g_grid, g_mono_eff, smoothstep(0.88, 0.98, box_frac));
+}
+
+vec3 sample_newton_accel(vec3 p) {
     vec3 uvw = clamp((p + vec3(u_half_box)) / (2.0 * u_half_box), vec3(0.008), vec3(0.992));
     vec3 g_grid = texture(u_force_tex, uvw).xyz;
     float box_frac = max(max(abs(p.x), abs(p.y)), abs(p.z)) / u_half_box;
@@ -481,14 +703,8 @@ void main() {
     if (u_pass == 0) {
         if (p_type > 1.5) return;
 
-        // Universal Empirical Radial Acceleration Relation (McGaugh+ 2016 SPARC RAR, a0_ref = 0.37123787)
-        vec3 g_N = sample_grid_or_mono_accel(p);
-        float g_mag = length(g_N);
-        float y_ref = clamp(g_mag / 0.37123787, 1e-5, 2500.0);
-        float nu_rar = 1.0 / max(1.0 - exp(-sqrt(y_ref)), 1e-4);
-        float nu_sim = 0.5 + sqrt(0.25 + 1.0 / y_ref);
-        float nu_ref = 0.5 * (nu_rar + nu_sim);
-        vec3 g_rar = g_N * nu_ref;
+        // Sample conservative 3D QUMOND Universal RAR Reference Acceleration (-grad Phi_eff_RAR, a0_ref = 0.37123787)
+        vec3 g_rar = sample_rar_ref_accel(p);
 
         float r_xz = max(length(p.xz), 0.12);
         vec3 rad_hat = vec3(p.x, 0.0, p.z) / r_xz;
@@ -501,43 +717,79 @@ void main() {
 
         // 1. Bulge / Galactic Stellar Bar (tagged 0.25 -> stored as 0.0)
         if (p_type > 0.1 && p_type < 0.4) {
-            float r3d = max(length(p), 0.18);
+            float r3d = max(length(p), 0.22);
             float a_r3 = max(-dot(g_rar, p / r3d), 0.0);
             float v_3d = sqrt(r3d * a_r3);
-            float f_rot = (u_preset == 4) ? 0.58 : 0.52;
+            float f_rot = (u_preset == 4) ? 0.40 : 0.36;
             float v_rot = f_rot * v_circ;
-            float sig_b = sqrt(max(v_3d * v_3d - v_rot * v_rot, 0.0) / 2.2);
-            vec3 vel = tang_hat * v_rot + vec3(g1.x * sig_b, g1.y * sig_b * 0.72, g2.x * sig_b);
+            float sig_b = sqrt(max(v_3d * v_3d - v_rot * v_rot, 0.06 * v_3d * v_3d) / 2.05);
+            vec3 vel = tang_hat * v_rot + vec3(g1.x * sig_b, g1.y * sig_b * 0.80, g2.x * sig_b);
             vel_type[idx] = vec4(vel, 0.0);
             return;
         }
 
-        // Local Toomre Q = 1.85 radial dispersion scale for self-gravitating disk stability
-        float rd_eff = max(u_rd_star, 0.5);
-        float sigma_surf = (0.72 * max(u_m_bary, 0.02) / (6.2831853 * rd_eff * rd_eff)) * exp(-r_xz / rd_eff);
-        float kappa_ep = 1.4142136 * max(v_circ, 0.05) / max(r_xz, 0.85 * rd_eff);
-        float sig_toomre = (1.85 * 3.36 * 0.4300917 * sigma_surf) / max(kappa_ep, 1e-3);
+        // Exact epicyclic frequency kappa(R) from conservative 3D QUMOND radial gradient!
+        float omega = max(v_circ, 0.02) / r_xz;
+        float r_m = max(r_xz - 0.75, 0.18);
+        float r_p = min(r_xz + 0.75, u_half_box - 1.5);
+        float a_Rm = max(-dot(sample_rar_ref_accel(rad_hat * r_m + vec3(0.0, p.y, 0.0)), rad_hat), 0.0);
+        float a_Rp = max(-dot(sample_rar_ref_accel(rad_hat * r_p + vec3(0.0, p.y, 0.0)), rad_hat), 0.0);
+        float da_dr = (a_Rp - a_Rm) / max(r_p - r_m, 0.25);
+        float kappa2 = clamp(3.0 * (a_R / r_xz) + da_dr, 1.10 * omega * omega, 4.0 * omega * omega);
+        float kappa_ep = sqrt(max(kappa2, 1e-6));
+        float ep_ratio = clamp(kappa_ep / max(2.0 * omega, 1e-4), 0.60, 1.0);
 
-        // 2. Cold Extended HI Atomic Gas Disk (p_type == 1.0)
+        // Two-component baryonic surface density + Brada & Milgrom (1999) QUMOND Toomre-Q dispersion!
+        float m_disk_star = max(u_m_bary * max(1.0 - u_bul_frac - u_gas_frac, 0.02), 0.0);
+        float m_disk_gas  = max(u_m_bary * u_gas_frac, 0.0);
+        float rd_s = max(u_rd_star, 0.45);
+        float rd_g = max(u_r_gas, 0.85);
+        float sigma_star = (m_disk_star / (6.2831853 * rd_s * rd_s)) * exp(-r_xz / rd_s);
+        float sigma_gas  = (m_disk_gas  / (6.2831853 * rd_g * rd_g)) * exp(-r_xz / rd_g);
+        float sigma_surf = sigma_star + sigma_gas;
+
+        float x_acc = max(a_R, 0.025 * 0.37123787) / 0.37123787;
+        // Exact QUMOND local disk perturbation boost: nu(y_N) * (1 + 0.5 * d ln nu / d ln y_N)
+        float nu_pert = clamp((1.0 + 1.0 / x_acc) * ((1.0 + 2.0 * x_acc) / (2.0 + 2.0 * x_acc)), 1.0, 3.8);
+        float g_eff_disk = 0.4300917 * nu_pert;
+        // Finite vertical scale-height reduction factor (2*pi*h_z ~ 1.85 kpc; preserves global m=2 bar Q!)
+        float lam_toomre = (39.4784176 * g_eff_disk * sigma_surf) / max(kappa2, 1e-5);
+        float soft_red = lam_toomre / (lam_toomre + 1.85);
+        float sig_toomre = (2.05 * 3.36 * g_eff_disk * sigma_surf * soft_red) / max(kappa_ep, 1e-3);
+
+        // Grid-sampled vertical harmonic restoring frequency nu_z for exact vertical Jeans equilibrium!
+        float z_probe = 1.05;
+        float ay_up = -sample_rar_ref_accel(vec3(p.x, z_probe, p.z)).y;
+        float ay_dn =  sample_rar_ref_accel(vec3(p.x, -z_probe, p.z)).y;
+        float nu_z = sqrt(max(0.5 * (ay_up + ay_dn) / z_probe, 0.15 * omega * omega));
+
+        // Core-regularized radial slope for exact Binney & Tremaine cylindrical Jeans asymmetric drift
+        float r_slope = (r_xz * r_xz) / sqrt(r_xz * r_xz + 1.44);
+
+        // 2. Extended HI Atomic Gas Disk (p_type == 1.0, Toomre-Q stabilized for collisionless disk evolution)
         if (p_type > 0.5) {
-            float sig_g = clamp(max(0.042 * v_circ, 0.36 * sig_toomre), 0.018, 0.14 * max(v_circ, 0.2));
-            float asd_g = clamp(1.10 * (r_xz / (1.8 * rd_eff)), 0.35, 2.5);
-            float v_phi = sqrt(max(v_circ * v_circ - asd_g * sig_g * sig_g, 0.0));
-            vec3 vel = tang_hat * (v_phi + g1.y * sig_g * 0.707)
+            float g_cap = mix(0.22, 0.30, exp(-r_xz / max(2.2 * rd_s, 2.5))) * max(v_circ, 0.2);
+            float sig_g = clamp(max(0.075 * v_circ, 0.80 * sig_toomre), 0.018, g_cap);
+            float z_rms_g = 0.30 * (1.0 + 0.018 * r_xz);
+            float sig_yg = clamp(max(nu_z * z_rms_g, 0.52 * sig_g), 0.014, 0.17 * max(v_circ, 0.2));
+            float asd_g = clamp(1.50 * (r_slope / rd_g) + ep_ratio * ep_ratio - 1.0, -0.25, 2.8);
+            float v_phi = sqrt(max(v_circ * v_circ - asd_g * sig_g * sig_g, 0.16 * v_circ * v_circ));
+            vec3 vel = tang_hat * (v_phi + g1.y * sig_g * ep_ratio)
                      + rad_hat * (g1.x * sig_g)
-                     + vec3(0.0, g2.x * sig_g * 0.50, 0.0);
+                     + vec3(0.0, g2.x * sig_yg, 0.0);
             vel_type[idx] = vec4(vel, 1.0);
             return;
         }
 
-        // 3. Rotating Stellar Disk with Exact Toomre Q = 1.85 Dispersion & Asymmetric Drift (p_type == 0.0)
-        float sig_floor = mix(0.060, 0.115, exp(-r_xz / max(3.0 * rd_eff, 2.0))) * v_circ;
-        float sig_R = clamp(max(sig_floor, sig_toomre), 0.055 * v_circ, 0.30 * v_circ);
-        float sig_phi = 0.7071 * sig_R;
-        float z0 = 0.28 * (1.0 + 0.02 * r_xz);
-        float sig_y = clamp(max(1.05 * z0 * (v_circ / max(r_xz, 1.0)), 0.52 * sig_R), 0.018 * v_circ, 0.16 * v_circ);
-        float asd = clamp(2.0 * (r_xz / rd_eff) - 0.50, 0.45, 4.5);
-        float v_phi = sqrt(max(v_circ * v_circ - asd * sig_R * sig_R, 0.08 * v_circ * v_circ));
+        // 3. Rotating Stellar Disk with Bottema (1993) + Milgromian Toomre-Q Dispersion & Asymmetric Drift
+        float sig_bottema = mix(0.11, 0.35, exp(-r_xz / max(2.2 * rd_s, 2.4))) * v_circ;
+        float sig_cap = mix(0.27, 0.43, exp(-r_xz / max(1.8 * rd_s, 2.2))) * v_circ;
+        float sig_R = clamp(max(sig_bottema, sig_toomre), 0.095 * v_circ, sig_cap);
+        float sig_phi = ep_ratio * sig_R;
+        float z_rms_s = 0.42 * (1.0 + 0.02 * r_xz);
+        float sig_y = clamp(max(nu_z * z_rms_s, 0.55 * sig_R), 0.042 * v_circ, 0.26 * v_circ);
+        float asd = clamp(1.60 * (r_slope / rd_s) + ep_ratio * ep_ratio - 1.0, -0.30, 3.6);
+        float v_phi = sqrt(max(v_circ * v_circ - asd * sig_R * sig_R, 0.20 * v_circ * v_circ));
 
         vec3 vel = tang_hat * (v_phi + g1.y * sig_phi)
                  + rad_hat * (g1.x * sig_R)
@@ -547,7 +799,7 @@ void main() {
         if (p_type <= 1.5) return;
 
         // Pass 1: Spherical Jeans Equilibrium with Smooth Outer Tangential Shell Boundary!
-        vec3 g_tot = sample_grid_or_mono_accel(p);
+        vec3 g_tot = sample_newton_accel(p);
         float r = max(length(p), 0.22);
         vec3 r_hat = p / r;
         float a_in = max(-dot(g_tot, r_hat), 0.0);
@@ -639,18 +891,58 @@ void main() {
     // Keep slightly overhanging bound halo orbits accounted for; drop only far unbound escapees
     if (any(lessThan(uvw, vec3(-0.18))) || any(greaterThan(uvw, vec3(1.18)))) return;
 
-    ivec3 c = clamp(ivec3(uvw * float(u_M)), ivec3(0), ivec3(u_M - 1));
-    int cell = (c.z * u_M + c.y) * u_M + c.x;
+    // Symmetric 8-Cell Trilinear Cloud-In-Cell (CIC) Mass Deposition around cell centers (i + 0.5) / M!
+    // Matches hardware GL_LINEAR force interpolation in u_force_tex to conserve discrete momentum!
+    float m_tot_flt = eff_mass * u_fix_scale;
+    int m_tot_fix = int(m_tot_flt + 0.5);
+    if (m_tot_fix <= 0) return;
 
-    // Dynamic fixed-point mass scale: zero clamp-to-1 inflation for DDO 154 AND zero INT32 overflow!
-    int m_fix = int(eff_mass * u_fix_scale + 0.5);
-    if (m_fix <= 0) return;
-    atomicAdd(mass_int[cell], m_fix);
+    vec3 fc = uvw * float(u_M) - vec3(0.5);
+    ivec3 i0 = ivec3(floor(fc));
+    vec3 f = fc - vec3(i0);
+    ivec3 c0 = clamp(i0, ivec3(0), ivec3(u_M - 1));
+    ivec3 c1 = clamp(i0 + ivec3(1), ivec3(0), ivec3(u_M - 1));
 
-    // Collisional Gas ONLY (0.5 < p_type < 1.5) deposits into Eulerian hydro shock grid!
+    float wx[2] = float[2](1.0 - f.x, f.x);
+    float wy[2] = float[2](1.0 - f.y, f.y);
+    float wz[2] = float[2](1.0 - f.z, f.z);
+    int cx[2] = int[2](c0.x, c1.x);
+    int cy[2] = int[2](c0.y, c1.y);
+    int cz[2] = int[2](c0.z, c1.z);
+
+    // Dominant corner (w >= 0.125) absorbs integer rounding remainder so sum_8(m_w) === m_tot_fix bit-for-bit!
+    int dom_x = (f.x >= 0.5) ? 1 : 0;
+    int dom_y = (f.y >= 0.5) ? 1 : 0;
+    int dom_z = (f.z >= 0.5) ? 1 : 0;
+    int dom_k = (dom_z << 2) | (dom_y << 1) | dom_x;
+
+    int sum_other = 0;
+    for (int dz = 0; dz < 2; ++dz) {
+        for (int dy = 0; dy < 2; ++dy) {
+            for (int dx_i = 0; dx_i < 2; ++dx_i) {
+                int k = (dz << 2) | (dy << 1) | dx_i;
+                if (k == dom_k) continue;
+                float w = wx[dx_i] * wy[dy] * wz[dz];
+                int mw = int(m_tot_flt * w + 0.5);
+                if (mw > 0) {
+                    int cell_k = (cz[dz] * u_M + cy[dy]) * u_M + cx[dx_i];
+                    atomicAdd(mass_int[cell_k], mw);
+                    sum_other += mw;
+                }
+            }
+        }
+    }
+    int m_dom = m_tot_fix - sum_other;
+    if (m_dom > 0) {
+        int cell_dom = (cz[dom_z] * u_M + cy[dom_y]) * u_M + cx[dom_x];
+        atomicAdd(mass_int[cell_dom], m_dom);
+    }
+
+    // Collisional Gas ONLY (0.5 < p_type < 1.5) deposits into Eulerian hydro shock grid (smoothed 3x3x3 in unpack)!
     if (p_type > 0.5 && p_type < 1.5) {
-        int base4 = cell * 4;
-        atomicAdd(gas_flat[base4 + 0], m_fix);
+        ivec3 cg = clamp(ivec3(uvw * float(u_M)), ivec3(0), ivec3(u_M - 1));
+        int base4 = ((cg.z * u_M + cg.y) * u_M + cg.x) * 4;
+        atomicAdd(gas_flat[base4 + 0], m_tot_fix);
         atomicAdd(gas_flat[base4 + 1], int(round(eff_mass * vt.x * u_mom_scale)));
         atomicAdd(gas_flat[base4 + 2], int(round(eff_mass * vt.y * u_mom_scale)));
         atomicAdd(gas_flat[base4 + 3], int(round(eff_mass * vt.z * u_mom_scale)));
@@ -725,6 +1017,91 @@ void main() {
 }
 """
 
+def _build_qumond_rhs_glsl(nu_glsl_expr: str) -> str:
+    """
+    Builds the exact conservative 6-face Finite-Volume QUMOND / Spacetime-Weave Poisson RHS shader:
+        Lap(Phi_eff) = -div(nu(|g_N| / a0) * g_N)
+    Zero 4h central-difference smearing, telescope-exact interior flux cancellation across all shared
+    faces, and exact identity rhs_eff === Lap_h(Phi_N) when nu(y) === 1!
+    """
+    return f"""#version 430
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(std430, binding = 1) readonly buffer PhiNBuf    {{ float phi_n[]; }};
+layout(std430, binding = 4) writeonly buffer RhsEffBuf {{ float rhs_eff[]; }};
+
+uniform int u_M;
+uniform float u_half_box;
+uniform float u_gm_monopole;
+uniform float u_a0_code;
+
+float sample_phi_n(int x, int y, int z) {{
+    if (x >= 0 && x < u_M && y >= 0 && y < u_M && z >= 0 && z < u_M) {{
+        return phi_n[(z * u_M + y) * u_M + x];
+    }}
+    float h = (2.0 * u_half_box) / float(u_M);
+    ivec3 gc = clamp(ivec3(x, y, z), ivec3(0), ivec3(u_M - 1));
+    int out_axes = abs(x - gc.x) + abs(y - gc.y) + abs(z - gc.z);
+    vec3 p_gh = (vec3(x, y, z) + 0.5) * h - vec3(u_half_box);
+    if (out_axes == 1) {{
+        vec3 p_in = (vec3(gc) + 0.5) * h - vec3(u_half_box);
+        vec3 p_wall = 0.5 * (p_in + p_gh);
+        float phi_wall = -u_gm_monopole / max(length(p_wall), 1.0);
+        float phi_in_c = phi_n[(gc.z * u_M + gc.y) * u_M + gc.x];
+        return 2.0 * phi_wall - phi_in_c;
+    }}
+    return -u_gm_monopole / max(length(p_gh), 1.0);
+}}
+
+float eval_face_flux(ivec3 a, ivec3 b, ivec3 t1, ivec3 t2, float inv_h, float inv_4h) {{
+    float pa = sample_phi_n(a.x, a.y, a.z);
+    float pb = sample_phi_n(b.x, b.y, b.z);
+    float g_n_out = -(pb - pa) * inv_h;
+
+    float da1 = sample_phi_n(a.x + t1.x, a.y + t1.y, a.z + t1.z)
+              - sample_phi_n(a.x - t1.x, a.y - t1.y, a.z - t1.z);
+    float db1 = sample_phi_n(b.x + t1.x, b.y + t1.y, b.z + t1.z)
+              - sample_phi_n(b.x - t1.x, b.y - t1.y, b.z - t1.z);
+    float g_t1 = -(da1 + db1) * inv_4h;
+
+    float da2 = sample_phi_n(a.x + t2.x, a.y + t2.y, a.z + t2.z)
+              - sample_phi_n(a.x - t2.x, a.y - t2.y, a.z - t2.z);
+    float db2 = sample_phi_n(b.x + t2.x, b.y + t2.y, b.z + t2.z)
+              - sample_phi_n(b.x - t2.x, b.y - t2.y, b.z - t2.z);
+    float g_t2 = -(da2 + db2) * inv_4h;
+
+    float g_mag = sqrt(g_n_out * g_n_out + g_t1 * g_t1 + g_t2 * g_t2);
+    float y = clamp(g_mag / max(u_a0_code, 1e-6), 1e-6, 2500.0);
+    float nu_f = clamp({nu_glsl_expr}, 0.25, 250.0);
+    return nu_f * g_n_out;
+}}
+
+void main() {{
+    ivec3 g = ivec3(gl_GlobalInvocationID);
+    if (g.x >= u_M || g.y >= u_M || g.z >= u_M) return;
+
+    float h = (2.0 * u_half_box) / float(u_M);
+    float inv_h = 1.0 / h;
+    float inv_4h = 0.25 / h;
+
+    float sum_flux = 0.0;
+    sum_flux += eval_face_flux(g, g + ivec3(-1, 0, 0), ivec3(0, 1, 0), ivec3(0, 0, 1), inv_h, inv_4h);
+    sum_flux += eval_face_flux(g, g + ivec3( 1, 0, 0), ivec3(0, 1, 0), ivec3(0, 0, 1), inv_h, inv_4h);
+    sum_flux += eval_face_flux(g, g + ivec3(0, -1, 0), ivec3(1, 0, 0), ivec3(0, 0, 1), inv_h, inv_4h);
+    sum_flux += eval_face_flux(g, g + ivec3(0,  1, 0), ivec3(1, 0, 0), ivec3(0, 0, 1), inv_h, inv_4h);
+    sum_flux += eval_face_flux(g, g + ivec3(0, 0, -1), ivec3(1, 0, 0), ivec3(0, 1, 0), inv_h, inv_4h);
+    sum_flux += eval_face_flux(g, g + ivec3(0, 0,  1), ivec3(1, 0, 0), ivec3(0, 1, 0), inv_h, inv_4h);
+
+    int id = (g.z * u_M + g.y) * u_M + g.x;
+    rhs_eff[id] = -inv_h * sum_flux;
+}}
+"""
+
+
+_QUMOND_RHS_RAR_REF_GLSL = _build_qumond_rhs_glsl(
+    "(0.5 * ((1.0 / max(1.0 - exp(-sqrt(y)), 1e-4)) + 0.5 + sqrt(0.25 + 1.0 / y)))"
+)
+
 _MG_SMOOTH_GLSL = """#version 430
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
@@ -737,14 +1114,26 @@ uniform float u_half_box;
 uniform int u_is_fine;        // 1 = Level 0 (monopole Dirichlet BC on outer box faces), 0 = Coarse error level (zero BC)
 uniform float u_gm_monopole;  // G * M_active for outer Dirichlet boundary
 uniform int u_zero_init;      // 1 = treat u_in as 0.0 (first sweep on coarse error grid!)
+uniform int u_use_wall_lut;   // 1 = use arbitrary-nu radial monopole LUT, 0 = Newtonian -gm_mono / r
+uniform float u_wall_phi_lut[64];
 
 int cidx(int x, int y, int z, int M) {
     return (z * M + y) * M + x;
 }
 
+float sample_wall_lut(float r, float half_box) {
+    float r_min = 0.45 * half_box;
+    float r_max = 1.80 * half_box;
+    float u = clamp((r - r_min) / max(r_max - r_min, 1e-5), 0.0, 1.0) * 63.0;
+    int i0 = clamp(int(floor(u)), 0, 62);
+    return mix(u_wall_phi_lut[i0], u_wall_phi_lut[i0 + 1], u - float(i0));
+}
+
 float wall_bc(vec3 p_wall) {
     if (u_is_fine == 0) return 0.0;
-    return -u_gm_monopole / max(length(p_wall), 1.0);
+    float r = max(length(p_wall), 1.0);
+    if (u_use_wall_lut == 1) return sample_wall_lut(r, u_half_box);
+    return -u_gm_monopole / r;
 }
 
 void main() {
@@ -797,14 +1186,26 @@ uniform int u_Mc;
 uniform float u_half_box;
 uniform int u_is_fine;
 uniform float u_gm_monopole;
+uniform int u_use_wall_lut;
+uniform float u_wall_phi_lut[64];
 
 int fidx(int x, int y, int z, int Mf) {
     return (z * Mf + y) * Mf + x;
 }
 
+float sample_wall_lut(float r, float half_box) {
+    float r_min = 0.45 * half_box;
+    float r_max = 1.80 * half_box;
+    float u = clamp((r - r_min) / max(r_max - r_min, 1e-5), 0.0, 1.0) * 63.0;
+    int i0 = clamp(int(floor(u)), 0, 62);
+    return mix(u_wall_phi_lut[i0], u_wall_phi_lut[i0 + 1], u - float(i0));
+}
+
 float wall_bc(vec3 p_wall) {
     if (u_is_fine == 0) return 0.0;
-    return -u_gm_monopole / max(length(p_wall), 1.0);
+    float r = max(length(p_wall), 1.0);
+    if (u_use_wall_lut == 1) return sample_wall_lut(r, u_half_box);
+    return -u_gm_monopole / r;
 }
 
 float fine_residual(ivec3 gf, int Mf, float hf, float inv_hf2) {
@@ -911,18 +1312,31 @@ _PACK_FORCE_TEX_GLSL = """#version 430
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 layout(std430, binding = 5) readonly buffer PhiBuf    { float phi_in[]; };
-layout(rgba16f, binding = 0) writeonly uniform image3D u_force_img;
+layout(rgba32f, binding = 0) writeonly uniform image3D u_force_img;
+layout(rg16f,   binding = 1) writeonly uniform image3D u_lens_img;
 
 uniform int u_M;
 uniform float u_half_box;
 uniform float u_gm_monopole;
+uniform int u_use_wall_lut;
+uniform float u_wall_phi_lut[64];
+
+float sample_wall_lut(float r, float half_box) {
+    float r_min = 0.45 * half_box;
+    float r_max = 1.80 * half_box;
+    float u = clamp((r - r_min) / max(r_max - r_min, 1e-5), 0.0, 1.0) * 63.0;
+    int i0 = clamp(int(floor(u)), 0, 62);
+    return mix(u_wall_phi_lut[i0], u_wall_phi_lut[i0 + 1], u - float(i0));
+}
 
 float sample_phi_ext(int x, int y, int z, int M, float dx, float half_box, float gm_mono) {
     if (x >= 0 && x < M && y >= 0 && y < M && z >= 0 && z < M) {
         return phi_in[(z * M + y) * M + x];
     }
     vec3 p_ghost = (vec3(x, y, z) + 0.5) * dx - vec3(half_box);
-    return -gm_mono / max(length(p_ghost), 1.0);
+    float r = max(length(p_ghost), 1.0);
+    if (u_use_wall_lut == 1) return sample_wall_lut(r, half_box);
+    return -gm_mono / r;
 }
 
 void main() {
@@ -944,20 +1358,22 @@ void main() {
     float gy = -(pyp - pym) * inv_2dx;
     float gz = -(pzp - pzm) * inv_2dx;
     float pot_mag = abs(phi_in[(g.z * M + g.y) * M + g.x]);
+    float g_mag = sqrt(gx * gx + gy * gy + gz * gz);
 
     imageStore(u_force_img, g, vec4(gx, gy, gz, pot_mag));
+    imageStore(u_lens_img,  g, vec4(clamp(g_mag, 0.0, 65000.0), clamp(pot_mag, 0.0, 65000.0), 0.0, 0.0));
 }
 """
 
 
 def _build_particle_step_glsl(nu_glsl_expr: str) -> str:
     """
-    Dynamically injects the active `PhysicsMod`'s SymPy-compiled `interpolation_nu(y)`
-    into the 1M-2M particle GPU Leapfrog integrator (Stars + Collisional Gas + Live CDM Halo)
-    AND drives Volumetric Gravitational Lensing Contours with the EFFECTIVE total acceleration!
+    Integrates 1M-2M Stars, Gas & Live CDM particles in the curl-free conservative 3D QUMOND / Weave
+    potential (`u_force_tex.xyz == -grad(Phi_eff)` inside the box; `nu(y)` applied ONLY to exterior
+    monopole fallback for outliers beyond `box_frac > 0.88`).
     """
     return f"""#version 430
-// AUTO-COMPILED 1M-2M STAR, GAS & LIVE CDM INTEGRATOR WITH SYMPY nu(y) INTERPOLATION
+// AUTO-COMPILED 1M-2M STAR, GAS & LIVE CDM CONSERVATIVE 3D QUMOND INTEGRATOR
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer PosBuf              {{ vec4 pos_mass[]; }};
@@ -990,21 +1406,19 @@ void main() {{
     float p_type = vt.w;
 
     vec3 uvw = clamp((p + vec3(u_half_box)) / (2.0 * u_half_box), vec3(0.008), vec3(0.992));
-    vec3 g_N = texture(u_force_tex, uvw).xyz;
+    // Inside [-u_half_box, +u_half_box]^3, u_force_tex ALREADY holds conservative -grad(Phi_eff)!
+    vec3 acc = texture(u_force_tex, uvw).xyz;
 
-    // Smooth exterior Newtonian monopole fallback near/beyond [-u_half_box, +u_half_box]^3!
+    // Smooth exterior monopole fallback ONLY near/beyond outer box wall (box_frac > 0.88)!
     float box_frac = max(max(abs(p.x), abs(p.y)), abs(p.z)) / u_half_box;
     if (box_frac > 0.88) {{
         vec3 g_mono = -u_gm_monopole * p / pow(dot(p, p) + 1.5, 1.5);
-        g_N = (box_frac >= 1.0) ? g_mono : mix(g_N, g_mono, smoothstep(0.88, 0.98, box_frac));
+        float g_mag = length(g_mono);
+        float y = clamp(g_mag / max(u_a0_code, 1e-6), 1e-6, 2500.0);
+        float nu_boost = clamp({nu_glsl_expr}, 0.25, 250.0);
+        vec3 acc_mono = g_mono * nu_boost;
+        acc = (box_frac >= 1.0) ? acc_mono : mix(acc, acc_mono, smoothstep(0.88, 0.98, box_frac));
     }}
-
-    // 1. Evaluate SymPy-compiled Master Action interpolation function nu(y) where y = |g_N| / a0!
-    float g_mag = length(g_N);
-    float y = clamp(g_mag / max(u_a0_code, 1e-6), 1e-6, 2500.0);
-    float nu_raw = {nu_glsl_expr};
-    float nu_boost = clamp(nu_raw, 0.25, 250.0);
-    vec3 acc = g_N * nu_boost;
 
     ivec3 c = clamp(ivec3(uvw * float(u_M)), ivec3(0), ivec3(u_M - 1));
     int cell = (c.z * u_M + c.y) * u_M + c.x;
@@ -1079,12 +1493,13 @@ void main() {
 
 
 def _build_bg_lensing_frag(nu_glsl_expr: str) -> str:
-    """Renders 3D Volumetric Lensing Contours using the TRUE effective acceleration `|g_N * nu(y)|`!"""
-    return f"""#version 430
+    """Renders 3D Volumetric Lensing Contours from L2-resident `RG16F` `u_lens_tex = (|-grad Phi_eff|, |Phi_eff|)`!"""
+    _ = nu_glsl_expr
+    return """#version 430
 in vec2 v_uv;
 out vec4 frag_color;
 
-uniform sampler3D u_force_tex;
+uniform sampler3D u_lens_tex;
 uniform vec3 u_cam_eye;
 uniform vec3 u_cam_fwd;
 uniform vec3 u_cam_right;
@@ -1095,7 +1510,7 @@ uniform float u_half_box;
 uniform float u_a0_code;
 uniform int u_show_lensing;
 
-vec2 intersect_aabb(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {{
+vec2 intersect_aabb(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
     vec3 inv_d = 1.0 / (rd + vec3(1e-8));
     vec3 t0s = (bmin - ro) * inv_d;
     vec3 t1s = (bmax - ro) * inv_d;
@@ -1104,9 +1519,9 @@ vec2 intersect_aabb(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {{
     float tmin = max(max(tsmaller.x, tsmaller.y), max(tsmaller.z, 0.0));
     float tmax = min(min(tbigger.x, tbigger.y), tbigger.z);
     return vec2(tmin, tmax);
-}}
+}
 
-void main() {{
+void main() {
     vec2 ndc = v_uv * 2.0 - 1.0;
     vec3 rd = normalize(
         u_cam_fwd
@@ -1118,44 +1533,40 @@ void main() {{
     float r_scr = length(ndc * vec2(u_aspect, 1.0));
     vec3 bg = mix(vec3(0.048, 0.092, 0.175), vec3(0.020, 0.040, 0.082), clamp(r_scr * 0.65, 0.0, 1.0));
 
-    if (abs(rd.y) > 1e-4) {{
+    if (abs(rd.y) > 1e-4) {
         float tg = (-6.5 - ro.y) / rd.y;
-        if (tg > 0.0 && tg < 160.0) {{
+        if (tg > 0.0 && tg < 160.0) {
             vec3 pg = ro + tg * rd;
             float rg = length(pg.xz);
-            if (rg < 36.0) {{
+            if (rg < 36.0) {
                 float dr10 = abs(fract(rg / 5.0 + 0.5) - 0.5) * 5.0;
                 float ring = exp(-(dr10 * dr10) * 22.0) * smoothstep(36.0, 10.0, rg);
                 bg += vec3(0.08, 0.22, 0.42) * ring * 0.14;
-            }}
-        }}
-    }}
+            }
+        }
+    }
 
-    if (u_show_lensing == 1) {{
+    if (u_show_lensing == 1) {
         vec2 tb = intersect_aabb(ro, rd, vec3(-u_half_box), vec3(u_half_box));
-        if (tb.y > tb.x) {{
-            int steps = 52;
+        if (tb.y > tb.x) {
+            int steps = 40;
             float dt = (tb.y - tb.x) / float(steps);
             float t = tb.x + 0.5 * dt;
             vec3 pot_acc = vec3(0.0);
-            for (int i = 0; i < steps; ++i) {{
+            for (int i = 0; i < steps; ++i) {
                 vec3 p = ro + t * rd;
                 vec3 uvw = (p + vec3(u_half_box)) / (2.0 * u_half_box);
-                vec4 gp = texture(u_force_tex, uvw);
-                float g_mag = length(gp.xyz);
-                float y = clamp(g_mag / max(u_a0_code, 1e-6), 1e-6, 2500.0);
-                float nu_eff = clamp({nu_glsl_expr}, 0.25, 36.0);
-                float g_eff = g_mag * nu_eff;
-                float shells = 0.52 + 0.48 * sin(gp.w * 6.5);
-                pot_acc += vec3(0.08, 0.76, 1.02) * (g_eff * shells) * dt * 0.026;
+                vec2 gp = texture(u_lens_tex, uvw).xy;
+                float shells = 0.52 + 0.48 * sin(gp.y * 6.5);
+                pot_acc += vec3(0.08, 0.76, 1.02) * (gp.x * shells) * dt * 0.026;
                 t += dt;
-            }}
+            }
             bg += clamp(pot_acc, vec3(0.0), vec3(0.52));
-        }}
-    }}
+        }
+    }
 
     frag_color = vec4(bg, 1.0);
-}}
+}
 """
 
 
@@ -1396,10 +1807,14 @@ class Arena3GalaxyCollider:
 
         # Compile fixed GPU compute & Multigrid V-cycle programs
         self._init_prog = self.ctx.compute_shader(_INIT_GALAXY_GLSL)
+        self._com_stage1_prog = self.ctx.compute_shader(_COM_REDUCE_STAGE1_GLSL)
+        self._com_stage2_prog = self.ctx.compute_shader(_COM_REDUCE_STAGE2_GLSL)
+        self._com_apply_prog = self.ctx.compute_shader(_COM_APPLY_GLSL)
         self._calibrate_vel_prog = self.ctx.compute_shader(_CALIBRATE_GALAXY_VEL_GLSL)
         self._clear_prog = self.ctx.compute_shader(_CLEAR_GRID_GLSL)
         self._deposit_prog = self.ctx.compute_shader(_DEPOSIT_GRID_GLSL)
         self._unpack_prog = self.ctx.compute_shader(_UNPACK_AND_SMOOTH_GLSL)
+        self._qumond_rar_ref_prog = self.ctx.compute_shader(_QUMOND_RHS_RAR_REF_GLSL)
         self._mg_smooth_prog = self.ctx.compute_shader(_MG_SMOOTH_GLSL)
         self._mg_restrict_prog = self.ctx.compute_shader(_MG_RESTRICT_GLSL)
         self._mg_prolong_prog = self.ctx.compute_shader(_MG_PROLONG_ADD_GLSL)
@@ -1411,6 +1826,8 @@ class Arena3GalaxyCollider:
         if compiled is None and not lazy_gpu:
             mod, compiled = _get_default_mod_and_compiled(mod)
 
+        self._qumond_rhs_prog: Optional[moderngl.ComputeShader] = None
+        self._nu_is_unity: bool = True
         self._step_prog: Optional[moderngl.ComputeShader] = None
         self._bg_prog: Optional[moderngl.Program] = None
         self._bg_vao: Optional[moderngl.VertexArray] = None
@@ -1420,6 +1837,8 @@ class Arena3GalaxyCollider:
         self._last_nu_fn: Optional[Callable[[np.ndarray], np.ndarray]] = (
             compiled.nu_numpy_fn if compiled is not None else None
         )
+        self._cached_wall_lut_key: Optional[Tuple[str, float, float, float]] = None
+        self._cached_wall_lut_bytes: Optional[bytes] = None
         init_nu_expr = compiled.nu_glsl_expr if compiled is not None else "1.0"
         self._ensure_nu_programs(init_nu_expr)
 
@@ -1427,7 +1846,7 @@ class Arena3GalaxyCollider:
         self._tm_prog = self.ctx.program(vertex_shader=_BG_VERT, fragment_shader=_TONEMAP_FRAG)
         self._tm_vao = self.ctx.vertex_array(self._tm_prog, [])
 
-        # Dedicated dynamic=True staging buffer (1.25 MiB covers 8192*16B pos + 8192*16B vel + 64^3*4B Phi_N!)
+        # Dedicated dynamic=True staging buffer (1.25 MiB covers 8192*16B pos + 8192*16B vel + 64^3*4B Phi_eff!)
         self._telemetry_stage_buf = self.ctx.buffer(
             reserve=2 * 8192 * 16 + (self.grid_m ** 3) * 4,
             dynamic=True,
@@ -1446,10 +1865,15 @@ class Arena3GalaxyCollider:
         self._gas_int_buf: Optional[moderngl.Buffer] = None
         self._rho_flt_buf: Optional[moderngl.Buffer] = None
         self._gas_hydro_buf: Optional[moderngl.Buffer] = None
+        self._mg_eff_u0: Optional[moderngl.Buffer] = None
+        self._last_phi_eff_buf: Optional[moderngl.Buffer] = None
         self._mg_rhs: List[moderngl.Buffer] = []
         self._mg_ua: List[moderngl.Buffer] = []
         self._mg_ub: List[moderngl.Buffer] = []
+        self._com_partial_buf: Optional[moderngl.Buffer] = None
+        self._com_out_buf: Optional[moderngl.Buffer] = None
         self._force_tex: Optional[moderngl.Texture3D] = None
+        self._lens_tex: Optional[moderngl.Texture3D] = None
 
         self._pos_buf: Optional[moderngl.Buffer] = None
         self._vel_buf: Optional[moderngl.Buffer] = None
@@ -1529,27 +1953,40 @@ class Arena3GalaxyCollider:
             self._gas_int_buf,
             self._rho_flt_buf,
             self._gas_hydro_buf,
+            self._mg_eff_u0,
             *self._mg_rhs,
             *self._mg_ua,
             *self._mg_ub,
+            self._com_partial_buf,
+            self._com_out_buf,
         ):
             if obj is not None:
                 total += int(obj.size)
         if self._force_tex is not None:
-            total += (self.grid_m ** 3) * 8
+            total += (self.grid_m ** 3) * 16
+        if self._lens_tex is not None:
+            total += (self.grid_m ** 3) * 4
         if self._hdr_tex is not None:
             w, h = self._hdr_tex.size
             total += int(w) * int(h) * 8
         self.allocated_vram_mb = float(total) / (1024.0 * 1024.0)
 
     def _allocate_grid_pyramid(self) -> None:
-        if self._mass_int_buf is not None and self._force_tex is not None and self._mg_ua:
+        if (
+            self._mass_int_buf is not None
+            and self._force_tex is not None
+            and self._lens_tex is not None
+            and self._mg_eff_u0 is not None
+            and self._mg_ua
+        ):
             return
         cells = self.grid_m ** 3
         self._mass_int_buf = self.ctx.buffer(reserve=cells * 4)
         self._gas_int_buf = self.ctx.buffer(reserve=cells * 16)
         self._rho_flt_buf = self.ctx.buffer(reserve=cells * 4)
         self._gas_hydro_buf = self.ctx.buffer(reserve=cells * 16)
+        self._mg_eff_u0 = self.ctx.buffer(data=np.zeros(cells, dtype=np.float32).tobytes())
+        self._com_out_buf = self.ctx.buffer(reserve=32)
 
         self._mg_rhs = []
         self._mg_ua = []
@@ -1560,12 +1997,19 @@ class Arena3GalaxyCollider:
             self._mg_rhs.append(self.ctx.buffer(data=z_bytes))
             self._mg_ua.append(self.ctx.buffer(data=z_bytes))
             self._mg_ub.append(self.ctx.buffer(data=z_bytes))
+        self._last_phi_eff_buf = self._mg_ua[0]
 
-        self._force_tex = self.ctx.texture3d((self.grid_m, self.grid_m, self.grid_m), components=4, dtype="f2")
+        self._force_tex = self.ctx.texture3d((self.grid_m, self.grid_m, self.grid_m), components=4, dtype="f4")
         self._force_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self._force_tex.repeat_x = False
         self._force_tex.repeat_y = False
         self._force_tex.repeat_z = False
+
+        self._lens_tex = self.ctx.texture3d((self.grid_m, self.grid_m, self.grid_m), components=2, dtype="f2")
+        self._lens_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._lens_tex.repeat_x = False
+        self._lens_tex.repeat_y = False
+        self._lens_tex.repeat_z = False
 
     def _release_grid_pyramid_and_fbo(self) -> None:
         self._clear_pending_telem_fence()
@@ -1576,10 +2020,14 @@ class Arena3GalaxyCollider:
             self._gas_int_buf,
             self._rho_flt_buf,
             self._gas_hydro_buf,
+            self._mg_eff_u0,
             *self._mg_rhs,
             *self._mg_ua,
             *self._mg_ub,
+            self._com_partial_buf,
+            self._com_out_buf,
             self._force_tex,
+            self._lens_tex,
             self._hdr_fbo,
             self._hdr_tex,
             self._xfer_stage_buf,
@@ -1593,10 +2041,15 @@ class Arena3GalaxyCollider:
         self._gas_int_buf = None
         self._rho_flt_buf = None
         self._gas_hydro_buf = None
+        self._mg_eff_u0 = None
+        self._last_phi_eff_buf = None
         self._mg_rhs = []
         self._mg_ua = []
         self._mg_ub = []
+        self._com_partial_buf = None
+        self._com_out_buf = None
         self._force_tex = None
+        self._lens_tex = None
         self._hdr_fbo = None
         self._hdr_tex = None
         self._xfer_stage_buf = None
@@ -1814,11 +2267,15 @@ class Arena3GalaxyCollider:
         if i < len(self._replay_meta):
             self.sim_time, self.step_count = self._replay_meta[i]
 
+        zeros = np.zeros(self.grid_m ** 3, dtype=np.float32).tobytes()
+        if self._mg_eff_u0 is not None:
+            self._mg_eff_u0.write(zeros)
         if self._mg_ua and self._mg_ub:
-            zeros = np.zeros(self.grid_m ** 3, dtype=np.float32).tobytes()
             self._mg_ua[0].write(zeros)
             self._mg_ub[0].write(zeros)
-        eff_has_ballistic, eff_halo_scale, _ = self._effective_halo_params(self._active_mod)
+        eff_has_ballistic, eff_halo_scale, ballistic_pleat = self._effective_halo_params(self._active_mod)
+        if self._active_mod is not None:
+            self.last_a0_code = self._compute_a0_code(self._active_mod, ballistic_pleat)
         self._solve_field_gpu(has_cdm=eff_has_ballistic, cdm_scale=eff_halo_scale, n_vcycles=3)
         self._sample_telemetry()
         self.replay_cursor = i
@@ -1835,11 +2292,15 @@ class Arena3GalaxyCollider:
             self._vel_buf.write(np.ascontiguousarray(bk["vel"], dtype=np.float32))
             self.sim_time = float(bk["sim_time"])  # type: ignore[arg-type]
             self.step_count = int(bk["step_count"])  # type: ignore[arg-type]
+            zeros = np.zeros(self.grid_m ** 3, dtype=np.float32).tobytes()
+            if self._mg_eff_u0 is not None:
+                self._mg_eff_u0.write(zeros)
             if self._mg_ua and self._mg_ub:
-                zeros = np.zeros(self.grid_m ** 3, dtype=np.float32).tobytes()
                 self._mg_ua[0].write(zeros)
                 self._mg_ub[0].write(zeros)
-            eff_has_ballistic, eff_halo_scale, _ = self._effective_halo_params(self._active_mod)
+            eff_has_ballistic, eff_halo_scale, ballistic_pleat = self._effective_halo_params(self._active_mod)
+            if self._active_mod is not None:
+                self.last_a0_code = self._compute_a0_code(self._active_mod, ballistic_pleat)
             self._solve_field_gpu(has_cdm=eff_has_ballistic, cdm_scale=eff_halo_scale, n_vcycles=3)
             self._sample_telemetry()
         elif self.replay_cursor >= 0 and len(self._replay_frames) > 0:
@@ -1912,8 +2373,7 @@ class Arena3GalaxyCollider:
             self._vel_buf.write(np.ascontiguousarray(saved_vel, dtype=np.float32))
             eff_has_ballistic, eff_halo_scale, ballistic_pleat = self._effective_halo_params(self._active_mod)
             if self._active_mod is not None:
-                a0_ratio = max(float(self._active_mod.parameters.a0_si), 1e-14) / A0_REF_SI
-                self.last_a0_code = 1e-6 if ballistic_pleat else (A0_REF_CODE * a0_ratio)
+                self.last_a0_code = self._compute_a0_code(self._active_mod, ballistic_pleat)
             self._solve_field_gpu(has_cdm=eff_has_ballistic, cdm_scale=eff_halo_scale, n_vcycles=3)
             if self._dirty_field_on_wake:
                 self._sample_telemetry()
@@ -1971,23 +2431,40 @@ class Arena3GalaxyCollider:
             return
         self._ensure_nu_programs(compiled.nu_glsl_expr)
         if re_solve_field:
-            self._solve_field_gpu(has_cdm=eff_has_ballistic, cdm_scale=eff_halo_scale, n_vcycles=3)
+            zeros = np.zeros(self.grid_m ** 3, dtype=np.float32).tobytes()
+            if self._mg_eff_u0 is not None:
+                self._mg_eff_u0.write(zeros)
+            if self._mg_ua and self._mg_ub:
+                self._mg_ua[0].write(zeros)
+                self._mg_ub[0].write(zeros)
+            self._solve_field_gpu(has_cdm=eff_has_ballistic, cdm_scale=eff_halo_scale, n_vcycles=4)
             self._sample_telemetry()
 
     def _ensure_nu_programs(self, nu_glsl_expr: str) -> None:
-        if nu_glsl_expr == self._compiled_nu_src and self._step_prog is not None and self._bg_prog is not None:
+        if (
+            nu_glsl_expr == self._compiled_nu_src
+            and self._step_prog is not None
+            and self._bg_prog is not None
+            and (self._nu_is_unity or self._qumond_rhs_prog is not None)
+        ):
             return
+        nu_is_unity = _nu_expr_is_unity(nu_glsl_expr)
+        new_qumond = None if nu_is_unity else self.ctx.compute_shader(_build_qumond_rhs_glsl(nu_glsl_expr))
         new_step = self.ctx.compute_shader(_build_particle_step_glsl(nu_glsl_expr))
-        new_bg = self.ctx.program(vertex_shader=_BG_VERT, fragment_shader=_build_bg_lensing_frag(nu_glsl_expr))
-        new_bg_vao = self.ctx.vertex_array(new_bg, [])
-        if self._step_prog is not None or self._bg_vao is not None or self._bg_prog is not None:
+        if self._bg_prog is None or self._bg_vao is None:
+            new_bg = self.ctx.program(vertex_shader=_BG_VERT, fragment_shader=_build_bg_lensing_frag(nu_glsl_expr))
+            new_bg_vao = self.ctx.vertex_array(new_bg, [])
+        else:
+            new_bg = self._bg_prog
+            new_bg_vao = self._bg_vao
+        if self._step_prog is not None or self._qumond_rhs_prog is not None:
             self.ctx.finish()
         if self._step_prog is not None:
             self._step_prog.release()
-        if self._bg_vao is not None:
-            self._bg_vao.release()
-        if self._bg_prog is not None:
-            self._bg_prog.release()
+        if self._qumond_rhs_prog is not None:
+            self._qumond_rhs_prog.release()
+        self._qumond_rhs_prog = new_qumond
+        self._nu_is_unity = nu_is_unity
         self._step_prog = new_step
         self._bg_prog = new_bg
         self._bg_vao = new_bg_vao
@@ -2079,7 +2556,7 @@ class Arena3GalaxyCollider:
         p = self.preset_idx % len(GALAXY_PRESETS)
         if p == 5:
             return max(float(self._sparc_shape[0]), 0.02)
-        return [27.5, 0.38, 14.22952, 8.30056, 70.0][p]
+        return [27.5, 0.38, 14.22952, 8.30056, 66.0][p]
 
     def _preset_halo_shape(self) -> Tuple[float, float, float]:
         """Returns `(rd_star, r_b_halo, r_max_halo)` in kpc for the active preset."""
@@ -2089,7 +2566,7 @@ class Arena3GalaxyCollider:
         if p == 1:
             return (1.15, 2.15, 28.0)
         if p == 4:
-            return (3.20, 4.7, 32.0)
+            return (3.40, 4.2, 32.0)
         if p == 5:
             rd = float(np.clip(self._sparc_shape[1], 0.35, 9.5))
             gf = float(np.clip(self._sparc_shape[2], 0.04, 0.92))
@@ -2108,9 +2585,56 @@ class Arena3GalaxyCollider:
         _, r_b, r_max = self._preset_halo_shape()
         return _cdm_enclosed_mass_py(r_max, m_b, r_b) / max(m_b, 1e-8)
 
+    def _preset_disk_params(self) -> Tuple[float, float, float]:
+        """Returns `(r_gas, gas_frac, bul_frac)` matching `_INIT_GALAXY_GLSL` for rotating disk presets."""
+        p = self.preset_idx % len(GALAXY_PRESETS)
+        if p == 0:
+            return (5.5, 0.28, 0.22)
+        if p == 1:
+            return (3.3, 0.82, 0.0)
+        if p == 4:
+            return (6.6, 0.26, 0.16)
+        if p == 5:
+            rd = float(np.clip(self._sparc_shape[1], 0.35, 9.5))
+            gf = float(np.clip(self._sparc_shape[2], 0.04, 0.92))
+            bf = float(np.clip(self._sparc_shape[3], 0.0, 0.45))
+            return (float(np.clip(2.1 * rd, 1.8, 6.0)), gf, bf)
+        return (3.5, 0.30, 0.0)
+
+    def _zero_com_gpu(self, mode: int) -> None:
+        """Deterministically zeroes both Baryon and CDM Halo `R_CoM` (`mode=0`) or `V_CoM` (`mode=1`) on GPU."""
+        assert self._pos_buf is not None and self._vel_buf is not None and self._com_out_buf is not None
+        n_p = int(self.particle_count)
+        n_wg = max((n_p + 255) // 256, 1)
+        req_part_bytes = max(n_wg * 32, 1024)
+        if self._com_partial_buf is None or self._com_partial_buf.size < req_part_bytes:
+            if self._com_partial_buf is not None:
+                self._com_partial_buf.release()
+            self._com_partial_buf = self.ctx.buffer(reserve=req_part_bytes)
+
+        self._pos_buf.bind_to_storage_buffer(0)
+        self._vel_buf.bind_to_storage_buffer(1)
+        self._com_partial_buf.bind_to_storage_buffer(2)
+        self._com_out_buf.bind_to_storage_buffer(3)
+
+        self._com_stage1_prog["u_count"].value = n_p
+        self._com_stage1_prog["u_mode"].value = int(mode)
+        self._com_stage1_prog.run(n_wg, 1, 1)
+        self.ctx.memory_barrier()
+
+        self._com_stage2_prog["u_num_wg"].value = n_wg
+        self._com_stage2_prog.run(1, 1, 1)
+        self.ctx.memory_barrier()
+
+        self._com_apply_prog["u_count"].value = n_p
+        self._com_apply_prog["u_mode"].value = int(mode)
+        self._com_apply_prog.run(n_wg, 1, 1)
+        self.ctx.memory_barrier()
+
     def _dispatch_velocity_calibration(self, u_pass: int, gm_monopole: float) -> None:
         assert self._pos_buf is not None and self._vel_buf is not None and self._force_tex is not None
         rd_star, r_b_halo, r_max_halo = self._preset_halo_shape()
+        r_gas, gas_frac, bul_frac = self._preset_disk_params()
         m_bary = self._preset_baryon_mass()
         self._pos_buf.bind_to_storage_buffer(0)
         self._vel_buf.bind_to_storage_buffer(1)
@@ -2123,6 +2647,9 @@ class Arena3GalaxyCollider:
             ("u_half_box", float(self.half_box)),
             ("u_m_bary", float(m_bary)),
             ("u_rd_star", float(rd_star)),
+            ("u_r_gas", float(r_gas)),
+            ("u_gas_frac", float(gas_frac)),
+            ("u_bul_frac", float(bul_frac)),
             ("u_r_b_halo", float(r_b_halo)),
             ("u_r_max_halo", float(r_max_halo)),
             ("u_gm_monopole", float(gm_monopole)),
@@ -2168,7 +2695,7 @@ class Arena3GalaxyCollider:
         if use_mod is not None:
             self.last_a0_code = self._compute_a0_code(use_mod, ballistic_pleat)
 
-        assert self._pos_buf is not None and self._vel_buf is not None
+        assert self._pos_buf is not None and self._vel_buf is not None and self._mg_eff_u0 is not None
         self._pos_buf.bind_to_storage_buffer(0)
         self._vel_buf.bind_to_storage_buffer(1)
         self._init_prog["u_count"].value = self.particle_count
@@ -2183,19 +2710,40 @@ class Arena3GalaxyCollider:
 
         zeros = np.zeros(self.grid_m ** 3, dtype=np.float32).tobytes()
         if _preset_is_rotating_disk(self.preset_idx):
-            # 1. Cheat-free observed-universe baryon velocity calibration (fixed RAR a0_ref = 0.371238, independent of mod!)
+            # 0. Zero t=0 Baryon & CDM Halo R_CoM deterministically BEFORE solving reference potentials!
+            self._zero_com_gpu(mode=0)
+
+            # 1. Cheat-free observed-universe baryon velocity calibration in conservative 3D QUMOND RAR potential!
+            self._mg_eff_u0.write(zeros)
             self._mg_ua[0].write(zeros)
             self._mg_ub[0].write(zeros)
-            gm_bary = self._solve_field_gpu(has_cdm=False, cdm_scale=0.0, n_vcycles=4)
+            gm_bary = self._solve_field_gpu(
+                has_cdm=False,
+                cdm_scale=0.0,
+                n_vcycles=4,
+                qumond_prog=self._qumond_rar_ref_prog,
+                a0_code=A0_REF_CODE,
+                nu_fn=_rar_ref_nu_numpy,
+            )
             self._dispatch_velocity_calibration(u_pass=0, gm_monopole=gm_bary)
 
             # 2. Cheat-free live NFW CDM halo Jeans equilibrium calibration (fixed cdm_scale = 1.0, independent of mod!)
+            self._mg_eff_u0.write(zeros)
             self._mg_ua[0].write(zeros)
             self._mg_ub[0].write(zeros)
-            gm_cdm_ref = self._solve_field_gpu(has_cdm=True, cdm_scale=1.0, n_vcycles=3)
+            gm_cdm_ref = self._solve_field_gpu(
+                has_cdm=True,
+                cdm_scale=1.0,
+                n_vcycles=4,
+                qumond_prog=None,
+            )
             self._dispatch_velocity_calibration(u_pass=1, gm_monopole=gm_cdm_ref)
 
-        # 3. Converge t=0 potential globally in 4 full 5-level Multigrid V-cycles using the ACTUAL selected PhysicsMod!
+            # 3. Zero t=0 Baryon & CDM Halo net linear momentum V_CoM deterministically so disk & halo never drift!
+            self._zero_com_gpu(mode=1)
+
+        # 4. Converge t=0 potential globally in 4 full 5-level Multigrid V-cycles using the ACTUAL selected PhysicsMod!
+        self._mg_eff_u0.write(zeros)
         self._mg_ua[0].write(zeros)
         self._mg_ub[0].write(zeros)
         self._solve_field_gpu(has_cdm=eff_has_ballistic, cdm_scale=eff_halo_scale, n_vcycles=4)
@@ -2207,39 +2755,79 @@ class Arena3GalaxyCollider:
         if self.replay_enabled:
             self._enqueue_replay_snapshot()
 
-    def _run_mg_smooth(self, level: int, sweeps: int, gm_monopole: float, zero_first: bool = False) -> None:
-        """Runs `sweeps` damped-Jacobi iterations on Multigrid `level`, leaving result in `self._mg_ua[level]`."""
+    def _get_wall_lut_bytes(
+        self,
+        gm_mono: float,
+        a0_code: float,
+        nu_fn: Callable[[np.ndarray], np.ndarray],
+        lut_tag: str,
+    ) -> bytes:
+        key = (lut_tag, round(float(gm_mono), 8), round(float(a0_code), 8), round(float(self.half_box), 6))
+        if self._cached_wall_lut_key == key and self._cached_wall_lut_bytes is not None:
+            return self._cached_wall_lut_bytes
+        lut_bytes = _compute_wall_phi_lut_bytes(gm_mono, a0_code, self.half_box, nu_fn)
+        self._cached_wall_lut_key = key
+        self._cached_wall_lut_bytes = lut_bytes
+        return lut_bytes
+
+    def _run_mg_smooth(
+        self,
+        level: int,
+        sweeps: int,
+        gm_monopole: float,
+        zero_first: bool = False,
+        u0_buf: Optional[moderngl.Buffer] = None,
+    ) -> None:
+        """Runs `sweeps` damped-Jacobi iterations on Multigrid `level`, leaving result in `u0_buf` (level 0) or `self._mg_ua[level]`."""
         m_lvl = self._mg_sizes[level]
         wg = max((m_lvl + 3) // 4, 1)
+        ua_lvl = (u0_buf if (level == 0 and u0_buf is not None) else self._mg_ua[level])
+        ub_lvl = self._mg_ub[level]
+
         self._mg_rhs[level].bind_to_storage_buffer(0)
         self._mg_smooth_prog["u_M"].value = m_lvl
         self._mg_smooth_prog["u_half_box"].value = float(self.half_box)
         self._mg_smooth_prog["u_is_fine"].value = 1 if level == 0 else 0
         self._mg_smooth_prog["u_gm_monopole"].value = float(gm_monopole)
 
-        # Ensure even number of ping-pong swaps or copy back so _mg_ua[level] always holds latest!
+        # Ensure even number of ping-pong swaps so ua_lvl always holds latest!
         n_even = sweeps if (sweeps % 2 == 0) else (sweeps + 1)
         for s in range(n_even):
             self._mg_smooth_prog["u_zero_init"].value = 1 if (zero_first and s == 0) else 0
             if s % 2 == 0:
-                self._mg_ua[level].bind_to_storage_buffer(1)
-                self._mg_ub[level].bind_to_storage_buffer(2)
+                ua_lvl.bind_to_storage_buffer(1)
+                ub_lvl.bind_to_storage_buffer(2)
             else:
-                self._mg_ub[level].bind_to_storage_buffer(1)
-                self._mg_ua[level].bind_to_storage_buffer(2)
+                ub_lvl.bind_to_storage_buffer(1)
+                ua_lvl.bind_to_storage_buffer(2)
             self._mg_smooth_prog.run(wg, wg, wg)
             self.ctx.memory_barrier()
 
-    def _run_multigrid_vcycle(self, gm_monopole: float) -> None:
+    def _run_multigrid_vcycle(
+        self,
+        gm_monopole: float,
+        u0_buf: Optional[moderngl.Buffer] = None,
+        use_wall_lut: bool = False,
+        wall_lut_bytes: Optional[bytes] = None,
+    ) -> None:
         """Executes one complete 5-level 3D Geometric Multigrid V-Cycle (`64³ -> 32³ -> 16³ -> 8³ -> 4³ -> 64³`)."""
         n_lvls = len(self._mg_sizes)
+        fine_u = u0_buf if u0_buf is not None else self._mg_ua[0]
+        use_lut_int = 1 if (use_wall_lut and wall_lut_bytes is not None) else 0
+        self._mg_smooth_prog["u_use_wall_lut"].value = use_lut_int
+        self._mg_restrict_prog["u_use_wall_lut"].value = use_lut_int
+        if use_lut_int == 1 and wall_lut_bytes is not None:
+            self._mg_smooth_prog["u_wall_phi_lut"].write(wall_lut_bytes)
+            self._mg_restrict_prog["u_wall_phi_lut"].write(wall_lut_bytes)
+
         # 1. Downward leg: pre-smooth (4 sweeps) & restrict exact cell-centered residual down to 4^3
         for lvl in range(n_lvls - 1):
-            self._run_mg_smooth(lvl, sweeps=4, gm_monopole=gm_monopole, zero_first=(lvl > 0))
+            u_lvl = fine_u if lvl == 0 else self._mg_ua[lvl]
+            self._run_mg_smooth(lvl, sweeps=4, gm_monopole=gm_monopole, zero_first=(lvl > 0), u0_buf=fine_u)
             m_coarse = self._mg_sizes[lvl + 1]
             wg_c = max((m_coarse + 3) // 4, 1)
             self._mg_rhs[lvl].bind_to_storage_buffer(0)
-            self._mg_ua[lvl].bind_to_storage_buffer(1)
+            u_lvl.bind_to_storage_buffer(1)
             self._mg_rhs[lvl + 1].bind_to_storage_buffer(2)
             self._mg_restrict_prog["u_Mc"].value = m_coarse
             self._mg_restrict_prog["u_half_box"].value = float(self.half_box)
@@ -2249,20 +2837,29 @@ class Arena3GalaxyCollider:
             self.ctx.memory_barrier()
 
         # 2. Exact solve on coarsest 4^3 grid (64 cells -> rapid relaxation in 16 sweeps!)
-        self._run_mg_smooth(n_lvls - 1, sweeps=16, gm_monopole=0.0, zero_first=True)
+        self._run_mg_smooth(n_lvls - 1, sweeps=16, gm_monopole=0.0, zero_first=True, u0_buf=fine_u)
 
         # 3. Upward leg: trilinearly prolongate coarse error & post-smooth (4 sweeps) up to 64^3
         for lvl in range(n_lvls - 2, -1, -1):
+            u_lvl = fine_u if lvl == 0 else self._mg_ua[lvl]
             m_fine = self._mg_sizes[lvl]
             wg_f = max((m_fine + 3) // 4, 1)
             self._mg_ua[lvl + 1].bind_to_storage_buffer(0)
-            self._mg_ua[lvl].bind_to_storage_buffer(1)
+            u_lvl.bind_to_storage_buffer(1)
             self._mg_prolong_prog["u_Mf"].value = m_fine
             self._mg_prolong_prog.run(wg_f, wg_f, wg_f)
             self.ctx.memory_barrier()
-            self._run_mg_smooth(lvl, sweeps=4, gm_monopole=gm_monopole, zero_first=False)
+            self._run_mg_smooth(lvl, sweeps=4, gm_monopole=gm_monopole, zero_first=False, u0_buf=fine_u)
 
-    def _solve_field_gpu(self, has_cdm: bool, cdm_scale: float, n_vcycles: int = 2) -> float:
+    def _solve_field_gpu(
+        self,
+        has_cdm: bool,
+        cdm_scale: float,
+        n_vcycles: int = 2,
+        qumond_prog: object = "auto",
+        a0_code: Optional[float] = None,
+        nu_fn: object = "auto",
+    ) -> float:
         assert (
             self._pos_buf is not None
             and self._vel_buf is not None
@@ -2270,7 +2867,10 @@ class Arena3GalaxyCollider:
             and self._gas_int_buf is not None
             and self._rho_flt_buf is not None
             and self._gas_hydro_buf is not None
+            and self._mg_eff_u0 is not None
+            and bool(self._mg_ua)
             and self._force_tex is not None
+            and self._lens_tex is not None
         )
         m = self.grid_m
         cells = m * m * m
@@ -2281,6 +2881,21 @@ class Arena3GalaxyCollider:
         mom_scale = float(np.clip(fix_scale / 20.0, 50.0, 5.0e9))
         gm_mono = float(G_grav * m_active)
 
+        eff_a0 = float(self.last_a0_code if a0_code is None else a0_code)
+        if qumond_prog == "auto":
+            use_qumond_prog: Optional[moderngl.ComputeShader] = (
+                None if (self._nu_is_unity or eff_a0 <= 2.0e-6) else self._qumond_rhs_prog
+            )
+            lut_tag = self._compiled_nu_src
+        else:
+            use_qumond_prog = qumond_prog  # type: ignore[assignment]
+            lut_tag = "rar_ref_calibration"
+
+        if nu_fn == "auto":
+            eff_nu_fn = self._last_nu_fn
+        else:
+            eff_nu_fn = nu_fn  # type: ignore[assignment]
+
         # 1. Clear 64^3 fixed-point mass & gas momentum accumulators
         self._mass_int_buf.bind_to_storage_buffer(2)
         self._gas_int_buf.bind_to_storage_buffer(3)
@@ -2288,7 +2903,7 @@ class Arena3GalaxyCollider:
         self._clear_prog.run((cells + 63) // 64, 1, 1)
         self.ctx.memory_barrier()
 
-        # 2. Atomic deposit 1M-2M Stars, Gas, and Live Collisionless Halo / Ballistic Pleat Modes!
+        # 2. Symmetric 8-Cell Trilinear CIC deposit of 1M-2M Stars, Gas & Live Collisionless Halo / Pleat Modes!
         self._pos_buf.bind_to_storage_buffer(0)
         self._vel_buf.bind_to_storage_buffer(1)
         self._deposit_prog["u_count"].value = self.particle_count
@@ -2301,7 +2916,7 @@ class Arena3GalaxyCollider:
         self._deposit_prog.run((self.particle_count + 255) // 256, 1, 1)
         self.ctx.memory_barrier()
 
-        # 3. Unpack Level-0 Poisson RHS + 3x3x3 Smoothed Eulerian Gas Hydro Grid
+        # 3. Unpack Level-0 Newtonian Poisson RHS (4*pi*G*rho_tot) + 3x3x3 Smoothed Eulerian Gas Hydro Grid
         self._mg_rhs[0].bind_to_storage_buffer(4)
         self._rho_flt_buf.bind_to_storage_buffer(5)
         self._gas_hydro_buf.bind_to_storage_buffer(7)
@@ -2314,17 +2929,59 @@ class Arena3GalaxyCollider:
         self._unpack_prog.run(wg3, wg3, wg3)
         self.ctx.memory_barrier()
 
-        # 4. Run 5-Level 3D Geometric Multigrid V-Cycles!
-        for _ in range(max(int(n_vcycles), 1)):
-            self._run_multigrid_vcycle(gm_mono)
+        # 4. Pass A: Solve Newtonian Poisson equation Lap(Phi_N) = 4*pi*G*rho_tot into _mg_ua[0]!
+        n_vc = max(int(n_vcycles), 1)
+        for _ in range(n_vc):
+            self._run_multigrid_vcycle(
+                gm_mono,
+                u0_buf=self._mg_ua[0],
+                use_wall_lut=False,
+                wall_lut_bytes=None,
+            )
 
-        # 5. Pack converged Newtonian acceleration g_N = -grad(Phi_N) & |Phi_N| into 3D Texture
-        self._mg_ua[0].bind_to_storage_buffer(5)
+        # 5. Pass B: Conservative Curl-Free 3D QUMOND / Spacetime-Weave Effective Potential Solve into _mg_eff_u0!
+        if use_qumond_prog is None:
+            phi_eff_buf = self._mg_ua[0]
+            use_lut_pack = 0
+            lut_bytes: Optional[bytes] = None
+        else:
+            lut_bytes = self._get_wall_lut_bytes(
+                gm_mono,
+                eff_a0,
+                eff_nu_fn if eff_nu_fn is not None else _rar_ref_nu_numpy,
+                lut_tag,
+            )
+            self._mg_ua[0].bind_to_storage_buffer(1)
+            self._mg_rhs[0].bind_to_storage_buffer(4)
+            use_qumond_prog["u_M"].value = m
+            use_qumond_prog["u_half_box"].value = float(self.half_box)
+            use_qumond_prog["u_gm_monopole"].value = gm_mono
+            use_qumond_prog["u_a0_code"].value = eff_a0
+            use_qumond_prog.run(wg3, wg3, wg3)
+            self.ctx.memory_barrier()
+
+            for _ in range(n_vc):
+                self._run_multigrid_vcycle(
+                    gm_mono,
+                    u0_buf=self._mg_eff_u0,
+                    use_wall_lut=True,
+                    wall_lut_bytes=lut_bytes,
+                )
+            phi_eff_buf = self._mg_eff_u0
+            use_lut_pack = 1
+
+        self._last_phi_eff_buf = phi_eff_buf
+
+        # 6. Pack curl-free conservative g_eff = -grad(Phi_eff) & |Phi_eff| into 3D RGBA32F + L2-resident RG16F Lensing Texture!
+        phi_eff_buf.bind_to_storage_buffer(5)
         self._force_tex.bind_to_image(0, read=False, write=True)
+        self._lens_tex.bind_to_image(1, read=False, write=True)
         self._pack_force_prog["u_M"].value = m
         self._pack_force_prog["u_half_box"].value = float(self.half_box)
-        if "u_gm_monopole" in self._pack_force_prog:
-            self._pack_force_prog["u_gm_monopole"].value = gm_mono
+        self._pack_force_prog["u_gm_monopole"].value = gm_mono
+        self._pack_force_prog["u_use_wall_lut"].value = use_lut_pack
+        if use_lut_pack == 1 and lut_bytes is not None:
+            self._pack_force_prog["u_wall_phi_lut"].write(lut_bytes)
         self._pack_force_prog.run(wg3, wg3, wg3)
         self.ctx.memory_barrier()
         return gm_mono
@@ -2396,6 +3053,10 @@ class Arena3GalaxyCollider:
             return
 
         eff_has_ballistic, eff_halo_scale, ballistic_pleat = self._effective_halo_params(use_mod)
+        # Avoid double-counting stationary nu(y) boost when ballistic pleat inertia is already active in Preset 2
+        a0_code = self._compute_a0_code(use_mod, ballistic_pleat)
+        self.last_a0_code = a0_code
+        self._last_nu_fn = use_comp.nu_numpy_fn
 
         gm_mono = self._solve_field_gpu(
             has_cdm=eff_has_ballistic,
@@ -2416,10 +3077,6 @@ class Arena3GalaxyCollider:
         self._gas_hydro_buf.bind_to_storage_buffer(7)
         self._force_tex.use(location=0)
 
-        # Avoid double-counting stationary nu(y) boost when ballistic pleat inertia is already active in Preset 2
-        a0_code = self._compute_a0_code(use_mod, ballistic_pleat)
-        self.last_a0_code = a0_code
-        self._last_nu_fn = use_comp.nu_numpy_fn
         pleat_splash = max(
             float(use_mod.parameters.pinned_pleat_coupling),
             0.08 * float(use_mod.parameters.g6) if not use_mod.parameters.has_cdm_halo else 0.0,
@@ -2495,21 +3152,16 @@ class Arena3GalaxyCollider:
         if np.any(stars) and np.any(gas):
             if preset_idx == 2:
                 # True Gravitational Lensing Peak vs Shocked X-Ray ICM Gas Offset (1 code unit = 25 kpc on 1.4 Mpc cluster box!)
+                # Note: self._mg_ua[0] ALREADY holds the converged conservative 3D potential Phi_eff (layout (z, y, x))!
                 gas_abs_x = float(np.mean(np.abs(pos[gas, 0])))
-                nu_fn = getattr(self, "_last_nu_fn", None)
-                if nu_fn is not None and phi is not None:
+                if phi is not None:
                     m = self.grid_m
                     h = float((2.0 * self.half_box) / float(m))
                     inv_2h = np.float32(0.5 / h)
-                    # Note: phi layout is (z, y, x)! Evaluate 3D finite differences in float32 for 4x lower cache traffic.
-                    gx = -(phi[1:-1, 1:-1, 2:] - phi[1:-1, 1:-1, :-2]) * inv_2h
-                    gy = -(phi[1:-1, 2:, 1:-1] - phi[1:-1, :-2, 1:-1]) * inv_2h
-                    gz = -(phi[2:, 1:-1, 1:-1] - phi[:-2, 1:-1, 1:-1]) * inv_2h
-                    g_mag = np.sqrt(gx * gx + gy * gy + gz * gz)
-                    y_val = np.clip(g_mag * np.float32(1.0 / max(float(a0_code), 1e-6)), 1e-6, 2500.0)
-                    nu_boost = np.clip(np.asarray(nu_fn(y_val), dtype=np.float32), 0.25, 250.0)
-                    gex, gey, gez = gx * nu_boost, gy * nu_boost, gz * nu_boost
-                    # Effective gravitating density rho_lens ~ -div(g_eff) on interior (m-4)^3
+                    # Weak-lensing convergence kappa ~ -div_2h(grad_2h(Phi_eff)) on Clowe et al. smoothing scale!
+                    gex = -(phi[1:-1, 1:-1, 2:] - phi[1:-1, 1:-1, :-2]) * inv_2h
+                    gey = -(phi[1:-1, 2:, 1:-1] - phi[1:-1, :-2, 1:-1]) * inv_2h
+                    gez = -(phi[2:, 1:-1, 1:-1] - phi[:-2, 1:-1, 1:-1]) * inv_2h
                     div_g = (
                         (gex[1:-1, 1:-1, 2:] - gex[1:-1, 1:-1, :-2])
                         + (gey[1:-1, 2:, 1:-1] - gey[1:-1, :-2, 1:-1])
@@ -2555,14 +3207,11 @@ class Arena3GalaxyCollider:
         _copy_buffer_sub_data(self._pos_buf, self._telemetry_stage_buf, 0, 0, samp_bytes)
         _copy_buffer_sub_data(self._vel_buf, self._telemetry_stage_buf, 0, samp_bytes, samp_bytes)
 
-        need_phi = (
-            self.preset_idx == 2
-            and getattr(self, "_last_nu_fn", None) is not None
-            and bool(self._mg_ua)
-        )
+        src_phi_buf = self._last_phi_eff_buf if self._last_phi_eff_buf is not None else (self._mg_ua[0] if self._mg_ua else None)
+        need_phi = (self.preset_idx == 2 and src_phi_buf is not None)
         phi_bytes = (self.grid_m ** 3) * 4 if need_phi else 0
-        if phi_bytes > 0:
-            _copy_buffer_sub_data(self._mg_ua[0], self._telemetry_stage_buf, 0, 2 * samp_bytes, phi_bytes)
+        if phi_bytes > 0 and src_phi_buf is not None:
+            _copy_buffer_sub_data(src_phi_buf, self._telemetry_stage_buf, 0, 2 * samp_bytes, phi_bytes)
 
         self._pending_telem_fence = GL.glFenceSync(GL.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
         GL.glFlush()
@@ -2620,14 +3269,11 @@ class Arena3GalaxyCollider:
         _copy_buffer_sub_data(self._pos_buf, self._telemetry_stage_buf, 0, 0, samp_bytes)
         _copy_buffer_sub_data(self._vel_buf, self._telemetry_stage_buf, 0, samp_bytes, samp_bytes)
 
-        need_phi = (
-            self.preset_idx == 2
-            and getattr(self, "_last_nu_fn", None) is not None
-            and bool(self._mg_ua)
-        )
+        src_phi_buf = self._last_phi_eff_buf if self._last_phi_eff_buf is not None else (self._mg_ua[0] if self._mg_ua else None)
+        need_phi = (self.preset_idx == 2 and src_phi_buf is not None)
         phi_bytes = (self.grid_m ** 3) * 4 if need_phi else 0
-        if phi_bytes > 0:
-            _copy_buffer_sub_data(self._mg_ua[0], self._telemetry_stage_buf, 0, 2 * samp_bytes, phi_bytes)
+        if phi_bytes > 0 and src_phi_buf is not None:
+            _copy_buffer_sub_data(src_phi_buf, self._telemetry_stage_buf, 0, 2 * samp_bytes, phi_bytes)
 
         total_bytes = 2 * samp_bytes + phi_bytes
         raw = self._telemetry_stage_buf.read(size=total_bytes)
@@ -2659,13 +3305,13 @@ class Arena3GalaxyCollider:
         }
 
     def render(self, fbo: moderngl.Framebuffer, camera: Camera3D, wall_time: float = 0.0) -> None:
-        if self.is_hibernated or self._pos_buf is None or self._force_tex is None:
+        if self.is_hibernated or self._pos_buf is None or self._force_tex is None or self._lens_tex is None:
             self.wake_from_ram()
         assert (
             self._pt_vao is not None
             and self._bg_prog is not None
             and self._bg_vao is not None
-            and self._force_tex is not None
+            and self._lens_tex is not None
         )
         w, h = fbo.size
         self._ensure_hdr_fbo(w, h)
@@ -2681,9 +3327,9 @@ class Arena3GalaxyCollider:
         aspect = float(w) / max(float(h), 1.0)
         fov_tan = math.tan(math.radians(camera.fov_deg) * 0.5)
 
-        self._force_tex.use(location=0)
+        self._lens_tex.use(location=0)
         for uname, uval in (
-            ("u_force_tex", 0),
+            ("u_lens_tex", 0),
             ("u_cam_eye", tuple(float(v) for v in eye)),
             ("u_cam_fwd", tuple(float(v) for v in fwd)),
             ("u_cam_right", tuple(float(v) for v in right)),
@@ -2755,8 +3401,13 @@ class Arena3GalaxyCollider:
             self._pos_buf,
             self._vel_buf,
             self._telemetry_stage_buf,
+            self._qumond_rhs_prog,
+            self._qumond_rar_ref_prog,
             self._step_prog,
             self._init_prog,
+            self._com_stage1_prog,
+            self._com_stage2_prog,
+            self._com_apply_prog,
             self._calibrate_vel_prog,
             self._clear_prog,
             self._deposit_prog,
