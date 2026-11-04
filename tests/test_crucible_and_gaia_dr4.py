@@ -62,7 +62,8 @@ def test_crucible_scientific_honesty_across_competing_theories() -> None:
     b_tnap = {b.badge_id: b.status for b in tnap_rep.badges}
     assert math.isclose(tnap_rep.omega_m_effective, 0.30941, abs_tol=5e-5)
     assert tnap_rep.cmb_d2_quadrupole_uK2 < 400.0
-    assert b_tnap["sparc_175"] == "PASS"
+    assert tnap_rep.cross_scale_seam_open is True
+    assert b_tnap["sparc_175"] == "WARN"
     assert b_tnap["solar_gw"] == "PASS"
     # Honest open flags on full-Boltzmann CMB & Hubble tension!
     assert b_tnap["planck_cmb"] == "WARN"

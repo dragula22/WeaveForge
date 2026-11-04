@@ -9,9 +9,9 @@ Unified Desktop GPU Sandbox (`GLFW` + `ModernGL` OpenGL 4.6 + `Dear ImGui` + `Im
     Context-Sensitive Arena Controls, and Rig 2 (`AMD RX 5700 XT`) LAN Worker Dispatcher.
   • Center 3D Viewport: Zero-copy OpenGL FBO texture display (`ImTextureRef`) with full
     60+ FPS `WASD + Q/E + Shift` Free-Fly & Turntable Orbit/Pan/Zoom camera.
-  • Right Studio Panel: Ruthlessly Honest 5-Dataset Observational Pass/Fail Crucible +
-    3 Real-Time `ImPlot` Scientific Charts (SPARC Rotation Curves, Planck CMB Peaks,
-    and Dec 2, 2026 `Gaia DR4` Wide-Binary `|z_gal|` Velocity Boost).
+  • Right Studio Panel: Ruthlessly Honest 7-Dataset Observational Pass/Fail Crucible +
+    AST Free-Knob Auditor + 3 Real-Time `ImPlot` Scientific Charts (SPARC Rotation Curves,
+    Planck CMB TT/TE/EE Knox Chi2, and Dec 2, 2026 `Gaia DR4` Wide-Binary `|z_gal|` Boost).
 """
 
 from __future__ import annotations
@@ -155,6 +155,9 @@ _COUPLING_PARAM_FIELDS: Tuple[str, ...] = (
     "waist_clamping_ell",
     "w0_de",
     "wa_de",
+    "h0_kms_mpc",
+    "delta_neff_pleat",
+    "pleat_screening_mpc",
 )
 SIM_FIXED_HZ: float = 60.0
 SIM_FIXED_DT: float = 1.0 / SIM_FIXED_HZ
@@ -341,7 +344,7 @@ class WeaveForgeStudioApp:
         self.window = glfw.create_window(
             init_w,
             init_h,
-            "WeaveForge Studio — Multi-Scale 3D Physics Sandbox & Observational Crucible",
+            "WeaveForge v1.0 Studio — Multi-Scale 3D Physics Sandbox & Un-Gameable Crucible",
             None,
             None,
         )
@@ -2294,6 +2297,25 @@ class WeaveForgeStudioApp:
                             )
                             imgui.pop_text_wrap_pos()
                     else:
+                        ch_spin, new_spin = imgui.slider_float(
+                            "Kerr Spin a/M##qnm_spin",
+                            float(np.clip(getattr(self.arena2, "spin_a", 0.67), 0.0, 0.95)),
+                            0.0,
+                            0.95,
+                            "%.2f",
+                        )
+                        is_spin_dragging = imgui.is_item_active()
+                        if ch_spin:
+                            self.arena2.spin_a = float(np.clip(new_spin, 0.0, 0.95))
+                            self._reset_frame_pacing_clock()
+                        if imgui.small_button("Static a=0.00##qnm_a0"):
+                            self.arena2.spin_a = 0.0
+                            self._reset_frame_pacing_clock()
+                        imgui.same_line()
+                        if imgui.small_button("GW150914 a=0.67##qnm_a67"):
+                            self.arena2.spin_a = 0.67
+                            self._reset_frame_pacing_clock()
+
                         ch_refl, new_refl = imgui.slider_float(
                             "Spool Echo R",
                             float(getattr(self.arena2, "spool_reflectivity", 0.0)),
@@ -2316,23 +2338,46 @@ class WeaveForgeStudioApp:
                             "BHEX Shadow & Photon-Sphere Rings", self.arena2.show_bhex_gauge
                         )
 
+                        spin_clamped_ui = float(np.clip(getattr(self.arena2, "spin_a", 0.67), 0.0, 0.95))
+                        spin_key = (
+                            round(spin_clamped_ui * 50.0) / 50.0
+                            if is_spin_dragging
+                            else round(spin_clamped_ui, 2)
+                        )
                         refl_key = (
                             round(float(self.arena2.spool_reflectivity) * 20.0) / 20.0
                             if is_refl_dragging
                             else round(float(self.arena2.spool_reflectivity), 2)
                         )
-                        qnm_sum = get_bhex_ringdown_summary(self.working_mod, refl_key)
+                        qnm_sum = get_bhex_ringdown_summary(self.working_mod, refl_key, spin_a=spin_key)
                         self.arena2.qnm_freq_ratio = float(qnm_sum["qnm_freq_ratio"])
                         bssn_sum = get_bssn_strong_field_summary()
+                        kerr_aud = qnm_sum.get("kerr_lvk_audit", {})
 
                         ligo_st = str(qnm_sum["ligo_status"])
                         ligo_col = COL_PASS if ligo_st == "PASS" else (COL_WARN if ligo_st == "WARN" else COL_FAIL)
                         imgui.push_text_wrap_pos(0.0)
                         imgui.text_colored(
                             ligo_col,
-                            f"BHEX l=2 QNM: Mw_220 = {float(qnm_sum['omega_r']):.4f}{float(qnm_sum['omega_i']):+.4f}i "
-                            f"({float(qnm_sum['delta_f220_vs_gr_pct']):+.2f}% vs GR) | LVK O4 [{ligo_st}]",
+                            f"Spin a={spin_key:.2f}: Mw_220={float(qnm_sum['omega_r']):.4f}{float(qnm_sum['omega_i']):+.4f}i "
+                            f"({float(qnm_sum['delta_f220_vs_gr_pct']):+.2f}% vs GR) | LVK [{ligo_st}]",
                         )
+                        if isinstance(kerr_aud, dict) and "gw150914_imr_sigma" in kerr_aud:
+                            kerr_st = str(kerr_aud.get("lvk_status", ligo_st))
+                            kerr_col = COL_PASS if kerr_st == "PASS" else (COL_WARN if kerr_st == "WARN" else COL_FAIL)
+                            imgui.text_colored(
+                                kerr_col,
+                                f"GW150914 Free(M,a)={float(kerr_aud['gw150914_ringdown_only_min_sigma']):.2f}s "
+                                f"(Qmax={float(kerr_aud['max_achievable_Q220']):.2f}) | "
+                                f"IMR={float(kerr_aud['gw150914_imr_sigma']):.2f}s | "
+                                f"LVK O4={float(kerr_aud['lvk_o4_hierarchical_sigma']):.2f}s",
+                            )
+                            imgui.text_colored(
+                                COL_MUTED,
+                                f"Ratios: f221/f220={float(kerr_aud['R_f_221_220_at_spin']):.3f} | "
+                                f"f330/f220={float(kerr_aud['R_f_330_220_at_spin']):.3f} | "
+                                f"D_sh={float(qnm_sum['b_crit_over_m']):.3f}M",
+                            )
                         if float(self.arena2.spool_reflectivity) > 0.01:
                             imgui.text_colored(
                                 COL_FORECAST,
@@ -2544,6 +2589,9 @@ class WeaveForgeStudioApp:
                 )
                 ch9, _ = self._draw_coupling_slider_float("Dark Energy w0", "w0_de", -1.6, -0.4)
                 ch10, _ = self._draw_coupling_slider_float("Dark Energy wa", "wa_de", -1.5, 1.0)
+                ch_h0, _ = self._draw_coupling_slider_float("Hubble H0 (km/s/Mpc)", "h0_kms_mpc", 55.0, 80.0)
+                ch_dneff, _ = self._draw_coupling_slider_float("Early Pleat dN_eff", "delta_neff_pleat", 0.0, 0.60)
+                ch_scr, _ = self._draw_coupling_slider_float("Mpc Screening L_scr", "pleat_screening_mpc", 0.0, 2.00)
 
                 changed_any = (
                     ch1
@@ -2560,6 +2608,9 @@ class WeaveForgeStudioApp:
                     or ch8
                     or ch9
                     or ch10
+                    or ch_h0
+                    or ch_dneff
+                    or ch_scr
                 )
                 if changed_any:
                     if ch1 or ch_m or ch2 or ch3 or ch_ks or ch_gk or ch_ret or ch4:
@@ -3240,12 +3291,13 @@ class WeaveForgeStudioApp:
         sub_line = "Camera: Left-Drag Orbit | Right-Drag Pan | Right-Click Menu | WASD+QE Fly"
         if self.compiled is not None:
             if self._active_arena == 1 and int(getattr(self.arena2, "submode", 0)) == 3:
-                refl_hud = round(float(getattr(self.arena2, "spool_reflectivity", 0.0)) * 20.0) / 20.0
-                q_hud = get_bhex_ringdown_summary(self.working_mod, refl_hud)
+                refl_hud = round(float(getattr(self.arena2, "spool_reflectivity", 0.0)), 2)
+                spin_hud = round(float(np.clip(getattr(self.arena2, "spin_a", 0.67), 0.0, 0.95)), 2)
+                q_hud = get_bhex_ringdown_summary(self.working_mod, refl_hud, spin_a=spin_hud)
                 sub_line = (
-                    f"BHEX QNM Mw_220 = {float(q_hud['omega_r']):.4f}{float(q_hud['omega_i']):+.4f}i "
+                    f"Spin a={spin_hud:.2f} | Mw_220={float(q_hud['omega_r']):.4f}{float(q_hud['omega_i']):+.4f}i "
                     f"({float(q_hud['delta_f220_vs_gr_pct']):+.2f}% vs GR, LVK O4 {q_hud['ligo_status']})  |  "
-                    f"Spool R={refl_hud:.2f}  |  Shadow = {self.compiled.shadow_radius_rg:.3f} r_g"
+                    f"Spool R={refl_hud:.2f}  |  Shadow={float(q_hud['b_crit_over_m']):.3f} r_g"
                 )
             else:
                 sub_line = (
@@ -3326,6 +3378,26 @@ class WeaveForgeStudioApp:
 
         rep = self.crucible
         if rep is not None:
+            knob_col = (
+                COL_WARN
+                if (bool(rep.cross_scale_seam_open) or int(rep.per_galaxy_halo_knobs) > 0)
+                else COL_PASS
+            )
+            knob_hdr_txt = (
+                f"Single H0={rep.h0_consistent_kms_mpc:.2f} km/s/Mpc | "
+                f"AST Knobs: {rep.free_global_knobs} global ({rep.free_action_literals} act) + "
+                f"{rep.per_galaxy_halo_knobs} halo"
+            )
+            imgui.text_colored(knob_col, knob_hdr_txt)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    f"{rep.knob_audit_summary}\n"
+                    f"NGC 3198 Double-Count Audit: V={rep.ngc3198_v_double_counted_kms:.1f} km/s "
+                    f"({rep.ngc3198_double_count_sigma:.1f} sigma, seam_open={rep.cross_scale_seam_open})"
+                )
+
+            badges_region_h = float(round(np.clip(panel_h * 0.40, 176.0 * s, 465.0 * s)))
+            imgui.begin_child("##CrucibleBadgesScroll", imgui.ImVec2(-1.0, badges_region_h), imgui.ChildFlags_.none)
             imgui.push_style_var(imgui.StyleVar_.window_padding, imgui.ImVec2(6.0 * s, 4.0 * s))
             imgui.push_style_var(imgui.StyleVar_.item_spacing, imgui.ImVec2(6.0 * s, 3.0 * s))
             for b in rep.badges:
@@ -3348,6 +3420,7 @@ class WeaveForgeStudioApp:
                 imgui.pop_text_wrap_pos()
                 imgui.end_child()
             imgui.pop_style_var(2)
+            imgui.end_child()
 
             imgui.separator()
             # 1. SPARC-175 Galaxy Selector + 1-Click 3D Arena 3 Spawner!
@@ -3431,14 +3504,16 @@ class WeaveForgeStudioApp:
                     cmb_mode = cm_i
                 if is_cm_sel:
                     imgui.pop_style_color(2)
-            pol_stat_txt = f"TE r={rep.cmb_te_corr_2500:.4f}"
+            pol_stat_txt = f"TE r={rep.cmb_te_corr_2500:.4f} | chi2/v={rep.cmb_chi2_dof_profiled_ns:.2f}"
             pol_stat_w = imgui.calc_text_size(pol_stat_txt).x
             cur_end_x = imgui.get_item_rect_max().x - imgui.get_window_pos().x
             avail_pol_x = imgui.get_window_width() - pol_stat_w - style.window_padding.x
             if avail_pol_x > cur_end_x + 8.0 * s:
                 imgui.same_line(avail_pol_x)
                 imgui.text_colored(
-                    COL_PASS if rep.cmb_te_corr_2500 > 0.92 else COL_FAIL,
+                    COL_PASS
+                    if (rep.cmb_te_corr_2500 > 0.92 and rep.cmb_chi2_dof_profiled_ns <= 1.25)
+                    else (COL_WARN if rep.cmb_chi2_dof_profiled_ns <= 2.50 else COL_FAIL),
                     pol_stat_txt,
                 )
 

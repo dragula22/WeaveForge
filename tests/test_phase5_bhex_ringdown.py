@@ -302,6 +302,7 @@ def test_studio_phase5_bssn_ringdown_and_kz_telemetry(tmp_path) -> None:
         app.select_left_tab(1)
         app.arena2.submode = 3
         app.reset_active_camera()
+        app.arena2.spin_a = 0.0
         app.arena2.spool_reflectivity = 0.0
         snap_r0 = tmp_path / "studio_submode3_r0.png"
         app.render_single_frame(dt_override=0.016)

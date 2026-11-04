@@ -45,7 +45,14 @@ except Exception:  # pragma: no cover
     _HAS_CAMB = False
 
 from weaveforge.core.camera import Camera3D
-from weaveforge.core.frameworks import PhysicsMod
+from weaveforge.core.cosmology_referee import (
+    audit_single_h0_consistency,
+    evaluate_cross_scale_mass_continuity,
+    evaluate_linear_growth_s8,
+    evaluate_planck_knox_chi2_2500,
+    evaluate_primordial_bbn,
+)
+from weaveforge.core.frameworks import PhysicsMod, count_mod_free_knobs
 from weaveforge.core.skyrme_perturbation import (
     evaluate_catenoid_waist_adiabaticity,
     skyrme_pleat_jeans_damping_envelope,
@@ -153,15 +160,36 @@ class CrucibleReport:
     cmb_qh_net_chiral_pos: float = 0.0
     cmb_kz_depends_on_r0: bool = False
     cmb_kz_matches_target_10pct: bool = False
+    # Un-Gameable Cosmological Referee, Cross-Scale Continuity & Knob Audit (Track 6A)
+    h0_consistent_kms_mpc: float = 67.36
+    a0_h0_rel_mismatch: float = 0.0
+    cmb_chi2_dof_fixed_ns: float = 1.0
+    cmb_chi2_dof_profiled_ns: float = 1.0
+    cmb_best_fit_ns: float = 0.9649
+    cmb_high_l_tilt_pct: float = 0.0
+    bbn_dh_e5: float = 2.515
+    bbn_yp: float = 0.2471
+    bbn_max_sigma: float = 0.8
+    lensing_s8_active: float = 0.811
+    lensing_s8_gr_screened: float = 0.811
+    lensing_s8_sigma: float = 1.5
+    cross_scale_seam_open: bool = False
+    ngc3198_v_double_counted_kms: float = 150.0
+    ngc3198_double_count_sigma: float = 0.0
+    free_action_literals: int = 0
+    free_global_knobs: int = 0
+    per_galaxy_halo_knobs: int = 0
+    knob_audit_summary: str = ""
+    desi_bao_anchored_chi2_dof: float = 1.0
 
 
 _CAMB_FORTRAN_LOCK = threading.Lock()
 _CAMB_LUT_LOCK = threading.RLock()
 _SPARC_SCORE_LOCK = threading.Lock()
 _CAMB_STOP_EVENT = threading.Event()
-_EXACT_CAMB_CURVES: Dict[Tuple[float, float], np.ndarray] = {}
+_EXACT_CAMB_CURVES: Dict[Tuple[float, float, float], np.ndarray] = {}
 _CAMB_DDR5_SPLINES: Dict[float, CubicSpline] = {}
-_EXACT_CAMB_POL_CURVES: Dict[Tuple[float, float], np.ndarray] = {}
+_EXACT_CAMB_POL_CURVES: Dict[Tuple[float, float, float], np.ndarray] = {}
 _CAMB_POL_DDR5_SPLINES: Dict[float, CubicSpline] = {}
 _CAMB_WARM_THREAD: Optional[threading.Thread] = None
 _CAMB_WARM_PROC: Optional[subprocess.Popen] = None  # type: ignore[type-arg]
@@ -173,8 +201,7 @@ _CAMB_LAST_ERROR: Optional[str] = None
 _PLANCK_REF_CACHE: Optional[Tuple[np.ndarray, np.ndarray, float, float, np.ndarray]] = None
 _PLANCK_POL_REF_CACHE: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = None
 
-_PLANCK_H0: float = 67.4
-_PLANCK_H0_NNU_3303: float = 69.0  # Preserves Planck angular acoustic scale 100*theta_* = 1.0411 on N_eff = 3.303 branch
+_PLANCK_H0: float = 67.36
 _PLANCK_OMEGA_B: float = 0.04897
 _CAMB_LMAX: int = 1350
 _CAMB_POL_LMAX: int = 2500
@@ -245,20 +272,21 @@ def _camb_lut_cache_signature() -> str:
     )
 
 
-def _cached_camb_tt_curve(omega_m_q: float, nnu_q: float) -> np.ndarray:
+def _cached_camb_tt_curve(omega_m_q: float, nnu_q: float, h0_q: float = _PLANCK_H0) -> np.ndarray:
     """
-    Runs the genuine `CAMB` Fortran Einstein–Boltzmann hierarchy (`l = 0..1350`) for `(omega_m_eff, N_eff)`,
+    Runs the genuine `CAMB` Fortran Einstein–Boltzmann hierarchy (`l = 0..1350`) for `(omega_m_eff, N_eff, H_0)`,
     serialized via double-checked `_CAMB_FORTRAN_LOCK` and memoized in DDR5 System RAM (`~0.42s` cold, `< 0.01 ms` warm!).
     """
     om_key = round(float(omega_m_q), 4)
-    nnu_key = round(float(nnu_q), 3)
-    cache_key = (om_key, nnu_key)
+    nnu_key = round(max(float(nnu_q), 0.1), 3)
+    h0_key = round(max(float(h0_q), 20.0), 2)
+    cache_key = (om_key, nnu_key, h0_key)
     with _CAMB_LUT_LOCK:
         existing = _EXACT_CAMB_CURVES.get(cache_key)
         if existing is not None:
             return existing
 
-    h = _PLANCK_H0 / 100.0
+    h = h0_key / 100.0
     # Regularize omch2 >= 1e-4 so CAMB's synchronous-gauge CDM rest frame stays finite near pure-baryon limits
     omch2 = max((float(om_key) - _PLANCK_OMEGA_B) * (h * h), 1.0e-4)
 
@@ -269,7 +297,7 @@ def _cached_camb_tt_curve(omega_m_q: float, nnu_q: float) -> np.ndarray:
                 return existing
 
         pars = camb.set_params(
-            H0=_PLANCK_H0,
+            H0=float(h0_key),
             ombh2=0.02237,
             omch2=omch2,
             tau=0.0544,
@@ -286,7 +314,7 @@ def _cached_camb_tt_curve(omega_m_q: float, nnu_q: float) -> np.ndarray:
         ).copy()
         if not np.all(np.isfinite(dl_tt)):
             pars_safe = camb.set_params(
-                H0=_PLANCK_H0,
+                H0=float(h0_key),
                 ombh2=0.02237,
                 omch2=max(omch2, 2.5e-4),
                 tau=0.0544,
@@ -371,14 +399,15 @@ def load_camb_lut_disk_cache(cache_path: Optional[Path] = None, force_reload: bo
         sp_3044 = CubicSpline(nodes, dl_3044, axis=0, bc_type="not-a-knot", extrapolate=False)
         sp_3303 = CubicSpline(nodes, dl_3303, axis=0, bc_type="not-a-knot", extrapolate=False)
 
+        h0_k = round(_PLANCK_H0, 2)
         with _CAMB_LUT_LOCK:
             if force_reload:
                 _EXACT_CAMB_CURVES.clear()
                 _PLANCK_REF_CACHE = None
             for i, om in enumerate(nodes):
                 om_k = round(float(om), 4)
-                _EXACT_CAMB_CURVES[(om_k, 3.044)] = dl_3044[i].copy()
-                _EXACT_CAMB_CURVES[(om_k, 3.303)] = dl_3303[i].copy()
+                _EXACT_CAMB_CURVES[(om_k, 3.044, h0_k)] = dl_3044[i].copy()
+                _EXACT_CAMB_CURVES[(om_k, 3.303, h0_k)] = dl_3303[i].copy()
             _CAMB_DDR5_SPLINES[3.044] = sp_3044
             _CAMB_DDR5_SPLINES[3.303] = sp_3303
             _CAMB_LUT_READY = True
@@ -402,8 +431,8 @@ def save_camb_lut_disk_cache(
         return None
     target = Path(cache_path) if cache_path is not None else _CAMB_LUT_DISK_CACHE_PATH
     nodes = np.array(_CAMB_DENSE_NODES, dtype=np.float64)
-    rows_3044 = [_cached_camb_tt_curve(float(om), 3.044) for om in _CAMB_DENSE_NODES]
-    rows_3303 = [_cached_camb_tt_curve(float(om), 3.303) for om in _CAMB_DENSE_NODES]
+    rows_3044 = [_cached_camb_tt_curve(float(om), 3.044, _PLANCK_H0) for om in _CAMB_DENSE_NODES]
+    rows_3303 = [_cached_camb_tt_curve(float(om), 3.303, _PLANCK_H0) for om in _CAMB_DENSE_NODES]
     dtype = np.float32 if use_float32 else np.float64
     mat_3044 = np.stack(rows_3044, axis=0).astype(dtype, copy=False)
     mat_3303 = np.stack(rows_3303, axis=0).astype(dtype, copy=False)
@@ -441,13 +470,14 @@ def _rebuild_camb_spline_for_nnu(
     valid_xs: List[float] = []
     ys_list: List[np.ndarray] = []
     nnu_key = round(float(nnu_val), 3)
+    h0_key = round(_PLANCK_H0, 2)
     for om in cand_xs:
         if _CAMB_STOP_EVENT.is_set():
             return
-        cache_key = (round(float(om), 4), nnu_key)
+        cache_key = (round(float(om), 4), nnu_key, h0_key)
         with _CAMB_LUT_LOCK:
             was_cached = cache_key in _EXACT_CAMB_CURVES
-        arr = _cached_camb_tt_curve(float(om), nnu_key)
+        arr = _cached_camb_tt_curve(float(om), nnu_key, h0_key)
         if np.all(np.isfinite(arr)):
             valid_xs.append(float(om))
             ys_list.append(arr)
@@ -469,7 +499,7 @@ def _camb_warm_inproc(yield_s: float = 0.01) -> None:
     for om0, nnu0 in ((0.31397, 3.044), (0.3094, 3.303), (0.3140, 3.044), (0.0490, 3.044)):
         if _CAMB_STOP_EVENT.is_set():
             return
-        _cached_camb_tt_curve(om0, nnu0)
+        _cached_camb_tt_curve(om0, nnu0, _PLANCK_H0)
         if yield_s > 0.0 and _CAMB_STOP_EVENT.wait(yield_s):
             return
 
@@ -613,30 +643,50 @@ def _provisional_camb_tt_curve(omega_m_eff: float, nnu: float) -> np.ndarray:
     return out
 
 
-def _get_camb_tt_fast(omega_m_eff: float, nnu: float) -> np.ndarray:
+def _get_camb_tt_fast(omega_m_eff: float, nnu: float, h0_kms_mpc: float = _PLANCK_H0) -> np.ndarray:
     if not _CAMB_LUT_READY:
         load_camb_lut_disk_cache()
 
     om_f = float(omega_m_eff)
     om_q = round(om_f, 4)
-    nnu_q = round(float(nnu), 3)
+    nnu_f = max(float(nnu), 0.1)
+    nnu_q = round(nnu_f, 3)
+    h0_f = max(float(h0_kms_mpc), 20.0)
+    h0_q = round(h0_f, 2)
+    near_planck_h0 = abs(h0_f - _PLANCK_H0) <= 0.02
 
+    spline = None
+    sp_pair: Optional[Tuple[CubicSpline, CubicSpline]] = None
     with _CAMB_LUT_LOCK:
-        exact = _EXACT_CAMB_CURVES.get((om_q, nnu_q))
+        exact = _EXACT_CAMB_CURVES.get((om_q, nnu_q, h0_q))
         if exact is not None:
             return exact.copy()
-        spline = _CAMB_DDR5_SPLINES.get(nnu_q) if (_CAMB_OMEGA_MIN <= om_f <= _CAMB_OMEGA_MAX) else None
+        if near_planck_h0 and (_CAMB_OMEGA_MIN <= om_f <= _CAMB_OMEGA_MAX):
+            spline = _CAMB_DDR5_SPLINES.get(nnu_q)
+            if spline is None and (2.50 <= nnu_f <= 3.80):
+                sp0 = _CAMB_DDR5_SPLINES.get(3.044)
+                sp1 = _CAMB_DDR5_SPLINES.get(3.303)
+                if sp0 is not None and sp1 is not None:
+                    sp_pair = (sp0, sp1)
 
     if spline is not None:
         dl_interp = np.asarray(spline(om_f), dtype=np.float64)
         if np.all(np.isfinite(dl_interp)):
             np.maximum(dl_interp, 0.0, out=dl_interp)
             return dl_interp
+    elif sp_pair is not None:
+        w = (nnu_f - 3.044) / (3.303 - 3.044)
+        dl_0 = np.asarray(sp_pair[0](om_f), dtype=np.float64)
+        dl_1 = np.asarray(sp_pair[1](om_f), dtype=np.float64)
+        dl_blend = (1.0 - w) * dl_0 + w * dl_1
+        if np.all(np.isfinite(dl_blend)):
+            np.maximum(dl_blend, 0.0, out=dl_blend)
+            return dl_blend
 
     if _is_async_camb_warming():
         return _provisional_camb_tt_curve(om_f, nnu_q)
 
-    return _cached_camb_tt_curve(om_q, nnu_q).copy()
+    return _cached_camb_tt_curve(om_q, nnu_q, h0_q).copy()
 
 
 def _get_planck_ref_spectrum() -> Tuple[np.ndarray, np.ndarray, float, float, np.ndarray]:
@@ -648,12 +698,12 @@ def _get_planck_ref_spectrum() -> Tuple[np.ndarray, np.ndarray, float, float, np
     ell = np.arange(2, 1001, dtype=np.float64)
     is_prov = False
     with _CAMB_LUT_LOCK:
-        has_ref = (0.314, 3.044) in _EXACT_CAMB_CURVES
+        has_ref = (0.314, 3.044, round(_PLANCK_H0, 2)) in _EXACT_CAMB_CURVES
     if (not has_ref) and _is_async_camb_warming():
         dl_ref_full = _provisional_camb_tt_curve(0.31397, 3.044)
         is_prov = True
     else:
-        dl_ref_full = _cached_camb_tt_curve(0.31397, 3.044)
+        dl_ref_full = _cached_camb_tt_curve(0.31397, 3.044, _PLANCK_H0)
     dl_obs = dl_ref_full[2:1001].copy()
     dl_obs[0] = 226.0  # Planck 2018 Commander observed quadrupole D_2 = 226 uK^2!
     pks_ref, _ = find_peaks(dl_ref_full[80:450], prominence=50.0)
@@ -667,38 +717,33 @@ def _get_planck_ref_spectrum() -> Tuple[np.ndarray, np.ndarray, float, float, np
     return res
 
 
-def _h0_for_pol_nnu_branch(nnu_q: float) -> float:
-    """Returns Planck acoustic-scale (`theta_*`) calibrated H0 for `(3.044 -> 67.4, 3.303 -> 69.0)`."""
-    return _PLANCK_H0_NNU_3303 if abs(float(nnu_q) - 3.303) < 0.05 else _PLANCK_H0
-
-
 def _camb_pol_lut_cache_signature() -> str:
     camb_ver = str(getattr(camb, "__version__", "no_camb")) if _HAS_CAMB else "no_camb"
     nodes_sig = ",".join(f"{x:.4f}" for x in _CAMB_DENSE_NODES)
     nnu_sig = ",".join(f"{n:.3f}" for n in _CAMB_NNU_BRANCHES)
     return (
-        f"v1_pol2500|camb={camb_ver}|H0={_PLANCK_H0:.4f},{_PLANCK_H0_NNU_3303:.4f}"
+        f"v2_pol2500|camb={camb_ver}|H0={_PLANCK_H0:.4f}"
         f"|ob={_PLANCK_OMEGA_B:.6f}|lmax={_CAMB_POL_LMAX}|nell={len(_CAMB_POL_ELL_GRID)}"
         f"|nnu={nnu_sig}|nodes={nodes_sig}"
     )
 
 
-def _cached_camb_pol_2500_curves(omega_m_q: float, nnu_q: float) -> np.ndarray:
+def _cached_camb_pol_2500_curves(omega_m_q: float, nnu_q: float, h0_q: float = _PLANCK_H0) -> np.ndarray:
     """
     Runs the genuine `CAMB` Fortran Einstein–Boltzmann polarization hierarchy (`l = 2..2500`)
     and extracts `[TT, TE, EE]` (`CAMB` `"total"` columns `[0, 3, 1]`) onto `_CAMB_POL_ELL_GRID`
     (`1251` multipoles `[2, 3, 4, 6, ..., 2500]`), returning shape `(3, 1251)` in `uK^2`.
     """
     om_key = round(float(omega_m_q), 4)
-    nnu_key = round(float(nnu_q), 3)
-    cache_key = (om_key, nnu_key)
+    nnu_key = round(max(float(nnu_q), 0.1), 3)
+    h0_key = round(max(float(h0_q), 20.0), 2)
+    cache_key = (om_key, nnu_key, h0_key)
     with _CAMB_LUT_LOCK:
         existing = _EXACT_CAMB_POL_CURVES.get(cache_key)
         if existing is not None:
             return existing
 
-    h0_branch = _h0_for_pol_nnu_branch(nnu_key)
-    h = h0_branch / 100.0
+    h = h0_key / 100.0
     omch2 = max((float(om_key) - _PLANCK_OMEGA_B) * (h * h), 1.0e-4)
 
     with _CAMB_FORTRAN_LOCK:
@@ -708,7 +753,7 @@ def _cached_camb_pol_2500_curves(omega_m_q: float, nnu_q: float) -> np.ndarray:
                 return existing
 
         pars = camb.set_params(
-            H0=h0_branch,
+            H0=float(h0_key),
             ombh2=0.02237,
             omch2=omch2,
             tau=0.0544,
@@ -725,7 +770,7 @@ def _cached_camb_pol_2500_curves(omega_m_q: float, nnu_q: float) -> np.ndarray:
         )
         if not np.all(np.isfinite(tot)):
             pars_safe = camb.set_params(
-                H0=h0_branch,
+                H0=float(h0_key),
                 ombh2=0.02237,
                 omch2=max(omch2, 2.5e-4),
                 tau=0.0544,
@@ -823,14 +868,15 @@ def load_camb_pol_lut_disk_cache(cache_path: Optional[Path] = None, force_reload
         sp_3044 = CubicSpline(nodes, pol_3044, axis=0, bc_type="not-a-knot", extrapolate=False)
         sp_3303 = CubicSpline(nodes, pol_3303, axis=0, bc_type="not-a-knot", extrapolate=False)
 
+        h0_k = round(_PLANCK_H0, 2)
         with _CAMB_LUT_LOCK:
             if force_reload:
                 _EXACT_CAMB_POL_CURVES.clear()
                 _PLANCK_POL_REF_CACHE = None
             for i, om in enumerate(nodes):
                 om_k = round(float(om), 4)
-                _EXACT_CAMB_POL_CURVES[(om_k, 3.044)] = pol_3044[i].copy()
-                _EXACT_CAMB_POL_CURVES[(om_k, 3.303)] = pol_3303[i].copy()
+                _EXACT_CAMB_POL_CURVES[(om_k, 3.044, h0_k)] = pol_3044[i].copy()
+                _EXACT_CAMB_POL_CURVES[(om_k, 3.303, h0_k)] = pol_3303[i].copy()
             _CAMB_POL_DDR5_SPLINES[3.044] = sp_3044
             _CAMB_POL_DDR5_SPLINES[3.303] = sp_3303
             _CAMB_POL_LUT_READY = True
@@ -862,8 +908,8 @@ def save_camb_pol_lut_disk_cache(
         return None
     target = Path(cache_path) if cache_path is not None else _CAMB_POL_LUT_DISK_CACHE_PATH
     nodes = np.array(_CAMB_DENSE_NODES, dtype=np.float64)
-    rows_3044 = [_cached_camb_pol_2500_curves(float(om), 3.044) for om in _CAMB_DENSE_NODES]
-    rows_3303 = [_cached_camb_pol_2500_curves(float(om), 3.303) for om in _CAMB_DENSE_NODES]
+    rows_3044 = [_cached_camb_pol_2500_curves(float(om), 3.044, _PLANCK_H0) for om in _CAMB_DENSE_NODES]
+    rows_3303 = [_cached_camb_pol_2500_curves(float(om), 3.303, _PLANCK_H0) for om in _CAMB_DENSE_NODES]
     raw_3044 = np.stack(rows_3044, axis=0)
     raw_3303 = np.stack(rows_3303, axis=0)
     mat_3044 = _quantize_pol_float32(raw_3044) if use_float32 else raw_3044.astype(np.float64, copy=False)
@@ -916,19 +962,31 @@ def _provisional_camb_pol_2500_curves(omega_m_eff: float, nnu: float) -> np.ndar
     return np.stack((tt, te, ee), axis=0)
 
 
-def _get_camb_pol_2500_fast(omega_m_eff: float, nnu: float) -> np.ndarray:
+def _get_camb_pol_2500_fast(omega_m_eff: float, nnu: float, h0_kms_mpc: float = _PLANCK_H0) -> np.ndarray:
     if not _CAMB_POL_LUT_READY:
         load_camb_pol_lut_disk_cache()
 
     om_f = float(omega_m_eff)
     om_q = round(om_f, 4)
-    nnu_q = round(float(nnu), 3)
+    nnu_f = max(float(nnu), 0.1)
+    nnu_q = round(nnu_f, 3)
+    h0_f = max(float(h0_kms_mpc), 20.0)
+    h0_q = round(h0_f, 2)
+    near_planck_h0 = abs(h0_f - _PLANCK_H0) <= 0.02
 
+    spline = None
+    sp_pair: Optional[Tuple[CubicSpline, CubicSpline]] = None
     with _CAMB_LUT_LOCK:
-        exact = _EXACT_CAMB_POL_CURVES.get((om_q, nnu_q))
+        exact = _EXACT_CAMB_POL_CURVES.get((om_q, nnu_q, h0_q))
         if exact is not None:
             return exact.copy()
-        spline = _CAMB_POL_DDR5_SPLINES.get(nnu_q) if (_CAMB_OMEGA_MIN <= om_f <= _CAMB_OMEGA_MAX) else None
+        if near_planck_h0 and (_CAMB_OMEGA_MIN <= om_f <= _CAMB_OMEGA_MAX):
+            spline = _CAMB_POL_DDR5_SPLINES.get(nnu_q)
+            if spline is None and (2.50 <= nnu_f <= 3.80):
+                sp0 = _CAMB_POL_DDR5_SPLINES.get(3.044)
+                sp1 = _CAMB_POL_DDR5_SPLINES.get(3.303)
+                if sp0 is not None and sp1 is not None:
+                    sp_pair = (sp0, sp1)
 
     if spline is not None:
         pol_interp = np.asarray(spline(om_f), dtype=np.float64)
@@ -936,11 +994,20 @@ def _get_camb_pol_2500_fast(omega_m_eff: float, nnu: float) -> np.ndarray:
             np.maximum(pol_interp[0], 0.0, out=pol_interp[0])
             np.maximum(pol_interp[2], 0.0, out=pol_interp[2])
             return pol_interp
+    elif sp_pair is not None:
+        w = (nnu_f - 3.044) / (3.303 - 3.044)
+        p0 = np.asarray(sp_pair[0](om_f), dtype=np.float64)
+        p1 = np.asarray(sp_pair[1](om_f), dtype=np.float64)
+        pol_blend = (1.0 - w) * p0 + w * p1
+        if np.all(np.isfinite(pol_blend)):
+            np.maximum(pol_blend[0], 0.0, out=pol_blend[0])
+            np.maximum(pol_blend[2], 0.0, out=pol_blend[2])
+            return pol_blend
 
     if _is_async_camb_warming():
         return _provisional_camb_pol_2500_curves(om_f, nnu_q)
 
-    return _cached_camb_pol_2500_curves(om_q, nnu_q).copy()
+    return _cached_camb_pol_2500_curves(om_q, nnu_q, h0_q).copy()
 
 
 def _get_planck_pol_2500_ref() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
@@ -952,12 +1019,12 @@ def _get_planck_pol_2500_ref() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.n
 
     is_prov = False
     with _CAMB_LUT_LOCK:
-        has_ref = (0.314, 3.044) in _EXACT_CAMB_POL_CURVES or (3.044 in _CAMB_POL_DDR5_SPLINES)
+        has_ref = (0.314, 3.044, round(_PLANCK_H0, 2)) in _EXACT_CAMB_POL_CURVES or (3.044 in _CAMB_POL_DDR5_SPLINES)
     if (not has_ref) and _is_async_camb_warming():
         ref_mat = _provisional_camb_pol_2500_curves(0.31397, 3.044)
         is_prov = True
     else:
-        ref_mat = _get_camb_pol_2500_fast(0.31397, 3.044)
+        ref_mat = _get_camb_pol_2500_fast(0.31397, 3.044, _PLANCK_H0)
 
     ell_2500 = _CAMB_POL_ELL_FLOAT.copy()
     tt_obs = ref_mat[0].copy()
@@ -971,15 +1038,21 @@ def _get_planck_pol_2500_ref() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.n
     return res
 
 
-def compute_cmb_polarization_2500(
+def _compute_cmb_polarization_2500_with_raw(
     mod: PhysicsMod,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
-    """
-    Computes the full `l = 2..2500` `CAMB` `[TT, TE, EE]` polarization power spectra `D_l [uK^2]`
-    from DDR5 `CubicSpline` LUTs in `< 0.2 ms`, applying consistent Euclidean catenoid waist
-    clamping `T_waist(l) = 1 - exp(-(l / l_cut)^2)` across `TT`, `TE`, and `EE` and evaluating
-    the primordial isocurvature bound `beta_iso`.
-    """
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    float,
+    float,
+    np.ndarray,
+]:
     omega_b = _PLANCK_OMEGA_B
     xi_tnap = 5.0 + 1.0 / math.pi
     omega_cdm_equiv = (
@@ -989,7 +1062,8 @@ def compute_cmb_polarization_2500(
     )
     omega_pleat_equiv = max(float(mod.parameters.pinned_pleat_coupling), 0.0) * xi_tnap * omega_b
     omega_m_eff = omega_b + omega_cdm_equiv + omega_pleat_equiv
-    nnu = 3.303 if (mod.parameters.pinned_pleat_coupling > 0.5 and not mod.parameters.has_cdm_halo) else 3.044
+    h0_mod = float(mod.parameters.h0_kms_mpc)
+    nnu = max(3.044 + float(mod.parameters.delta_neff_pleat), 0.1)
     ell_cut = max(float(mod.parameters.waist_clamping_ell), 0.0)
 
     if _HAS_CAMB:
@@ -999,7 +1073,7 @@ def compute_cmb_polarization_2500(
         te_obs = te_obs_ref.copy()
         ee_obs = ee_obs_ref.copy()
 
-        pol_mod = _get_camb_pol_2500_fast(omega_m_eff, nnu)
+        pol_raw = _get_camb_pol_2500_fast(omega_m_eff, nnu, h0_kms_mpc=h0_mod)
     else:  # pragma: no cover
         ell_2500 = _CAMB_POL_ELL_FLOAT.copy()
         ref_mat = _provisional_camb_pol_2500_curves(0.31397, 3.044)
@@ -1008,23 +1082,26 @@ def compute_cmb_polarization_2500(
         te_obs = ref_mat[1].copy()
         ee_obs = ref_mat[2].copy()
         ref_tt_p1 = float(np.max(ref_mat[0, _CAMB_POL_MASK_P1]))
-        pol_mod = _provisional_camb_pol_2500_curves(omega_m_eff, nnu)
-
-    # Calibrate overall primordial scalar amplitude A_s to Planck's 1st TT peak (preserving exact TE/TT & EE/TT physics)
-    mod_tt_p1 = float(np.max(pol_mod[0, _CAMB_POL_MASK_P1]))
-    if mod_tt_p1 > 1.0:
-        pol_mod *= ref_tt_p1 / mod_tt_p1
+        pol_raw = _provisional_camb_pol_2500_curves(omega_m_eff, nnu)
 
     # Apply infrared Euclidean catenoid waist clamping T_waist(l) = 1 - exp(-(l / l_cut)^2) across TT, TE, and EE
     if ell_cut > 0.05:
         t_waist = 1.0 - np.exp(-((ell_2500 / ell_cut) ** 2))
-        pol_mod *= t_waist[None, :]
+        pol_raw *= t_waist[None, :]
 
     # Optional ultralight Skyrme-pleat Jeans damping hook when m_pleat_ev is varied dynamically
     m_pleat_opt = getattr(mod.parameters, "m_pleat_ev", None)
     if m_pleat_opt is not None and float(m_pleat_opt) < 1.0e-15:
         j_env = skyrme_pleat_jeans_damping_envelope(ell_2500, float(m_pleat_opt))
-        pol_mod *= j_env[None, :]
+        pol_raw *= j_env[None, :]
+
+    pol_raw_clamped = pol_raw.copy()
+
+    # Calibrate display curves to Planck's 1st TT peak (preserving exact TE/TT & EE/TT physics)
+    pol_mod = pol_raw
+    mod_tt_p1 = float(np.max(pol_mod[0, _CAMB_POL_MASK_P1]))
+    if mod_tt_p1 > 1.0:
+        pol_mod *= ref_tt_p1 / mod_tt_p1
 
     tt_mod = pol_mod[0].copy()
     te_mod = pol_mod[1].copy()
@@ -1048,7 +1125,19 @@ def compute_cmb_polarization_2500(
         if ell_cut > 0.0
         else 0.0
     )
-    return ell_2500, tt_obs, tt_mod, te_obs, te_mod, ee_obs, ee_mod, te_corr, ee_ratio, beta_iso
+    return ell_2500, tt_obs, tt_mod, te_obs, te_mod, ee_obs, ee_mod, te_corr, ee_ratio, beta_iso, pol_raw_clamped
+
+
+def compute_cmb_polarization_2500(
+    mod: PhysicsMod,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+    """
+    Computes the full `l = 2..2500` `CAMB` `[TT, TE, EE]` polarization power spectra `D_l [uK^2]`
+    from DDR5 `CubicSpline` LUTs in `< 0.2 ms`, applying consistent Euclidean catenoid waist
+    clamping `T_waist(l) = 1 - exp(-(l / l_cut)^2)` across `TT`, `TE`, and `EE` and evaluating
+    the primordial isocurvature bound `beta_iso`.
+    """
+    return _compute_cmb_polarization_2500_with_raw(mod)[:10]
 
 
 def get_crucible_ddr5_ram_mb() -> float:
@@ -1105,14 +1194,15 @@ def compute_cmb_tt_spectrum(mod: PhysicsMod) -> tuple[np.ndarray, np.ndarray, np
     )
     omega_pleat_equiv = max(float(mod.parameters.pinned_pleat_coupling), 0.0) * xi_tnap * omega_b
     omega_m_eff = omega_b + omega_cdm_equiv + omega_pleat_equiv
-    nnu = 3.303 if (mod.parameters.pinned_pleat_coupling > 0.5 and not mod.parameters.has_cdm_halo) else 3.044
+    h0_mod = float(mod.parameters.h0_kms_mpc)
+    nnu = max(3.044 + float(mod.parameters.delta_neff_pleat), 0.1)
 
     if _HAS_CAMB:
         ell_ref, dl_obs_ref, ref_p1, ref_p2, ls_all = _get_planck_ref_spectrum()
         ell = ell_ref.copy()
         dl_obs = dl_obs_ref.copy()
 
-        dl_raw_full = _get_camb_tt_fast(omega_m_eff, nnu)
+        dl_raw_full = _get_camb_tt_fast(omega_m_eff, nnu, h0_kms_mpc=h0_mod)
 
         # Calibrate primordial scalar normalization A_s so the 1st acoustic peak matches Planck's observed D_{l1}
         pks_mod, _ = find_peaks(dl_raw_full[80:450], prominence=50.0)
@@ -1174,43 +1264,75 @@ _DESI_IS_DV = np.array([row[1] == "DV" for row in _DESI_DR2_BAO_DATA], dtype=boo
 _DESI_IS_DM = np.array([row[1] == "DM" for row in _DESI_DR2_BAO_DATA], dtype=bool)
 
 
-@lru_cache(maxsize=256)
-def compute_desi_dr2_bao_chi2(omega_m_q: float, w0_q: float, wa_q: float) -> Tuple[float, float]:
+@lru_cache(maxsize=512)
+def _eval_desi_dr2_bao_metrics(
+    omega_m_q: float,
+    w0_q: float,
+    wa_q: float,
+    h0_q: float = _PLANCK_H0,
+    nnu_q: float = 3.044,
+) -> Tuple[float, float, float, float]:
     """
-    Evaluates the active model's background expansion `(Omega_m_eff, w0, wa)` matching `astropy.cosmology.w0waCDM`
-    to `< 5e-16` relative precision via 64-point Gauss–Legendre quadrature (`~0.04 ms`) against the 13 published
-    DESI DR2 (2025) BAO distance ratios (`z = 0.295 .. 2.330`), profiling analytically over `r_d` (`dof = 12`).
+    Evaluates both the `r_d`-profiled shape BAO `chi^2/12` and the `CAMB` sound-horizon anchored
+    BAO `chi^2/13` using `H_0 = h0_q` across the 13 published DESI DR2 (2025) distance ratios.
     """
     c_kms = 299792.458
     om = float(np.clip(omega_m_q, 0.01, 0.95))
     ode = max(1.0 - om, 0.01)
     w0_f = float(w0_q)
     wa_f = float(wa_q)
+    h0_f = max(float(h0_q), 20.0)
+    nnu_f = max(float(nnu_q), 0.1)
 
     if abs((om + ode) - 1.0) < 1e-12:
         zp1 = 1.0 + _DESI_ZS
         de_exp = 3.0 * (1.0 + w0_f + wa_f)
         ez_end = np.sqrt(om * (zp1 ** 3) + ode * (zp1 ** de_exp) * np.exp(-3.0 * wa_f * _DESI_ZS / zp1))
-        dh_mpc = c_kms / (_PLANCK_H0 * ez_end)
+        dh_mpc = c_kms / (h0_f * ez_end)
 
         half_z = 0.5 * _DESI_ZS[:, None]
         z_grid = half_z * (_GL64_X[None, :] + 1.0)
         zp1_g = 1.0 + z_grid
         ez_g = np.sqrt(om * (zp1_g ** 3) + ode * (zp1_g ** de_exp) * np.exp(-3.0 * wa_f * z_grid / zp1_g))
-        dm_mpc = (c_kms / _PLANCK_H0) * (half_z[:, 0] * np.sum(_GL64_W[None, :] / ez_g, axis=1))
+        dm_mpc = (c_kms / h0_f) * (half_z[:, 0] * np.sum(_GL64_W[None, :] / ez_g, axis=1))
     else:  # pragma: no cover
-        cosmo = w0waCDM(H0=_PLANCK_H0, Om0=om, Ode0=ode, w0=w0_f, wa=wa_f)
+        cosmo = w0waCDM(H0=h0_f, Om0=om, Ode0=ode, w0=w0_f, wa=wa_f)
         dm_mpc = np.asarray(cosmo.comoving_transverse_distance(_DESI_ZS).value, dtype=np.float64)
         dh_mpc = c_kms / np.asarray(cosmo.H(_DESI_ZS).value, dtype=np.float64)
 
     dv_mpc = (_DESI_ZS * (dm_mpc ** 2) * dh_mpc) ** (1.0 / 3.0)
     pred_mpc = np.where(_DESI_IS_DV, dv_mpc, np.where(_DESI_IS_DM, dm_mpc, dh_mpc))
 
-    # Exact weighted least-squares profile over alpha_rd = 1 / r_d (in Mpc^-1)
+    # 1. Exact weighted least-squares profile over alpha_rd = 1 / r_d (in Mpc^-1), dof = 12
     alpha_best = float(np.sum(pred_mpc * _DESI_OBS * _DESI_INV_VAR) / max(np.sum(pred_mpc * pred_mpc * _DESI_INV_VAR), 1e-12))
     rd_best_mpc = 1.0 / max(alpha_best, 1e-6)
-    chi2 = float(np.sum(((pred_mpc * alpha_best - _DESI_OBS) / _DESI_SIG) ** 2))
-    return chi2 / 12.0, rd_best_mpc
+    chi2_shape_dof = float(np.sum(((pred_mpc * alpha_best - _DESI_OBS) / _DESI_SIG) ** 2)) / 12.0
+
+    # 2. CAMB sound-horizon anchored r_d calibrated at 147.09 Mpc for (om=0.31397, h0=67.36, nnu=3.044), dof = 13
+    h = h0_f / 100.0
+    h_ref = _PLANCK_H0 / 100.0
+    ombh2 = 0.02237
+    wm = ombh2 + max((om - _PLANCK_OMEGA_B) * (h * h), 1.0e-4)
+    wm_ref = ombh2 + (0.31397 - _PLANCK_OMEGA_B) * (h_ref * h_ref)
+    rd_camb_mpc = 147.09 * ((wm / wm_ref) ** (-0.255)) * ((nnu_f / 3.044) ** (-0.1072))
+    chi2_anchored_dof = float(np.sum(((pred_mpc / max(rd_camb_mpc, 1.0) - _DESI_OBS) / _DESI_SIG) ** 2)) / 13.0
+    return chi2_shape_dof, rd_best_mpc, chi2_anchored_dof, rd_camb_mpc
+
+
+def compute_desi_dr2_bao_chi2(
+    omega_m_q: float,
+    w0_q: float,
+    wa_q: float,
+    h0_q: float = _PLANCK_H0,
+    nnu_q: float = 3.044,
+) -> Tuple[float, float]:
+    """
+    Evaluates the active model's background expansion `(Omega_m_eff, w0, wa, H_0)` matching `astropy.cosmology.w0waCDM`
+    to `< 5e-16` relative precision via 64-point Gauss–Legendre quadrature (`~0.04 ms`) against the 13 published
+    DESI DR2 (2025) BAO distance ratios (`z = 0.295 .. 2.330`), profiling analytically over `r_d` (`dof = 12`).
+    """
+    chi2_shape_dof, rd_best_mpc, _, _ = _eval_desi_dr2_bao_metrics(omega_m_q, w0_q, wa_q, h0_q, nnu_q)
+    return chi2_shape_dof, rd_best_mpc
 
 
 def evaluate_observational_crucible(
@@ -1219,11 +1341,23 @@ def evaluate_observational_crucible(
     selected_galaxy_idx: int = 0,
 ) -> CrucibleReport:
     """
-    Runs the complete 5-dataset observational crucible against the active `PhysicsMod`
+    Runs the complete 7-row un-gameable observational crucible against the active `PhysicsMod`
     and its `SymPy`-compiled `CompiledMasterAction` using real published SPARC-175 MRT tables,
-    real `CAMB` Boltzmann acoustic transfer functions, and real `Astropy` DESI DR2 BAO distances.
+    real `CAMB` Boltzmann acoustic/polarization spectra (`H_0 = h0_kms_mpc`), Planck Knox `chi^2`,
+    primordial `BBN`, 3D linear growth `S_8`, cross-scale `NGC 3198` mass continuity, and `DESI DR2` BAO.
     """
     assert compiled.nu_numpy_fn is not None
+
+    h0_mod = float(mod.parameters.h0_kms_mpc)
+    delta_neff = float(mod.parameters.delta_neff_pleat)
+    nnu_mod = max(3.044 + delta_neff, 0.1)
+    xi_tnap = 5.0 + 1.0 / math.pi
+    omega_pleat_equiv = max(float(mod.parameters.pinned_pleat_coupling), 0.0) * xi_tnap * _PLANCK_OMEGA_B
+
+    knob_audit = count_mod_free_knobs(mod)
+    h0_audit = audit_single_h0_consistency(mod)
+    a0_h0_rel_mismatch = float(h0_audit["a0_h0_rel_mismatch"])
+    shoes_h0_sigma = float(h0_audit["shoes_h0_sigma"])
 
     galaxies_175 = get_sparc_175_cached()
     # 1. SPARC 175-Galaxy Rotation Curves & RAR (cached by compiled nu expression + halo/a0 params!)
@@ -1271,7 +1405,7 @@ def evaluate_observational_crucible(
                 _CACHED_GALAXY_FITS.clear()
             _CACHED_GALAXY_FITS[gal_key] = gal_fit
 
-    # 2. Planck 2018 CMB Acoustic & Polarization Spectra (Real CAMB TT l=2..1000 + TT/TE/EE l=2..2500!)
+    # 2. Planck 2018 CMB Acoustic & Polarization Spectra + Binned Knox chi^2 (l = 30..2500)
     ell, dl_obs, dl_mod, omega_m_eff, r32, d2_quad = compute_cmb_tt_spectrum(mod)
     (
         ell_2500,
@@ -1284,18 +1418,65 @@ def evaluate_observational_crucible(
         cmb_te_corr_2500,
         cmb_ee_peak_ratio,
         cmb_beta_iso,
-    ) = compute_cmb_polarization_2500(mod)
+        pol_raw_clamped,
+    ) = _compute_cmb_polarization_2500_with_raw(mod)
 
-    # 3. DESI DR2 (2025) BAO Distance Ladder via Astropy w0waCDM
+    knox_res = evaluate_planck_knox_chi2_2500(
+        ell_2500,
+        tt_obs_2500,
+        te_obs_2500,
+        ee_obs_2500,
+        pol_raw_clamped[0],
+        pol_raw_clamped[1],
+        pol_raw_clamped[2],
+    )
+    cmb_chi2_dof_fixed_ns = float(knox_res["chi2_dof_fixed_ns"])
+    cmb_chi2_dof_profiled_ns = float(knox_res["chi2_dof_profiled_ns"])
+    cmb_best_fit_ns = float(knox_res["best_fit_ns"])
+    cmb_high_l_tilt_pct = float(knox_res["high_l_tilt_pct"])
+
+    # 3. Primordial BBN (D/H & Y_p) + 3D Linear Growth S_8 + NGC 3198 Cross-Scale Continuity
+    omega_b_bbn = 0.02237 / ((_PLANCK_H0 / 100.0) ** 2)
+    bbn_res = evaluate_primordial_bbn(
+        omega_b=omega_b_bbn,
+        h0_kms_mpc=h0_mod,
+        delta_neff=delta_neff,
+    )
+    bbn_dh_e5 = float(bbn_res["dh_e5"])
+    bbn_yp = float(bbn_res["y_p"])
+    bbn_max_sigma = float(bbn_res["max_sigma"])
+    bbn_status = str(bbn_res["status"])
+
+    s8_res = evaluate_linear_growth_s8(mod, compiled.nu_numpy_fn, omega_m_eff)
+    lensing_s8_active = float(s8_res["s8_active"])
+    lensing_s8_gr_screened = float(s8_res["s8_gr_screened"])
+    lensing_s8_sigma = float(s8_res["s8_sigma"])
+    lensing_s8_signed_sigma = float(s8_res["s8_signed_sigma"])
+    s8_status = str(s8_res["status"])
+
+    cs_res = evaluate_cross_scale_mass_continuity(
+        mod=mod,
+        nu_numpy_fn=compiled.nu_numpy_fn,
+        galaxies_175=galaxies_175,
+        omega_pleat_equiv=omega_pleat_equiv,
+        omega_b=_PLANCK_OMEGA_B,
+    )
+    cross_scale_seam_open = bool(cs_res["cross_scale_seam_open"])
+    ngc3198_v_dc = float(cs_res["ngc3198_v_double_counted_kms"])
+    ngc3198_dc_sig = float(cs_res["ngc3198_double_count_sigma"])
+
+    # 4. DESI DR2 (2025) BAO Distance Ladder (both r_d-profiled shape & CAMB r_d-anchored at H_0 = h0_mod)
     w0 = float(mod.parameters.w0_de)
     wa = float(mod.parameters.wa_de)
-    desi_chi2_dof, _ = compute_desi_dr2_bao_chi2(
+    desi_chi2_dof, rd_best_mpc, desi_anchored_chi2_dof, rd_camb_mpc = _eval_desi_dr2_bao_metrics(
         round(float(omega_m_eff), 4),
         round(w0, 3),
         round(wa, 3),
+        round(h0_mod, 2),
+        round(nnu_mod, 3),
     )
 
-    # 4. Gaia DR4 Wide-Binary |z_gal| Curves (Conservative 3D Two-Body QUMOND, Zenodo 10.5281/zenodo.23919217)
+    # 5. Gaia DR4 Wide-Binary |z_gal| Curves (Conservative 3D Two-Body QUMOND, Zenodo 10.5281/zenodo.23919217)
     wb = compute_wide_binary_efe_curves(
         compiled.nu_numpy_fn,
         mod.parameters.a0_si,
@@ -1309,7 +1490,7 @@ def evaluate_observational_crucible(
     gc_split = float(wb.get("compass_split_15k_pct", 0.0))
     zenodo_doi = str(wb.get("zenodo_doi", "10.5281/zenodo.23919217"))
 
-    # 5. 3D Catenoid Kibble-Zurek Freeze-Out & Red-Team Cosmology Diagnostics (Milestone 5B)
+    # 6. 3D Catenoid Kibble-Zurek Freeze-Out & Red-Team Cosmology Diagnostics (Milestone 5B)
     kz_sum = get_catenoid_freezeout_crucible_summary(mod)
     xi_kz_mod = float(kz_sum["xi_kz_at_mod_waist"])
     xi_kz_min = float(kz_sum["xi_min_sweep"])
@@ -1319,24 +1500,33 @@ def evaluate_observational_crucible(
     qh_pos = float(kz_sum["qh_net_chiral_pos"])
     kz_dep = bool(kz_sum["xi_depends_on_throat_scale"])
     kz_match = bool(kz_sum["matches_5_plus_inv_pi_within_10pct"])
-    omega_pleat_eff = max(0.0, float(omega_m_eff) - 0.0490)
 
     badges: List[CrucibleBadge] = []
 
     # -------------------------------------------------------------------------
-    # BADGE 1: SPARC 175-Galaxy Rotation Curves (Real Lelli+ 2016 MRT Catalog)
+    # ROW 1: SPARC 175-Galaxy Rotation Curves + Cross-Scale Mass Continuity
     # -------------------------------------------------------------------------
     if sparc_passed and not mod.parameters.has_cdm_halo:
-        sparc_status = "PASS"
-        pleat_halo_note = (
-            f" Open seam: assumes cosmic pleats/dust (Omega_pleat={omega_pleat_eff:.3f} in CMB) remain unclustered in galaxy halos (avoiding double-counting)."
-            if mod.parameters.pinned_pleat_coupling > 0.1
-            else ""
-        )
-        sparc_detail = (
-            f"Zero dark-halo knobs! Fits 175 real SPARC galaxies from baryons with 0.11 dex Spitzer [3.6] IMF prior "
-            f"(median chi²_red = {med_chi2:.2f}, RAR = {rar_dex:.3f} dex vs 0.130 dex observed).{pleat_halo_note}"
-        )
+        if cross_scale_seam_open:
+            sparc_status = "WARN"
+            sparc_detail = (
+                f"Fits 175 SPARC galaxies from baryons (med chi² = {med_chi2:.2f} | {rar_dex:.3f} dex), "
+                f"but Open seam: assumes cosmic pleats/dust (Omega_pleat={omega_pleat_equiv:.3f} in CMB) remain "
+                f"unclustered in halos; including unscreened Omega_pleat blows NGC 3198 up to {ngc3198_v_dc:.0f} km/s "
+                f"({ngc3198_dc_sig:.0f}σ double-count seam)!"
+            )
+        else:
+            sparc_status = "PASS"
+            scr_note = (
+                f" Explicit halo screening L_scr={mod.parameters.pleat_screening_mpc:.2f} Mpc (+1 free knob) "
+                f"prevents cosmic-pleat halo collapse (NGC 3198 {ngc3198_v_dc:.0f} km/s)."
+                if (omega_pleat_equiv > 0.01 and mod.parameters.pleat_screening_mpc >= 0.05)
+                else ""
+            )
+            sparc_detail = (
+                f"Zero dark-halo knobs! Fits 175 real SPARC galaxies from baryons with 0.11 dex Spitzer [3.6] IMF prior "
+                f"(median chi²_red = {med_chi2:.2f}, RAR = {rar_dex:.3f} dex vs 0.130 dex observed).{scr_note}"
+            )
     elif sparc_passed and mod.parameters.has_cdm_halo:
         sparc_status = "WARN"
         sparc_detail = (
@@ -1358,52 +1548,112 @@ def evaluate_observational_crucible(
     ))
 
     # -------------------------------------------------------------------------
-    # BADGE 2: Planck 2018 CMB Acoustic Peak 3, TE/EE Polarization & Waist Adiabaticity (Real CAMB!)
+    # ROW 2: Planck 2018 CMB (CAMB TT/TE/EE, Knox chi²/ν & Waist Adiabaticity)
     # -------------------------------------------------------------------------
     r32_ok = 0.86 <= r32 <= 1.12
     pol_ok = (cmb_te_corr_2500 >= 0.90) and (0.85 <= cmb_ee_peak_ratio <= 1.15)
     iso_ok = cmb_beta_iso < 0.038
-    if (not r32_ok) or (not pol_ok) or (not iso_ok):
+    if (not r32_ok) or (not pol_ok) or (not iso_ok) or (cmb_chi2_dof_profiled_ns > 2.5):
         cmb_status = "FAIL"
         cmb_detail = (
-            f"CAMB BOLTZMANN FAILURE: R_32 = {r32:.2f} (Planck = 0.98), TE r={cmb_te_corr_2500:.3f}, "
+            f"CAMB BOLTZMANN FAILURE: R_32 = {r32:.2f} (Planck = 0.98), Knox chi²/ν = {cmb_chi2_dof_fixed_ns:.2f} "
+            f"(profiled {cmb_chi2_dof_profiled_ns:.2f} @ n_s={cmb_best_fit_ns:.4f}), TE r={cmb_te_corr_2500:.3f}, "
             f"EE={cmb_ee_peak_ratio:.2f}x (l<=2500), beta_iso={cmb_beta_iso:.4f} (Planck 95% CL < 0.038)! "
             f"Silk damping / acoustic phase shift or non-adiabatic waist cutoff violates Planck 2018 TT/TE/EE."
         )
-    elif mod.parameters.pinned_pleat_coupling > 0.1 and not mod.parameters.has_cdm_halo:
+    elif (cmb_chi2_dof_fixed_ns > 1.25) or cross_scale_seam_open or (xi_kz_mod > 0.0 and kz_dep):
         cmb_status = "WARN"
-        kz_clause = (
-            f"3D KZ quench gives xi={xi_kz_mod:.2f} in [{xi_kz_min:.2f},{xi_kz_max:.2f}] (r0/lS-dependent, not locked to 5+1/pi=5.32; sym <Q_H>={qh_sym:+.2f})"
-            if xi_kz_mod > 0.0
-            else "dust-to-MOND nonlinear galaxy screening unclosed"
-        )
+        beta_str = f"beta_iso={cmb_beta_iso:.4f}<0.02" if cmb_beta_iso < 0.02 else f"beta_iso={cmb_beta_iso:.4f}"
+        if xi_kz_mod > 0.0:
+            kz_clause = (
+                f"3D KZ quench gives xi={xi_kz_mod:.2f} in [{xi_kz_min:.2f},{xi_kz_max:.2f}] "
+                f"(r0/lS-dependent, not locked to 5+1/pi=5.32; sym <Q_H>={qh_sym:+.2f})"
+            )
+        elif cross_scale_seam_open:
+            kz_clause = "dust-to-MOND nonlinear galaxy screening unclosed"
+        else:
+            kz_clause = f"Knox chi²/ν={cmb_chi2_dof_fixed_ns:.2f} (prof {cmb_chi2_dof_profiled_ns:.2f} @ n_s={cmb_best_fit_ns:.4f})"
         neff_clause = (
-            "; N_eff=3.303 Silk tilt (H0=69 pol shift, dchi²~+218 w/o refit n_s & ~2.9σ BBN unless post-BBN)"
-            if mod.parameters.waist_clamping_ell > 0.5
-            else ""
+            f"; N_eff={nnu_mod:.3f} Silk tilt ({cmb_high_l_tilt_pct:+.1f}%, Knox chi²/ν={cmb_chi2_dof_fixed_ns:.2f} -> "
+            f"{cmb_chi2_dof_profiled_ns:.2f} @ n_s={cmb_best_fit_ns:.4f})"
+            if abs(delta_neff) > 0.02
+            else f"; Knox chi²/ν={cmb_chi2_dof_fixed_ns:.2f} (prof {cmb_chi2_dof_profiled_ns:.2f})"
+        )
+        scr_tail = (
+            "; Mpc S_8 & halo-pleat screening."
+            if cross_scale_seam_open
+            else f"; H_0={h0_mod:.2f} km/s/Mpc, L_scr={mod.parameters.pleat_screening_mpc:.2f} Mpc."
         )
         cmb_detail = (
-            f"CAMB w/ Omega_m = {omega_m_eff:.5f} gives R_32={r32:.2f}, catenoid waist D_2={d2_quad:.0f} uK² "
+            f"CAMB (H_0={h0_mod:.2f}, Omega_m={omega_m_eff:.5f}) gives R_32={r32:.2f}, waist D_2={d2_quad:.0f} uK² "
             f"(Planck 226 uK²), TE r={cmb_te_corr_2500:.3f}, EE={cmb_ee_peak_ratio:.2f}x (l<=2500), "
-            f"beta_iso={cmb_beta_iso:.4f}<0.02; open seams: {kz_clause}{neff_clause}; Mpc S_8 & halo-pleat screening."
+            f"{beta_str}; open seams: {kz_clause}{neff_clause}{scr_tail}"
         )
     else:
         cmb_status = "PASS"
         cmb_detail = (
-            f"CAMB Boltzmann matches TT/TE/EE out to l=2500 (Omega_m={omega_m_eff:.4f}, R_32={r32:.2f}, "
-            f"TE r={cmb_te_corr_2500:.3f}, EE={cmb_ee_peak_ratio:.2f}x). "
+            f"CAMB Boltzmann (H_0={h0_mod:.2f}) matches TT/TE/EE out to l=2500 (Omega_m={omega_m_eff:.4f}, R_32={r32:.2f}, "
+            f"Knox chi²/ν={cmb_chi2_dof_fixed_ns:.2f}, TE r={cmb_te_corr_2500:.3f}, EE={cmb_ee_peak_ratio:.2f}x). "
             f"Quadrupole D_2 = {d2_quad:.0f} uK² vs Planck 226 uK² ({'clamped' if d2_quad < 500 else 'unclamped ~2.2 sigma cosmic variance'})."
         )
     badges.append(CrucibleBadge(
         badge_id="planck_cmb",
         dataset_name="Planck 2018 CMB (CAMB TT/TE/EE)",
         status=cmb_status,
-        headline_metric=f"R_32 = {r32:.2f} | TE r = {cmb_te_corr_2500:.3f} | D_2 = {d2_quad:.0f} uK²",
+        headline_metric=(
+            f"R_32={r32:.2f} | χ²/ν={cmb_chi2_dof_fixed_ns:.2f} ({cmb_chi2_dof_profiled_ns:.2f}) "
+            f"| TE r={cmb_te_corr_2500:.3f} | D_2={d2_quad:.0f}"
+        ),
         detail_honest=cmb_detail,
     ))
 
     # -------------------------------------------------------------------------
-    # BADGE 3: Solar-System Ephemerides (Cassini + Saturn 9.58 AU) & GW170817
+    # ROW 3: Primordial BBN (Deuterium D/H & Helium-4 Y_p)
+    # -------------------------------------------------------------------------
+    bbn_detail = (
+        f"AlterBBN/Pitrou+ response at eta_10={float(bbn_res['eta_10']):.2f} (H_0={h0_mod:.2f}), "
+        f"N_eff={nnu_mod:.3f} (Delta N_eff={delta_neff:+.3f}): D/H={bbn_dh_e5:.3f}e-5 vs Cooke/PDG 2.547±0.025e-5 "
+        f"({float(bbn_res['dh_sigma']):+.2f}σ), Y_p={bbn_yp:.4f} vs PDG 0.2453±0.0034 ({float(bbn_res['yp_sigma']):+.2f}σ), "
+        f"joint Planck+BBN N_eff squeeze = {float(bbn_res['neff_bbn_sigma']):.2f}σ (max={bbn_max_sigma:.2f}σ)."
+    )
+    badges.append(CrucibleBadge(
+        badge_id="bbn_abundances",
+        dataset_name="Primordial BBN (D/H & He-4)",
+        status=bbn_status,
+        headline_metric=f"D/H={bbn_dh_e5:.2f}e-5 | Y_p={bbn_yp:.4f}",
+        detail_honest=bbn_detail,
+    ))
+
+    # -------------------------------------------------------------------------
+    # ROW 4: 3D Linear Matter Growth & Weak-Lensing S_8 (DES Y3 / KiDS-1000)
+    # -------------------------------------------------------------------------
+    l_scr = float(mod.parameters.pleat_screening_mpc)
+    if bool(s8_res["nu_boost_active"]) and l_scr <= 0.0:
+        s8_detail = (
+            f"UNSCREENED COSMIC-WEB QUMOND BLOWOUT: Without an explicit Mpc screening scale (pleat_screening_mpc=0), "
+            f"low-acceleration nu(g_N/a_0) boosts 8 Mpc/h linear growth from GR S_8={lensing_s8_gr_screened:.3f} "
+            f"to S_8={lensing_s8_active:.3f} ({lensing_s8_signed_sigma:+.1f}σ vs DES Y3/KiDS 0.776±0.017)!"
+        )
+    elif bool(s8_res["nu_boost_active"]) and l_scr > 0.0:
+        s8_detail = (
+            f"Explicit Mpc screening L_scr={l_scr:.2f} Mpc (+1 free knob) suppresses cosmic-web MOND on k*L_scr<<1: "
+            f"S_8={lensing_s8_active:.3f} (GR baseline {lensing_s8_gr_screened:.3f}, {lensing_s8_signed_sigma:+.2f}σ vs DES Y3/KiDS 0.776±0.017)."
+        )
+    else:
+        s8_detail = (
+            f"Pure GR linear growth (Omega_m={omega_m_eff:.4f}, H_0={h0_mod:.2f}) gives sigma_8={float(s8_res['sigma8_active']):.3f}, "
+            f"S_8={lensing_s8_active:.3f} ({lensing_s8_signed_sigma:+.2f}σ vs joint DES Y3/KiDS-1000 0.776±0.017)."
+        )
+    badges.append(CrucibleBadge(
+        badge_id="lensing_s8",
+        dataset_name="3D Matter Growth & Lensing S_8",
+        status=s8_status,
+        headline_metric=f"S_8 = {lensing_s8_active:.3f} ({lensing_s8_sigma:.1f}σ)",
+        detail_honest=s8_detail,
+    ))
+
+    # -------------------------------------------------------------------------
+    # ROW 5: Solar-System Ephemerides (Cassini + Saturn 9.58 AU) & GW170817
     # -------------------------------------------------------------------------
     gw_ok = compiled.gw_speed_deviation <= 3.0e-15
     ppn_ok = (abs(compiled.ppn_gamma - 1.0) <= 2.3e-5) and (abs(compiled.ppn_beta - 1.0) <= 8.0e-5)
@@ -1437,31 +1687,40 @@ def evaluate_observational_crucible(
     ))
 
     # -------------------------------------------------------------------------
-    # BADGE 4: DESI DR2 BAO (Astropy w0waCDM) & Honest Hubble Tension Audit
+    # ROW 6: DESI DR2 BAO (Shape + Sound-Horizon Anchored) & Single-H_0 Tension
     # -------------------------------------------------------------------------
     desi_thawing = (w0 > -0.99) and (wa < -0.05)
-    if desi_chi2_dof > 3.5:
+    if (desi_chi2_dof > 3.5) or (desi_anchored_chi2_dof > 3.5):
         desi_status = "FAIL"
         desi_detail = (
-            f"DESI DR2 BAO FAILURE (chi²/dof = {desi_chi2_dof:.1f} across z=0.30..2.33 via Astropy w0waCDM): "
-            f"Omega_m_eff = {omega_m_eff:.3f} cannot reproduce observed comoving BAO distance ratios D_M/r_d & D_H/r_d!"
+            f"DESI DR2 BAO FAILURE at H_0={h0_mod:.2f} km/s/Mpc: shape chi²/12={desi_chi2_dof:.2f}, "
+            f"CAMB r_d-anchored chi²/13={desi_anchored_chi2_dof:.2f} (r_d,CAMB={rd_camb_mpc:.1f} vs BAO-fit {rd_best_mpc:.1f} Mpc; "
+            f"SH0ES gap={shoes_h0_sigma:.1f}σ, a_0/H_0 mismatch={a0_h0_rel_mismatch * 100.0:.2f}%)!"
+        )
+    elif (desi_chi2_dof <= 2.0) and (desi_anchored_chi2_dof <= 2.0) and (shoes_h0_sigma <= 2.0):
+        desi_status = "PASS"
+        desi_detail = (
+            f"DESI DR2 13-pt BAO shape chi²/12={desi_chi2_dof:.2f}, anchored chi²/13={desi_anchored_chi2_dof:.2f} "
+            f"(r_d={rd_camb_mpc:.1f} Mpc) & SH0ES H_0={h0_mod:.2f} ({shoes_h0_sigma:.1f}σ) simultaneously satisfied."
         )
     else:
         desi_status = "WARN"
         desi_detail = (
-            f"DESI DR2 13-pt BAO chi²/dof = {desi_chi2_dof:.2f} ({'matches thawing w0>-1, wa<0' if desi_thawing else 'flat w=-1 baseline'}), "
-            f"while the ~5-sigma Planck (67.4) vs SH0ES Cepheid (73.0 km/s/Mpc) H_0 tension remains open."
+            f"DESI DR2 13-pt BAO shape chi²/12={desi_chi2_dof:.2f}, r_d-anchored chi²/13={desi_anchored_chi2_dof:.2f} "
+            f"({'matches thawing w0>-1, wa<0' if desi_thawing else 'flat w=-1 baseline'}; r_d={rd_camb_mpc:.1f} Mpc), "
+            f"while single H_0={h0_mod:.2f} leaves {shoes_h0_sigma:.1f}σ SH0ES Cepheid (73.04±1.04) tension open "
+            f"(a_0/H_0 mismatch={a0_h0_rel_mismatch * 100.0:.2f}%)."
         )
     badges.append(CrucibleBadge(
         badge_id="desi_h0",
         dataset_name="DESI DR2 BAO & H_0 Tension",
         status=desi_status,
-        headline_metric=f"BAO chi²/ν={desi_chi2_dof:.2f} | w0={w0:+.2f}",
+        headline_metric=f"BAO χ²/ν={desi_chi2_dof:.2f} (anc {desi_anchored_chi2_dof:.2f}) | H_0={h0_mod:.2f}",
         detail_honest=desi_detail,
     ))
 
     # -------------------------------------------------------------------------
-    # BADGE 5: Dec 2, 2026 Gaia DR4 Wide-Binary 3D QUMOND Falsification Pipeline
+    # ROW 7: Dec 2, 2026 Gaia DR4 Wide-Binary 3D QUMOND Falsification Pipeline
     # -------------------------------------------------------------------------
     if halo_boost > 5.0:
         wb_status = "FORECAST"
@@ -1527,6 +1786,26 @@ def evaluate_observational_crucible(
         cmb_qh_net_chiral_pos=qh_pos,
         cmb_kz_depends_on_r0=kz_dep,
         cmb_kz_matches_target_10pct=kz_match,
+        h0_consistent_kms_mpc=h0_mod,
+        a0_h0_rel_mismatch=a0_h0_rel_mismatch,
+        cmb_chi2_dof_fixed_ns=cmb_chi2_dof_fixed_ns,
+        cmb_chi2_dof_profiled_ns=cmb_chi2_dof_profiled_ns,
+        cmb_best_fit_ns=cmb_best_fit_ns,
+        cmb_high_l_tilt_pct=cmb_high_l_tilt_pct,
+        bbn_dh_e5=bbn_dh_e5,
+        bbn_yp=bbn_yp,
+        bbn_max_sigma=bbn_max_sigma,
+        lensing_s8_active=lensing_s8_active,
+        lensing_s8_gr_screened=lensing_s8_gr_screened,
+        lensing_s8_sigma=lensing_s8_sigma,
+        cross_scale_seam_open=cross_scale_seam_open,
+        ngc3198_v_double_counted_kms=ngc3198_v_dc,
+        ngc3198_double_count_sigma=ngc3198_dc_sig,
+        free_action_literals=int(knob_audit["action_literal_count"]),
+        free_global_knobs=int(knob_audit["global_knob_total"]),
+        per_galaxy_halo_knobs=int(knob_audit["per_galaxy_halo_knobs"]),
+        knob_audit_summary=str(knob_audit["summary_label"]),
+        desi_bao_anchored_chi2_dof=desi_anchored_chi2_dof,
     )
 
 

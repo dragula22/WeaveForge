@@ -31,3 +31,6 @@ waist_clamping_ell = 0.0
 pinned_pleat_coupling = 0.0
 w0_de = -1.0
 wa_de = 0.0
+h0_kms_mpc = 67.36
+delta_neff_pleat = 0.0
+pleat_screening_mpc = 0.0

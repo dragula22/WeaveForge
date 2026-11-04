@@ -48,6 +48,7 @@ def _cmd_worker(args: argparse.Namespace) -> int:
 
 def _cmd_audit(_args: argparse.Namespace) -> int:
     from weaveforge.arenas.arena4_cosmic_crucible import evaluate_observational_crucible
+    from weaveforge.core.bhex_ringdown import get_kerr_lvk_ringdown_audit
     from weaveforge.core.frameworks import load_all_mods
     from weaveforge.core.symbolic_compiler import (
         compile_master_action,
@@ -55,18 +56,19 @@ def _cmd_audit(_args: argparse.Namespace) -> int:
     )
 
     print("================================================================================")
-    print(" WEAVEFORGE FOUNDATIONAL SYMPY ALGEBRAIC IDENTITIES AUDIT")
+    print(" WEAVEFORGE v1.0.0 — FOUNDATIONAL SYMPY ALGEBRAIC IDENTITIES AUDIT")
     print("================================================================================")
     proofs = verify_foundational_tnap_identities()
     for k, v in proofs.items():
         print(f"  * {k:34s}: {v}")
 
     print("\n================================================================================")
-    print(" COMPETING PHYSICS MODS — 5-GATE HEALTH AUDIT & 5-DATASET OBSERVATIONAL CRUCIBLE")
+    print(" COMPETING PHYSICS MODS — 5-GATE AUDIT, AST KNOBS & 7-DATASET WIND TUNNEL")
     print("================================================================================")
     for mod in load_all_mods():
         comp = compile_master_action(mod)
         rep = evaluate_observational_crucible(mod, comp)
+        lvk = get_kerr_lvk_ringdown_audit(mod, spin_a=0.67)
         if not comp.all_critical_passed:
             crit = "REJECTED BY RED-TEAM"
         elif comp.has_warnings or not comp.all_gates_passed:
@@ -77,7 +79,12 @@ def _cmd_audit(_args: argparse.Namespace) -> int:
         print(
             f"  Health: {crit} | PPN gamma={comp.ppn_gamma:.5f} | "
             f"2PN Shadow={comp.shadow_radius_rg:.4f} r_g ({comp.shadow_vs_gr_pct:+.2f}%) | "
-            f"Omega_m_eff={rep.omega_m_effective:.5f}"
+            f"Single H0={rep.h0_consistent_kms_mpc:.2f} km/s/Mpc"
+        )
+        print(
+            f"  Knobs : {rep.knob_audit_summary} | "
+            f"Spinning LVK O4 (a=0.67): [{lvk['lvk_status']}] "
+            f"IMR={float(lvk['gw150914_imr_sigma']):.2f}s, O4_TGR={float(lvk['lvk_o4_hierarchical_sigma']):.2f}s"
         )
         for b in rep.badges:
             print(f"    [{b.status:8s}] {b.dataset_name:32s} -> {b.headline_metric}")

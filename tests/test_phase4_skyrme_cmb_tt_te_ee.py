@@ -149,8 +149,14 @@ def test_real_camb_2500_multipole_tt_te_ee_polarization_crucible() -> None:
         assert rep.cmb_te_mod_2500.shape == rep.cmb_ell_2500.shape
         assert rep.cmb_ee_mod_2500.shape == rep.cmb_ell_2500.shape
 
-    assert tnap_rep.cmb_te_corr_2500 > 0.995
+    # At single consistent global H0 = 67.36 km/s/Mpc (zero H0=69 split):
+    # pre-BBN N_eff = 3.303 gives TE r ~ 0.990 > 0.985, while post-BBN delta_neff_pleat = 0.0 gives > 0.999
+    assert tnap_rep.cmb_te_corr_2500 > 0.985
     assert cdm_rep.cmb_te_corr_2500 > 0.995
+    tnap_post_bbn = mods["tnap_weave"].clone(new_id="tnap_post_bbn_pol")
+    tnap_post_bbn.parameters.delta_neff_pleat = 0.0
+    tnap_post_rep = evaluate_observational_crucible(tnap_post_bbn, compile_master_action(tnap_post_bbn))
+    assert tnap_post_rep.cmb_te_corr_2500 > 0.999
     assert 0.92 <= tnap_rep.cmb_ee_peak_ratio <= 1.08
     assert 0.92 <= cdm_rep.cmb_ee_peak_ratio <= 1.08
     assert 0.0 < tnap_rep.cmb_beta_iso < 0.02

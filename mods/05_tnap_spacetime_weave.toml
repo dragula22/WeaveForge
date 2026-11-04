@@ -37,3 +37,6 @@ waist_clamping_ell = 3.21     # Two-wing CPT catenoid Big Bang waist suppresses 
 pinned_pleat_coupling = 1.0   # Uncharged SO(3) hoop-buckling pleats (xi = 5 + 1/pi -> Omega_m = 0.30941)!
 w0_de = -0.91                 # Thawing horizon tension tested against DESI DR2
 wa_de = -0.28
+h0_kms_mpc = 67.36            # Single consistent global Planck 2018 H0 across a0, CAMB, BAO, BBN & S8!
+delta_neff_pleat = 0.259      # Pre-BBN pleat radiation species (N_eff = 3.303; set 0.0 for post-BBN pleats)
+pleat_screening_mpc = 0.0     # Explicit halo/Mpc pleat screening scale L_screen (0.0 = unclosed cross-scale seam!)

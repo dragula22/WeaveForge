@@ -31,7 +31,9 @@ from typing import Dict, Optional, Tuple
 import moderngl
 import numpy as np
 
+from weaveforge.core.bhex_ringdown import get_bhex_ringdown_summary
 from weaveforge.core.camera import Camera3D
+from weaveforge.core.frameworks import PhysicsMod
 from weaveforge.core.symbolic_compiler import CompiledMasterAction
 
 
@@ -84,6 +86,7 @@ uniform float u_probe_alt_km;     // Orbital clock altitude in [0, 40000] km
 uniform float u_fbo_h;            // Active render-target height for sub-pixel-safe BHEX ring gauge
 uniform float u_spool_reflectivity; // Gibbons Planck-spool throat reflectivity R in [0.0, 1.0]
 uniform float u_qnm_freq_ratio;     // Active mod QNM frequency ratio omega_220 / omega_220_GR
+uniform int u_has_horizon;          // 1 = Event-horizon BH (Kerr), 0 = Smooth horizonless throat (Kerr-Weave)
 
 vec3 aces_tonemap(vec3 x) {{
     const float a = 2.51;
@@ -492,7 +495,12 @@ void main() {{
                 + 0.6521452 * (eval_optical_n(1.0 / r_g2) + eval_optical_n(1.0 / r_g3))
             );
 
-            // Lapse-colored BSSN spatial embedding surface + conformal polar (r, phi) grid
+            // Relativistic Azreg-Ainou / Lense-Thirring frame-dragging swirl along the funnel:
+            float spin_eff = clamp(u_spin_a, 0.0, 0.998);
+            float drag_twist = 2.65 / (r * r + 0.42 * r_ph * r_ph);
+            float phi_drag = phi - spin_eff * drag_twist - 0.35 * spin_eff * u_time / (r * sqrt(r) + 0.65);
+
+            // Lapse-colored BSSN spatial embedding surface + frame-dragged conformal polar (r, phi) grid
             vec3 c_throat = vec3(0.52, 0.11, 0.25);
             vec3 c_mid    = vec3(0.08, 0.30, 0.62);
             vec3 c_flat   = vec3(0.05, 0.18, 0.34);
@@ -504,7 +512,7 @@ void main() {{
 
             float g_rad = abs(fract(r) - 0.5);
             float line_r = exp(-(g_rad * g_rad) * 220.0);
-            float g_phi = abs(fract(phi * (16.0 / 6.2831853)) - 0.5);
+            float g_phi = abs(fract(phi_drag * (16.0 / 6.2831853)) - 0.5);
             float line_p = exp(-(g_phi * g_phi) * 260.0) * smoothstep(0.25, 0.95, r);
             float conf_grid = max(line_r, line_p);
 
@@ -512,21 +520,23 @@ void main() {{
             float ndl = 0.28 + 0.72 * max(dot(n_surf, light_dir), 0.0);
             float fres = pow(max(1.0 - clamp(dot(n_surf, -rd), 0.0, 1.0), 0.0), 2.6);
             vec3 surf_col = base_f * ndl
-                          + vec3(0.14, 0.56, 0.92) * conf_grid * (0.28 + 0.35 * alpha_lapse)
+                          + vec3(0.14, 0.56, 0.92) * conf_grid * (0.28 + 0.35 * alpha_lapse + 0.22 * spin_eff)
                           + vec3(0.16, 0.48, 0.85) * fres * 0.42;
 
             // Outward-propagating quadrupolar l=2, m=2 BHEX QNM spiral ringdown strain crests:
-            //   cos(2 * phi - omega_220 * (t - r_*)) damped by the QNM envelope
+            //   cos(2 * phi_wave - omega_220 * (t - r_*)) tightened by spin & scaled by u_qnm_freq_ratio
             float q_ratio = clamp(u_qnm_freq_ratio, 0.25, 3.0);
-            float omega_220 = 1.120 * q_ratio;
-            float gamma_220 = 0.095;
+            float kerr_spin_boost = 1.0 + 0.34 * spin_eff + 0.56 * spin_eff * spin_eff;
+            float omega_220 = 1.120 * kerr_spin_boost * q_ratio;
+            float gamma_220 = 0.095 * mix(1.0, 0.68, spin_eff * clamp(q_ratio, 0.0, 1.0));
             float t_wave = mod(u_time * 4.8 + 11.5, 28.0);
             float ret_u = t_wave - r_star;
             float qnm_env = smoothstep(-2.5, 1.2, ret_u)
                           * exp(-gamma_220 * max(ret_u, 0.0))
                           * smoothstep(0.42 * r_ph, 0.95 * r_ph, r)
                           / sqrt(max(r, 0.65));
-            float h_quad = cos(2.0 * phi - omega_220 * ret_u) * qnm_env;
+            float phi_wave = phi - 0.55 * spin_eff * drag_twist;
+            float h_quad = cos(2.0 * phi_wave - omega_220 * ret_u) * qnm_env;
             surf_col += vec3(0.18, 0.95, 1.35) * max(h_quad, 0.0) * 1.15;
             surf_col += vec3(1.25, 0.58, 0.14) * max(-h_quad, 0.0) * 0.85;
 
@@ -534,7 +544,7 @@ void main() {{
             if (u_spool_reflectivity > 0.01) {{
                 float refl = clamp(u_spool_reflectivity, 0.0, 1.0);
                 float w_spool = exp(-((r - r_spool) * (r - r_spool)) / 0.016);
-                float spool_braid = 0.65 + 0.35 * cos(12.0 * phi + 4.0 * u_time);
+                float spool_braid = 0.65 + 0.35 * cos(12.0 * phi_drag + 4.0 * u_time);
                 surf_col += vec3(1.45, 0.96, 0.32) * w_spool * spool_braid * refl * 1.65;
 
                 float u_ec1 = ret_u - 6.8;
@@ -546,19 +556,36 @@ void main() {{
                                  * (0.5 + 0.5 * cos(2.6 * (r_star + 2.2) - 4.2 * u_time - 1.3))
                                  * exp(-max(r - r_spool, 0.0) * 0.24)
                                  * smoothstep(r_spool * 0.78, r_spool * 1.10, r);
-                float echo_quad = 0.55 + 0.45 * cos(2.0 * phi - omega_220 * u_ec1);
+                float echo_quad = 0.55 + 0.45 * cos(2.0 * phi_wave - omega_220 * u_ec1);
                 float echo_sig = (env_ec1 + 0.75 * env_ec2 + 0.68 * echo_rings) * echo_quad;
                 surf_col += vec3(0.32, 1.38, 0.88) * echo_sig * 1.35;
             }} else {{
-                // Pure black-hole / sub-throat Sommerfeld absorption inside photon sphere
-                surf_col *= smoothstep(0.30 * r_ph, 0.82 * r_ph, r);
+                // Distinguish contracting Boyer-Lindquist Kerr horizon + ergoregion vs smooth horizonless Kerr-Weave throat
+                if (u_has_horizon == 1) {{
+                    float r_kerr_hor = max(0.28, 0.52 * r_ph * (0.55 + 0.45 * sqrt(max(1.0 - spin_eff * spin_eff, 0.02))));
+                    float r_ergo = 0.76 * r_ph;
+                    surf_col *= smoothstep(0.72 * r_kerr_hor, 1.18 * r_kerr_hor, r);
+                    float w_hor = exp(-((r - r_kerr_hor) * (r - r_kerr_hor)) / 0.009);
+                    float ergo_band = spin_eff * smoothstep(r_kerr_hor, 0.5 * (r_kerr_hor + r_ergo), r)
+                                    * smoothstep(r_ergo * 1.08, r_kerr_hor, r);
+                    surf_col += vec3(0.95, 0.22, 0.42) * (w_hor * 0.85 + ergo_band * 0.55);
+                }} else {{
+                    float r_throat = 0.54 * r_ph;
+                    surf_col *= smoothstep(0.26 * r_ph, 0.76 * r_ph, r);
+                    float w_th = exp(-((r - r_throat) * (r - r_throat)) / 0.012);
+                    float drag_fil = 0.55 + 0.45 * cos(8.0 * phi_drag - 2.6 * u_time);
+                    surf_col += mix(vec3(0.24, 0.82, 1.12), vec3(1.22, 0.86, 0.30), spin_eff)
+                              * w_th * (0.45 + 0.65 * spin_eff * drag_fil);
+                }}
             }}
 
-            // Exact photon-sphere ring r_ph = 1 / u_u_photon and critical BHEX shadow ring r_sh = u_shadow_rg
-            float w_ph = exp(-((r - r_ph) * (r - r_ph)) / 0.012);
+            // Prograde/retrograde frame-dragged photon-ring & BHEX shadow rings
+            float r_ph_eff = r_ph * (1.0 - 0.14 * spin_eff * cos(phi));
+            float w_ph = exp(-((r - r_ph_eff) * (r - r_ph_eff)) / 0.012);
             surf_col += vec3(1.38, 0.92, 0.26) * w_ph * 1.25;
 
-            float w_sh = exp(-((r - r_sh) * (r - r_sh)) / 0.022) * (0.45 + 0.55 * step(0.0, sin(phi * 20.0)));
+            float r_sh_eff = r_sh - 0.28 * spin_eff * cos(phi);
+            float w_sh = exp(-((r - r_sh_eff) * (r - r_sh_eff)) / 0.022) * (0.45 + 0.55 * step(0.0, sin(phi_drag * 20.0)));
             surf_col += vec3(0.28, 0.96, 1.28) * w_sh * 0.95;
 
             if (u_show_bhex_gauge == 1) {{
@@ -600,6 +627,9 @@ class Arena2BlackHoleForge:
         self.probe_alt_km = 3189.07  # Default right on the 0.00 us/day zero-crossing!
         self.spool_reflectivity: float = 0.0
         self.qnm_freq_ratio: float = 1.0
+        self._last_synced_spin_a: float = float(self.spin_a)
+        self._last_synced_mod_id: Optional[str] = getattr(mod, "id", None) if mod is not None else None
+        self._last_ringdown_summary: Optional[Dict[str, object]] = None
         self.is_hibernated: bool = bool(lazy_gpu)
         self.allocated_vram_mb: float = 0.0 if lazy_gpu else 0.5
         self.ddr5_ram_mb: float = 0.0
@@ -691,6 +721,27 @@ class Arena2BlackHoleForge:
             "spool_ratio_exact": 1.000000,
         }
 
+    def sync_spinning_ringdown_state(self, mod: Optional[PhysicsMod] = None) -> Optional[Dict[str, object]]:
+        """
+        Synchronizes `self.qnm_freq_ratio` against `get_bhex_ringdown_summary(..., spin_a=self.spin_a)`
+        (`< 0.5 ms` warm) as the user adjusts `Spin a/M` in `[0.0, 0.95]`.
+        """
+        target_mod = mod if mod is not None else self._active_mod
+        if target_mod is None:
+            return None
+        self._active_mod = target_mod
+        spin_clamped = float(np.clip(self.spin_a, 0.0, 0.95))
+        qnm_s = get_bhex_ringdown_summary(
+            target_mod,
+            spool_reflectivity=float(self.spool_reflectivity),
+            spin_a=spin_clamped,
+        )
+        self.qnm_freq_ratio = float(qnm_s["qnm_freq_ratio"])
+        self._last_synced_spin_a = float(self.spin_a)
+        self._last_synced_mod_id = getattr(target_mod, "id", None)
+        self._last_ringdown_summary = qnm_s
+        return qnm_s
+
     def render(
         self,
         fbo: moderngl.Framebuffer,
@@ -702,6 +753,11 @@ class Arena2BlackHoleForge:
         self._ensure_program(compiled.optical_n_glsl_expr, compiled.d_half_n2_dU_glsl_expr)
         self.allocated_vram_mb = 0.5
         assert self._prog is not None and self._vao is not None
+
+        if int(self.submode) == 3 and self._active_mod is not None:
+            cur_mod_id = getattr(self._active_mod, "id", None)
+            if abs(float(self.spin_a) - self._last_synced_spin_a) > 1.0e-9 or cur_mod_id != self._last_synced_mod_id:
+                self.sync_spinning_ringdown_state(self._active_mod)
 
         fbo.use()
         w, h = fbo.size
@@ -717,6 +773,7 @@ class Arena2BlackHoleForge:
         u_cam = 1.0 / cam_r
         n_cam_mod = float(compiled.optical_n_numpy_fn(np.array([u_cam]))[0]) if compiled.optical_n_numpy_fn else 1.0
         n_cam_gr = ((1.0 + 0.5 * u_cam) ** 3) / max(1.0 - 0.5 * u_cam, 0.05)
+        has_hor_flag = 1 if float(compiled.u_horizon_cap) < 5.0 else 0
 
         for uname, uval in (
             ("u_cam_eye", tuple(float(v) for v in eye)),
@@ -740,6 +797,7 @@ class Arena2BlackHoleForge:
             ("u_fbo_h", float(max(h, 64))),
             ("u_spool_reflectivity", float(self.spool_reflectivity)),
             ("u_qnm_freq_ratio", float(self.qnm_freq_ratio)),
+            ("u_has_horizon", int(has_hor_flag)),
         ):
             if uname in self._prog:
                 self._prog[uname].value = uval

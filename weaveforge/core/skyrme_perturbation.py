@@ -48,8 +48,8 @@ import sympy as sp
 
 # Cosmological & unit conversion constants (Planck 2018 baseline)
 _C_KMS: float = 299792.458
-_PLANCK_H0_KMS_MPC: float = 67.4
-_H0_OVER_C_MPC_INV: float = _PLANCK_H0_KMS_MPC / _C_KMS  # 2.248222e-4 Mpc^-1
+_PLANCK_H0_KMS_MPC: float = 67.36
+_H0_OVER_C_MPC_INV: float = _PLANCK_H0_KMS_MPC / _C_KMS  # 2.246888e-4 Mpc^-1
 _EV_TO_MPC_INV: float = 3.08567758149e22 / 1.973269804e-7  # m*c/hbar in Mpc^-1 per eV (1.563738e29)
 _CHI_STAR_MPC: float = 13870.0  # Comoving angular diameter distance to last scattering (z_* ~ 1089.9)
 _PLANCK_PIVOT_K_MPC_INV: float = 0.05
