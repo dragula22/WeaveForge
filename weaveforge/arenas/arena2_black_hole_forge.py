@@ -16,6 +16,11 @@ Real-time 60–144+ FPS 3D GPU Relativistic Raytracer & Strong-Field Laboratory:
   • Sub-Mode 2 (`3D Orbital Clock & 3,189.1 km Zero-Crossing Explorer`):
       3D sunlit Earth + glowing emerald `h = 3,189.1 km = 0.5 R_Earth` (`0.00 us/day` SR/GR cancellation)
       ring + live interactive orbital clock probe (`ISS -24.57 us/d` -> `GPS +38.64 us/d` -> `GEO +46.65 us/d`).
+  • Sub-Mode 3 (`Strong-Field BSSN Funnel & BHEX QNM Ringdown`):
+      3D curved spatial embedding funnel `y(r) = -2.6 / sqrt(r + 0.35)` colored by strong-field lapse
+      `alpha(r) = 1 / sqrt(max(n(1/r), 1.0))` & conformal grid lines, exact photon-sphere & BHEX shadow
+      rings, outward-propagating quadrupolar `l=2, m=2` BHEX QNM spiral strain waves, and delayed
+      post-ringdown gravitational-wave echoes from a reflective Gibbons Planck-spool throat!
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ FORGE_SUBMODES = [
     ("kerr_bhex", "Spinning Kerr vs. Weave Raytracer + Phase Slips"),
     ("planck_spool", "Planck-Tension 1.000000 Fishing-Reel Horizon"),
     ("orbital_clocks", "3D Earth Clocks & 3,189.1 km Zero-Crossing"),
+    ("bssn_ringdown", "Strong-Field BSSN Funnel & BHEX QNM Ringdown"),
 ]
 
 _VERT_QUAD = """#version 430
@@ -64,7 +70,7 @@ uniform float u_fov_tan;
 uniform float u_aspect;
 uniform float u_time;
 
-uniform int u_submode;            // 0=Kerr/Weave BH, 1=Planck Spool, 2=Earth Orbital Clocks
+uniform int u_submode;            // 0=Kerr/Weave BH, 1=Planck Spool, 2=Earth Clocks, 3=BSSN Funnel & BHEX Ringdown
 uniform float u_spin_a;           // Kerr spin a/M in [0.0, 0.998]
 uniform float u_shadow_rg;        // Compiled 2PN shadow radius (5.19615 GR vs 5.43656 TNaP)
 uniform float u_u_photon;         // Compiled photon-sphere inverse radius U_ph = r_g / r_ph
@@ -76,6 +82,8 @@ uniform int u_show_phase_slips;   // 1 = Render 3D superfluid quantum phase-slip
 uniform float u_mass_solar;       // Spool mass multiplier in [0.4, 2.2]
 uniform float u_probe_alt_km;     // Orbital clock altitude in [0, 40000] km
 uniform float u_fbo_h;            // Active render-target height for sub-pixel-safe BHEX ring gauge
+uniform float u_spool_reflectivity; // Gibbons Planck-spool throat reflectivity R in [0.0, 1.0]
+uniform float u_qnm_freq_ratio;     // Active mod QNM frequency ratio omega_220 / omega_220_GR
 
 vec3 aces_tonemap(vec3 x) {{
     const float a = 2.51;
@@ -346,7 +354,7 @@ void main() {{
     // =========================================================================
     // SUB-MODE 2: 3D EARTH ORBITAL CLOCKS & 3,189.1 KM ZERO-CROSSING RING
     // =========================================================================
-    else {{
+    else if (u_submode == 2) {{
         col_hdr = background_cosmos(rd);
         float R_earth = 1.80;
         float R_zero  = R_earth * 1.50;
@@ -407,6 +415,161 @@ void main() {{
         }}
     }}
 
+    // =========================================================================
+    // SUB-MODE 3: STRONG-FIELD BSSN CONFORMAL FUNNEL & BHEX QNM RINGDOWN
+    // =========================================================================
+    else {{
+        col_hdr = background_cosmos(rd);
+        float r_ph = 1.0 / max(u_u_photon, 0.15);
+        float r_sh = max(u_shadow_rg, 1.4);
+        float r_spool = max(0.52 * r_ph, 0.36);
+
+        float t_min = 0.08;
+        float t_max = min(length(ro) + 34.0, 96.0);
+        vec3 p_prev = ro + t_min * rd;
+        float r_prev = length(p_prev.xz);
+        float f_prev = p_prev.y + 2.6 / sqrt(r_prev + 0.35);
+        float t_prev = t_min;
+        bool hit_funnel = false;
+        float t_hit = 0.0;
+
+        const int F_STEPS = 108;
+        for (int i = 1; i <= F_STEPS; ++i) {{
+            float t_cur = t_min + (t_max - t_min) * (float(i) / float(F_STEPS));
+            vec3 p_cur = ro + t_cur * rd;
+            float r_cur = length(p_cur.xz);
+            float f_cur = p_cur.y + 2.6 / sqrt(r_cur + 0.35);
+            if (min(r_prev, r_cur) <= 30.0 && f_prev * f_cur <= 0.0) {{
+                float ta = t_prev;
+                float tb = t_cur;
+                float fa = f_prev;
+                for (int b_it = 0; b_it < 6; ++b_it) {{
+                    float tm = 0.5 * (ta + tb);
+                    vec3 pm = ro + tm * rd;
+                    float fm = pm.y + 2.6 / sqrt(length(pm.xz) + 0.35);
+                    if (fa * fm <= 0.0) {{
+                        tb = tm;
+                    }} else {{
+                        ta = tm;
+                        fa = fm;
+                    }}
+                }}
+                t_hit = 0.5 * (ta + tb);
+                hit_funnel = true;
+                break;
+            }}
+            t_prev = t_cur;
+            r_prev = r_cur;
+            f_prev = f_cur;
+        }}
+
+        if (hit_funnel) {{
+            vec3 ph = ro + t_hit * rd;
+            float r = max(length(ph.xz), 1e-4);
+            float phi = atan(ph.z, ph.x);
+            float sheet_mask = smoothstep(30.0, 23.5, r);
+
+            // Exact upward unit normal to y_funnel(r) = -2.6 / sqrt(r + 0.35)
+            float dy_dr = 1.3 / pow(r + 0.35, 1.5);
+            vec3 n_surf = normalize(vec3(-dy_dr * (ph.x / r), 1.0, -dy_dr * (ph.z / r)));
+            if (dot(n_surf, -rd) < 0.0) {{
+                n_surf = -n_surf;
+            }}
+
+            // Strong-field conformal lapse alpha(r) = 1 / sqrt(max(n(1/r), 1.0))
+            float n_opt = max(eval_optical_n(1.0 / max(r, 0.20)), 1.0);
+            float alpha_lapse = 1.0 / sqrt(n_opt);
+
+            // 4-point Gauss-Legendre tortoise coordinate r_*(r) - r_*(r_ph) = integral(n(1/r') dr')
+            float half_s = 0.5 * (r - r_ph);
+            float mid_s  = 0.5 * (r + r_ph);
+            float r_g1 = max(mid_s - 0.8611363 * half_s, 0.22);
+            float r_g2 = max(mid_s - 0.3399810 * half_s, 0.22);
+            float r_g3 = max(mid_s + 0.3399810 * half_s, 0.22);
+            float r_g4 = max(mid_s + 0.8611363 * half_s, 0.22);
+            float r_star = half_s * (
+                0.3478548 * (eval_optical_n(1.0 / r_g1) + eval_optical_n(1.0 / r_g4))
+                + 0.6521452 * (eval_optical_n(1.0 / r_g2) + eval_optical_n(1.0 / r_g3))
+            );
+
+            // Lapse-colored BSSN spatial embedding surface + conformal polar (r, phi) grid
+            vec3 c_throat = vec3(0.52, 0.11, 0.25);
+            vec3 c_mid    = vec3(0.08, 0.30, 0.62);
+            vec3 c_flat   = vec3(0.05, 0.18, 0.34);
+            vec3 base_f = mix(
+                c_throat,
+                mix(c_mid, c_flat, smoothstep(0.45, 0.92, alpha_lapse)),
+                smoothstep(0.08, 0.58, alpha_lapse)
+            );
+
+            float g_rad = abs(fract(r) - 0.5);
+            float line_r = exp(-(g_rad * g_rad) * 220.0);
+            float g_phi = abs(fract(phi * (16.0 / 6.2831853)) - 0.5);
+            float line_p = exp(-(g_phi * g_phi) * 260.0) * smoothstep(0.25, 0.95, r);
+            float conf_grid = max(line_r, line_p);
+
+            vec3 light_dir = normalize(vec3(0.48, 0.78, 0.40));
+            float ndl = 0.28 + 0.72 * max(dot(n_surf, light_dir), 0.0);
+            float fres = pow(max(1.0 - clamp(dot(n_surf, -rd), 0.0, 1.0), 0.0), 2.6);
+            vec3 surf_col = base_f * ndl
+                          + vec3(0.14, 0.56, 0.92) * conf_grid * (0.28 + 0.35 * alpha_lapse)
+                          + vec3(0.16, 0.48, 0.85) * fres * 0.42;
+
+            // Outward-propagating quadrupolar l=2, m=2 BHEX QNM spiral ringdown strain crests:
+            //   cos(2 * phi - omega_220 * (t - r_*)) damped by the QNM envelope
+            float q_ratio = clamp(u_qnm_freq_ratio, 0.25, 3.0);
+            float omega_220 = 1.120 * q_ratio;
+            float gamma_220 = 0.095;
+            float t_wave = mod(u_time * 4.8 + 11.5, 28.0);
+            float ret_u = t_wave - r_star;
+            float qnm_env = smoothstep(-2.5, 1.2, ret_u)
+                          * exp(-gamma_220 * max(ret_u, 0.0))
+                          * smoothstep(0.42 * r_ph, 0.95 * r_ph, r)
+                          / sqrt(max(r, 0.65));
+            float h_quad = cos(2.0 * phi - omega_220 * ret_u) * qnm_env;
+            surf_col += vec3(0.18, 0.95, 1.35) * max(h_quad, 0.0) * 1.15;
+            surf_col += vec3(1.25, 0.58, 0.14) * max(-h_quad, 0.0) * 0.85;
+
+            // Delayed outward post-ringdown gravitational-wave echoes from inner Gibbons Planck-spool throat
+            if (u_spool_reflectivity > 0.01) {{
+                float refl = clamp(u_spool_reflectivity, 0.0, 1.0);
+                float w_spool = exp(-((r - r_spool) * (r - r_spool)) / 0.016);
+                float spool_braid = 0.65 + 0.35 * cos(12.0 * phi + 4.0 * u_time);
+                surf_col += vec3(1.45, 0.96, 0.32) * w_spool * spool_braid * refl * 1.65;
+
+                float u_ec1 = ret_u - 6.8;
+                float u_ec2 = ret_u - 13.6;
+                float throat_gate = smoothstep(r_spool * 0.80, r_spool * 1.20, r) / sqrt(max(r, 0.60));
+                float env_ec1 = refl * exp(-0.22 * u_ec1 * u_ec1) * throat_gate;
+                float env_ec2 = (refl * refl) * exp(-0.22 * u_ec2 * u_ec2) * throat_gate;
+                float echo_rings = refl
+                                 * (0.5 + 0.5 * cos(2.6 * (r_star + 2.2) - 4.2 * u_time - 1.3))
+                                 * exp(-max(r - r_spool, 0.0) * 0.24)
+                                 * smoothstep(r_spool * 0.78, r_spool * 1.10, r);
+                float echo_quad = 0.55 + 0.45 * cos(2.0 * phi - omega_220 * u_ec1);
+                float echo_sig = (env_ec1 + 0.75 * env_ec2 + 0.68 * echo_rings) * echo_quad;
+                surf_col += vec3(0.32, 1.38, 0.88) * echo_sig * 1.35;
+            }} else {{
+                // Pure black-hole / sub-throat Sommerfeld absorption inside photon sphere
+                surf_col *= smoothstep(0.30 * r_ph, 0.82 * r_ph, r);
+            }}
+
+            // Exact photon-sphere ring r_ph = 1 / u_u_photon and critical BHEX shadow ring r_sh = u_shadow_rg
+            float w_ph = exp(-((r - r_ph) * (r - r_ph)) / 0.012);
+            surf_col += vec3(1.38, 0.92, 0.26) * w_ph * 1.25;
+
+            float w_sh = exp(-((r - r_sh) * (r - r_sh)) / 0.022) * (0.45 + 0.55 * step(0.0, sin(phi * 20.0)));
+            surf_col += vec3(0.28, 0.96, 1.28) * w_sh * 0.95;
+
+            if (u_show_bhex_gauge == 1) {{
+                float w_gr_sh = exp(-((r - 5.1961524) * (r - 5.1961524)) / 0.018) * step(0.0, cos(phi * 28.0));
+                surf_col += vec3(0.85, 0.92, 1.05) * w_gr_sh * 0.48;
+            }}
+
+            col_hdr = mix(col_hdr, surf_col, sheet_mask);
+        }}
+    }}
+
     vec3 mapped = aces_tonemap(col_hdr * 1.08);
     mapped = pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2));
     frag_color = vec4(mapped, 1.0);
@@ -435,6 +598,8 @@ class Arena2BlackHoleForge:
         self.show_phase_slips = True
         self.mass_solar = 1.0
         self.probe_alt_km = 3189.07  # Default right on the 0.00 us/day zero-crossing!
+        self.spool_reflectivity: float = 0.0
+        self.qnm_freq_ratio: float = 1.0
         self.is_hibernated: bool = bool(lazy_gpu)
         self.allocated_vram_mb: float = 0.0 if lazy_gpu else 0.5
         self.ddr5_ram_mb: float = 0.0
@@ -573,6 +738,8 @@ class Arena2BlackHoleForge:
             ("u_mass_solar", float(self.mass_solar)),
             ("u_probe_alt_km", float(self.probe_alt_km)),
             ("u_fbo_h", float(max(h, 64))),
+            ("u_spool_reflectivity", float(self.spool_reflectivity)),
+            ("u_qnm_freq_ratio", float(self.qnm_freq_ratio)),
         ):
             if uname in self._prog:
                 self._prog[uname].value = uval

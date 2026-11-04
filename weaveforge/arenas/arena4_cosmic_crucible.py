@@ -50,6 +50,7 @@ from weaveforge.core.skyrme_perturbation import (
     evaluate_catenoid_waist_adiabaticity,
     skyrme_pleat_jeans_damping_envelope,
 )
+from weaveforge.core.catenoid_freezeout import get_catenoid_freezeout_crucible_summary
 from weaveforge.core.symbolic_compiler import CompiledMasterAction
 from weaveforge.data.gaia_dr4_pipeline import compute_wide_binary_efe_curves
 from weaveforge.data.sparc_catalog import (
@@ -143,6 +144,15 @@ class CrucibleReport:
     cmb_te_corr_2500: float = 1.0
     cmb_ee_peak_ratio: float = 1.0
     cmb_beta_iso: float = 0.0
+    # 3D Catenoid Kibble-Zurek Freeze-Out & Red-Team Cosmology Diagnostics (Milestone 5B)
+    cmb_xi_kz_at_waist: float = 0.0
+    cmb_xi_kz_min: float = 0.0
+    cmb_xi_kz_max: float = 0.0
+    cmb_kz_power_index: float = 0.0
+    cmb_qh_net_symmetric: float = 0.0
+    cmb_qh_net_chiral_pos: float = 0.0
+    cmb_kz_depends_on_r0: bool = False
+    cmb_kz_matches_target_10pct: bool = False
 
 
 _CAMB_FORTRAN_LOCK = threading.Lock()
@@ -1299,6 +1309,18 @@ def evaluate_observational_crucible(
     gc_split = float(wb.get("compass_split_15k_pct", 0.0))
     zenodo_doi = str(wb.get("zenodo_doi", "10.5281/zenodo.23919217"))
 
+    # 5. 3D Catenoid Kibble-Zurek Freeze-Out & Red-Team Cosmology Diagnostics (Milestone 5B)
+    kz_sum = get_catenoid_freezeout_crucible_summary(mod)
+    xi_kz_mod = float(kz_sum["xi_kz_at_mod_waist"])
+    xi_kz_min = float(kz_sum["xi_min_sweep"])
+    xi_kz_max = float(kz_sum["xi_max_sweep"])
+    kz_slope = float(kz_sum["kz_power_index"])
+    qh_sym = float(kz_sum["qh_net_symmetric"])
+    qh_pos = float(kz_sum["qh_net_chiral_pos"])
+    kz_dep = bool(kz_sum["xi_depends_on_throat_scale"])
+    kz_match = bool(kz_sum["matches_5_plus_inv_pi_within_10pct"])
+    omega_pleat_eff = max(0.0, float(omega_m_eff) - 0.0490)
+
     badges: List[CrucibleBadge] = []
 
     # -------------------------------------------------------------------------
@@ -1306,9 +1328,14 @@ def evaluate_observational_crucible(
     # -------------------------------------------------------------------------
     if sparc_passed and not mod.parameters.has_cdm_halo:
         sparc_status = "PASS"
+        pleat_halo_note = (
+            f" Open seam: assumes cosmic pleats/dust (Omega_pleat={omega_pleat_eff:.3f} in CMB) remain unclustered in galaxy halos (avoiding double-counting)."
+            if mod.parameters.pinned_pleat_coupling > 0.1
+            else ""
+        )
         sparc_detail = (
             f"Zero dark-halo knobs! Fits 175 real SPARC galaxies from baryons with 0.11 dex Spitzer [3.6] IMF prior "
-            f"(median chi²_red = {med_chi2:.2f}, RAR = {rar_dex:.3f} dex vs 0.130 dex observed)."
+            f"(median chi²_red = {med_chi2:.2f}, RAR = {rar_dex:.3f} dex vs 0.130 dex observed).{pleat_halo_note}"
         )
     elif sparc_passed and mod.parameters.has_cdm_halo:
         sparc_status = "WARN"
@@ -1345,10 +1372,20 @@ def evaluate_observational_crucible(
         )
     elif mod.parameters.pinned_pleat_coupling > 0.1 and not mod.parameters.has_cdm_halo:
         cmb_status = "WARN"
+        kz_clause = (
+            f"3D KZ quench gives xi={xi_kz_mod:.2f} in [{xi_kz_min:.2f},{xi_kz_max:.2f}] (r0/lS-dependent, not locked to 5+1/pi=5.32; sym <Q_H>={qh_sym:+.2f})"
+            if xi_kz_mod > 0.0
+            else "dust-to-MOND nonlinear galaxy screening unclosed"
+        )
+        neff_clause = (
+            "; N_eff=3.303 Silk tilt (H0=69 pol shift, dchi²~+218 w/o refit n_s & ~2.9σ BBN unless post-BBN)"
+            if mod.parameters.waist_clamping_ell > 0.5
+            else ""
+        )
         cmb_detail = (
             f"CAMB w/ Omega_m = {omega_m_eff:.5f} gives R_32={r32:.2f}, catenoid waist D_2={d2_quad:.0f} uK² "
             f"(Planck 226 uK²), TE r={cmb_te_corr_2500:.3f}, EE={cmb_ee_peak_ratio:.2f}x (l<=2500), "
-            f"beta_iso={cmb_beta_iso:.4f}<0.02; open item: non-linear early-waist xi=5+1/pi freeze-out."
+            f"beta_iso={cmb_beta_iso:.4f}<0.02; open seams: {kz_clause}{neff_clause}; Mpc S_8 & halo-pleat screening."
         )
     else:
         cmb_status = "PASS"
@@ -1482,6 +1519,14 @@ def evaluate_observational_crucible(
         cmb_te_corr_2500=cmb_te_corr_2500,
         cmb_ee_peak_ratio=cmb_ee_peak_ratio,
         cmb_beta_iso=cmb_beta_iso,
+        cmb_xi_kz_at_waist=xi_kz_mod,
+        cmb_xi_kz_min=xi_kz_min,
+        cmb_xi_kz_max=xi_kz_max,
+        cmb_kz_power_index=kz_slope,
+        cmb_qh_net_symmetric=qh_sym,
+        cmb_qh_net_chiral_pos=qh_pos,
+        cmb_kz_depends_on_r0=kz_dep,
+        cmb_kz_matches_target_10pct=kz_match,
     )
 
 

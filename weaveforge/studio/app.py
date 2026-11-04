@@ -48,6 +48,8 @@ from weaveforge.arenas.arena4_cosmic_crucible import (
     get_sparc_175_cached,
 )
 from weaveforge.compute.lan_worker import AsyncLANWorkerDispatcher
+from weaveforge.core.bhex_ringdown import get_bhex_ringdown_summary
+from weaveforge.core.bssn_solver import get_bssn_strong_field_summary
 from weaveforge.core.camera import Camera3D
 from weaveforge.core.frameworks import DEFAULT_MODS_DIR, PhysicsMod, load_all_mods
 from weaveforge.core.symbolic_compiler import (
@@ -528,6 +530,7 @@ class WeaveForgeStudioApp:
                 "show_phase_slips": bool(self.arena2.show_phase_slips),
                 "mass_solar": float(self.arena2.mass_solar),
                 "probe_alt_km": float(self.arena2.probe_alt_km),
+                "spool_reflectivity": float(getattr(self.arena2, "spool_reflectivity", 0.0)),
             },
             2: {
                 "show_lensing": bool(self.arena3.show_lensing),
@@ -1107,6 +1110,8 @@ class WeaveForgeStudioApp:
                 self.cameras[1].reset(yaw=0.52, pitch=0.38, distance=8.2)
             elif sub == 2:
                 self.cameras[1].reset(yaw=0.66, pitch=0.45, distance=11.5)
+            elif sub == 3:
+                self.cameras[1].reset(yaw=0.58, pitch=0.46, distance=11.8)
             else:
                 self.cameras[1].reset(*_DEFAULT_CAMERA_POSES[1])
         else:
@@ -1493,6 +1498,10 @@ class WeaveForgeStudioApp:
             self.arena1.render(self._view_fbo, cam, wall_t)
         elif self._active_arena == 1:
             self._sim_accum = 0.0
+            if int(getattr(self.arena2, "submode", 0)) == 3:
+                refl_q = round(float(getattr(self.arena2, "spool_reflectivity", 0.0)) * 20.0) / 20.0
+                qnm_s = get_bhex_ringdown_summary(self.working_mod, refl_q)
+                self.arena2.qnm_freq_ratio = float(qnm_s["qnm_freq_ratio"])
             self.arena2.render(self._view_fbo, cam, self.compiled, wall_t)
         elif self._active_arena == 2:
             if not self.paused:
@@ -2224,8 +2233,11 @@ class WeaveForgeStudioApp:
                             self.cameras[1].reset(yaw=0.45, pitch=0.24, distance=18.5)
                         elif ns == 1:
                             self.cameras[1].reset(yaw=0.52, pitch=0.38, distance=8.2)
-                        else:
+                        elif ns == 2:
                             self.cameras[1].reset(yaw=0.66, pitch=0.45, distance=11.5)
+                        else:
+                            self.cameras[1].reset(yaw=0.58, pitch=0.46, distance=11.8)
+                        self._reset_frame_pacing_clock()
                     if self.arena2.submode == 0:
                         _, self.arena2.spin_a = imgui.slider_float("Kerr Spin a/M", self.arena2.spin_a, 0.0, 0.998)
                         _, self.arena2.show_bhex_gauge = imgui.checkbox("BHEX Shadow Gauge", self.arena2.show_bhex_gauge)
@@ -2244,7 +2256,7 @@ class WeaveForgeStudioApp:
                         imgui.push_text_wrap_pos(0.0)
                         imgui.text_colored(COL_PASS, "Wound Horizon Ratio R_spool / (2GM/c^2) = 1.000000")
                         imgui.pop_text_wrap_pos()
-                    else:
+                    elif self.arena2.submode == 2:
                         _, self.arena2.probe_alt_km = imgui.slider_float(
                             "Orbit Alt (km)", self.arena2.probe_alt_km, 200.0, 36000.0
                         )
@@ -2281,6 +2293,85 @@ class WeaveForgeStudioApp:
                                 f"Nav Drift: {tel['drift_km_day']:.2f} km/day | Mercury: {tel['mercury_arcsec_cy']:.2f}\"/cy",
                             )
                             imgui.pop_text_wrap_pos()
+                    else:
+                        ch_refl, new_refl = imgui.slider_float(
+                            "Spool Echo R",
+                            float(getattr(self.arena2, "spool_reflectivity", 0.0)),
+                            0.0,
+                            0.90,
+                            "%.2f",
+                        )
+                        is_refl_dragging = imgui.is_item_active()
+                        if ch_refl:
+                            self.arena2.spool_reflectivity = float(np.clip(new_refl, 0.0, 0.90))
+                            self._reset_frame_pacing_clock()
+                        if imgui.small_button("Horizon R=0.00##qnm_r0"):
+                            self.arena2.spool_reflectivity = 0.0
+                            self._reset_frame_pacing_clock()
+                        imgui.same_line()
+                        if imgui.small_button("Gibbons Spool R=0.65##qnm_r65"):
+                            self.arena2.spool_reflectivity = 0.65
+                            self._reset_frame_pacing_clock()
+                        _, self.arena2.show_bhex_gauge = imgui.checkbox(
+                            "BHEX Shadow & Photon-Sphere Rings", self.arena2.show_bhex_gauge
+                        )
+
+                        refl_key = (
+                            round(float(self.arena2.spool_reflectivity) * 20.0) / 20.0
+                            if is_refl_dragging
+                            else round(float(self.arena2.spool_reflectivity), 2)
+                        )
+                        qnm_sum = get_bhex_ringdown_summary(self.working_mod, refl_key)
+                        self.arena2.qnm_freq_ratio = float(qnm_sum["qnm_freq_ratio"])
+                        bssn_sum = get_bssn_strong_field_summary()
+
+                        ligo_st = str(qnm_sum["ligo_status"])
+                        ligo_col = COL_PASS if ligo_st == "PASS" else (COL_WARN if ligo_st == "WARN" else COL_FAIL)
+                        imgui.push_text_wrap_pos(0.0)
+                        imgui.text_colored(
+                            ligo_col,
+                            f"BHEX l=2 QNM: Mw_220 = {float(qnm_sum['omega_r']):.4f}{float(qnm_sum['omega_i']):+.4f}i "
+                            f"({float(qnm_sum['delta_f220_vs_gr_pct']):+.2f}% vs GR) | LVK O4 [{ligo_st}]",
+                        )
+                        if float(self.arena2.spool_reflectivity) > 0.01:
+                            imgui.text_colored(
+                                COL_FORECAST,
+                                f"Planck-Spool Echo Ratio = {float(qnm_sum['echo_ratio']):.3f} "
+                                f"(dt_echo = {float(qnm_sum['echo_delay_m']):.1f} M)",
+                            )
+                        imgui.text_colored(
+                            COL_MUTED,
+                            f"3+1D BSSNok: E_bind=+{float(bssn_sum['binding_energy']):.4f} | "
+                            f"1+log alpha_min={float(bssn_sum['alpha_collapsed_min']):.3f} | "
+                            f"|h+_22|={float(bssn_sum['gw_h_plus_l2_peak']):.2e}",
+                        )
+                        imgui.pop_text_wrap_pos()
+
+                        qnm_plot_h = float(round(108.0 * s))
+                        if implot.begin_plot("BHEX l=2 Ringdown h_22(t/M)##arena2_qnm_plot", imgui.ImVec2(-1.0, qnm_plot_h)):
+                            implot.setup_axes("t / M", "h_22")
+                            implot.setup_legend(implot.Location_.north_east, implot.LegendFlags_.horizontal)
+                            t_qnm = np.ascontiguousarray(qnm_sum["t_over_m"], dtype=np.float64)
+                            h_gr_q = np.ascontiguousarray(qnm_sum["h_gr"], dtype=np.float64)
+                            h_md_q = np.ascontiguousarray(qnm_sum["h_mod"], dtype=np.float64)
+                            y_lim_q = max(float(np.max(np.abs(h_gr_q))), float(np.max(np.abs(h_md_q))), 0.1) * 1.18
+                            implot.setup_axes_limits(
+                                float(t_qnm[0]), float(t_qnm[-1]), -y_lim_q, y_lim_q, implot.Cond_.always
+                            )
+                            w_q = max(1.0, 0.85 * s)
+                            implot.plot_line(
+                                "GR Leaver",
+                                t_qnm,
+                                h_gr_q,
+                                spec=implot.Spec(line_color=COL_FORECAST, line_weight=1.7 * w_q),
+                            )
+                            implot.plot_line(
+                                "Active Mod",
+                                t_qnm,
+                                h_md_q,
+                                spec=implot.Spec(line_color=ligo_col, line_weight=2.1 * w_q),
+                            )
+                            implot.end_plot()
 
                 elif self._active_arena == 2:
                     g_names = [lbl for _, lbl in GALAXY_PRESETS]
@@ -2475,6 +2566,21 @@ class WeaveForgeStudioApp:
                         self._recompile_working_mod()
                     else:
                         self._refresh_crucible_fast()
+
+                if self._active_arena == 3 and self.crucible is not None:
+                    kz_rep = self.crucible
+                    imgui.push_text_wrap_pos(0.0)
+                    imgui.text_colored(
+                        COL_WARN if not kz_rep.cmb_kz_matches_target_10pct else COL_PASS,
+                        f"3D KZ Quench: xi(r0/lS) in [{kz_rep.cmb_xi_kz_min:.2f}, {kz_rep.cmb_xi_kz_max:.2f}] "
+                        f"(waist={kz_rep.cmb_xi_kz_at_waist:.2f} vs 5+1/pi=5.32)",
+                    )
+                    imgui.text_colored(
+                        COL_FORECAST,
+                        f"Baryogenesis: <Q_H>(eta=0)={kz_rep.cmb_qh_net_symmetric:+.2f} -> "
+                        f"Weyl CP Twist={kz_rep.cmb_qh_net_chiral_pos:+.2f}",
+                    )
+                    imgui.pop_text_wrap_pos()
 
                 # 4K Scale, Decoupled 3D Render Scale, FPS Pacing & DDR5 RAM Hibernation Controls
                 imgui.separator()
@@ -3133,10 +3239,19 @@ class WeaveForgeStudioApp:
         top_line = f"{ARENA_TITLES[self._active_arena]}  |  {self.working_mod.name}"
         sub_line = "Camera: Left-Drag Orbit | Right-Drag Pan | Right-Click Menu | WASD+QE Fly"
         if self.compiled is not None:
-            sub_line = (
-                f"2PN Shadow = {self.compiled.shadow_radius_rg:.3f} r_g ({self.compiled.shadow_vs_gr_pct:+.2f}% vs GR)  |  "
-                f"LMB: Orbit  RMB-Drag: Pan  RMB: Menu  WASD: Fly"
-            )
+            if self._active_arena == 1 and int(getattr(self.arena2, "submode", 0)) == 3:
+                refl_hud = round(float(getattr(self.arena2, "spool_reflectivity", 0.0)) * 20.0) / 20.0
+                q_hud = get_bhex_ringdown_summary(self.working_mod, refl_hud)
+                sub_line = (
+                    f"BHEX QNM Mw_220 = {float(q_hud['omega_r']):.4f}{float(q_hud['omega_i']):+.4f}i "
+                    f"({float(q_hud['delta_f220_vs_gr_pct']):+.2f}% vs GR, LVK O4 {q_hud['ligo_status']})  |  "
+                    f"Spool R={refl_hud:.2f}  |  Shadow = {self.compiled.shadow_radius_rg:.3f} r_g"
+                )
+            else:
+                sub_line = (
+                    f"2PN Shadow = {self.compiled.shadow_radius_rg:.3f} r_g ({self.compiled.shadow_vs_gr_pct:+.2f}% vs GR)  |  "
+                    f"LMB: Orbit  RMB-Drag: Pan  RMB: Menu  WASD: Fly"
+                )
         pad_x = 10.0 * s
         pad_y = 7.0 * s
         gap_y = 4.0 * s

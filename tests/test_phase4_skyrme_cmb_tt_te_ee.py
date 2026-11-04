@@ -169,7 +169,7 @@ def test_real_camb_2500_multipole_tt_te_ee_polarization_crucible() -> None:
     detail = b_tnap["planck_cmb"].detail_honest
     assert f"TE r={tnap_rep.cmb_te_corr_2500:.3f}" in detail
     assert f"EE={tnap_rep.cmb_ee_peak_ratio:.2f}x (l<=2500)" in detail
-    assert f"beta_iso={tnap_rep.cmb_beta_iso:.4f}<0.02; open item: non-linear early-waist xi=5+1/pi freeze-out" in detail
+    assert f"beta_iso={tnap_rep.cmb_beta_iso:.4f}<0.02; open seams:" in detail
 
 
 def test_camb_2500_lut_latency_and_backward_compatibility() -> None:
