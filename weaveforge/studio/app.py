@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -54,6 +55,11 @@ from weaveforge.core.symbolic_compiler import (
     SymbolicCompilationError,
     compile_master_action,
 )
+from weaveforge.data.gaia_dr4_pipeline import (
+    evaluate_gaia_dr4_day_one_verdict,
+    export_mock_raw_gaia_dr4_astrometry_csv,
+    ingest_gaia_dr4_raw_astrometry,
+)
 from weaveforge.studio.theme import (
     COL_ACCENT,
     COL_FAIL,
@@ -78,6 +84,16 @@ ARENA_TITLES = [
     "[2] Black-Hole Forge",
     "[3] 1M-Star Collider",
     "[4] Hourglass & Crucible",
+]
+GW_VIS_MODES = [
+    "Scalar Strain (dU/dt)",
+    "Spin-2 LIGO Tensor (h+ / hx)",
+]
+CMB_PLOT_MODES = [
+    ("TT 1k", "Planck 2018 CAMB TT Spectrum D_l [uK^2]"),
+    ("TT 2.5k", "Planck 2018 CAMB TT (l<=2500) D_l [uK^2]"),
+    ("TE Pol", "Planck 2018 CAMB TE Cross-Pol D_l [uK^2]"),
+    ("EE Pol", "Planck 2018 CAMB EE Pol Spectrum D_l [uK^2]"),
 ]
 _ARENA_TITLES_MED = [
     "[1] Knots",
@@ -502,6 +518,8 @@ class WeaveForgeStudioApp:
                 "damping": float(self.arena1.damping),
                 "color_mode": int(self.arena1.color_mode),
                 "show_gw_ripples": bool(self.arena1.show_gw_ripples),
+                "gw_vis_mode": int(getattr(self.arena1, "gw_vis_mode", 0)),
+                "pauli_twist_pi": bool(getattr(self.arena1, "pauli_twist_pi", False)),
             },
             1: {
                 "submode": int(self.arena2.submode),
@@ -542,6 +560,8 @@ class WeaveForgeStudioApp:
         self._pending_screenshot_out: Optional[Path] = None
         self._last_slider_reset_rects: Dict[str, Tuple[float, float, float, float]] = {}
         self._last_top_reset_btn_rect: Optional[Tuple[float, float, float, float]] = None
+        self.cmb_plot_mode: int = 0
+        self._gaia_day1_rehearsal: Optional[Dict[str, Any]] = None
 
         # Viewport offscreen FBO (zero-copy texture bound to ImGui viewport)
         self._view_tex: Optional[moderngl.Texture] = None
@@ -1079,7 +1099,7 @@ class WeaveForgeStudioApp:
     def reset_active_camera(self) -> None:
         """Resets the active 3D arena camera to its canonical orbit pose."""
         idx = int(np.clip(self._active_arena, 0, 3))
-        if idx == 0 and int(getattr(self.arena1, "preset_idx", 0)) in (4, 5, 6):
+        if idx == 0 and int(getattr(self.arena1, "preset_idx", 0)) in (4, 5, 6, 7):
             self.cameras[0].reset(yaw=0.34, pitch=0.32, distance=19.2)
         elif idx == 1:
             sub = int(getattr(self.arena2, "submode", 0))
@@ -1168,6 +1188,41 @@ class WeaveForgeStudioApp:
             )
             if self._active_arena != 2:
                 self._arena3_needs_field_sync = True
+
+    def run_gaia_day1_rehearsal(
+        self, n_binaries: int = 3200, truth_mode: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Executes a full blind ESA Gaia DR4 Day-One rehearsal on sky-level two-star `(RA, Dec, plx, pm, RUWE, NSS, RV)`
+        3D Keplerian astrometry (with injected unresolved triples & RV flybys) using the active mod's physics regime.
+        """
+        t0 = time.perf_counter()
+        if truth_mode is None:
+            is_cdm = bool(self.working_mod.parameters.has_cdm_halo) or self.working_mod.id == "lambda_cdm"
+            truth = "lambda_cdm" if is_cdm else "tnap_weave"
+        else:
+            truth = str(truth_mode)
+        a0_val = float(getattr(self.working_mod.parameters, "a0_si", 1.202712e-10))
+        with tempfile.TemporaryDirectory() as tmp_d:
+            tmp_csv = Path(tmp_d) / "gaia_dr4_studio_rehearsal.csv"
+            export_mock_raw_gaia_dr4_astrometry_csv(
+                tmp_csv,
+                n_binaries=int(n_binaries),
+                truth_mode=truth,
+                inject_contaminants=True,
+                seed=20261202,
+            )
+            pairs, cut_flow = ingest_gaia_dr4_raw_astrometry(tmp_csv, max_ruwe=1.20)
+        res = dict(evaluate_gaia_dr4_day_one_verdict(pairs, a0_si=a0_val, cut_flow=cut_flow))
+        res["truth_mode"] = truth
+        res["elapsed_ms"] = (time.perf_counter() - t0) * 1000.0
+        self._gaia_day1_rehearsal = res
+        self.status_banner = (
+            f"Gaia DR4 Day-1 Blind Rehearsal ({truth}, N={res['n_clean']} clean): "
+            f"dChi2={res['delta_chi2']:+.1f} -> {res['verdict']} ({res['elapsed_ms']:.0f} ms)"
+        )
+        self._reset_frame_pacing_clock()
+        return res
 
     def _clear_replay_backup(self, arena_idx: int) -> None:
         self._replay_live_backup.pop(arena_idx, None)
@@ -2055,12 +2110,23 @@ class WeaveForgeStudioApp:
                     if ch:
                         self._clear_replay_backup(0)
                         self.arena1.reset_field(new_p)
-                        if new_p in (4, 5, 6):
+                        if new_p in (4, 5, 6, 7):
                             self.cameras[0].reset(yaw=0.34, pitch=0.32, distance=19.2)
                         else:
                             self.cameras[0].reset(*_DEFAULT_CAMERA_POSES[0])
                         self._poll_memory_telemetry(force=True)
                         self._reset_frame_pacing_clock()
+                    if int(self.arena1.preset_idx) == 7:
+                        ch_pt, new_pt = imgui.checkbox(
+                            "Antisymmetric Singlet Twist (dPsi = pi)",
+                            bool(getattr(self.arena1, "pauli_twist_pi", False)),
+                        )
+                        if ch_pt:
+                            self.arena1.pauli_twist_pi = bool(new_pt)
+                            self._clear_replay_backup(0)
+                            self.arena1.reset_field(7)
+                            self._poll_memory_telemetry(force=True)
+                            self._reset_frame_pacing_clock()
                     res_vals = [128, 256, 512]
                     res_opts = ["128^3 (Fast)", "256^3 (60+ FPS HD)", "512^3 (134M Max Crunch)"]
                     if self.arena1.grid_n not in res_vals:
@@ -2086,8 +2152,57 @@ class WeaveForgeStudioApp:
                     _, self.arena1.slice_x = imgui.slider_float("X Cutaway", self.arena1.slice_x, -0.8, 1.0)
                     _, self.arena1.damping = imgui.slider_float("Cooling", self.arena1.damping, 0.0, 0.8)
                     _, self.arena1.show_gw_ripples = imgui.checkbox(
-                        "3D Gravitational-Wave Ripples (dU/dt)", bool(self.arena1.show_gw_ripples)
+                        "3D GW Ripples", bool(self.arena1.show_gw_ripples)
                     )
+                    if self.arena1.show_gw_ripples:
+                        imgui.same_line()
+                        imgui.set_next_item_width(-1.0)
+                        _, self.arena1.gw_vis_mode = imgui.combo(
+                            "##gw_vis_mode_combo",
+                            int(np.clip(getattr(self.arena1, "gw_vis_mode", 0), 0, len(GW_VIS_MODES) - 1)),
+                            GW_VIS_MODES,
+                        )
+                    gw_t_dq = getattr(self.arena1, "gw_strain_t", ())
+                    if (
+                        self.arena1.show_gw_ripples
+                        and int(getattr(self.arena1, "gw_vis_mode", 0)) == 1
+                        and len(gw_t_dq) >= 2
+                    ):
+                        t_gw = np.ascontiguousarray(gw_t_dq, dtype=np.float64)
+                        hp_gw = np.ascontiguousarray(getattr(self.arena1, "gw_hplus_faceon", ()), dtype=np.float64)
+                        hx_gw = np.ascontiguousarray(getattr(self.arena1, "gw_hcross_faceon", ()), dtype=np.float64)
+                        n_gw_pts = min(len(t_gw), len(hp_gw), len(hx_gw))
+                        if n_gw_pts >= 2:
+                            t_gw = t_gw[-n_gw_pts:]
+                            hp_gw = hp_gw[-n_gw_pts:]
+                            hx_gw = hx_gw[-n_gw_pts:]
+                            h_lim = max(
+                                float(np.max(np.abs(hp_gw))),
+                                float(np.max(np.abs(hx_gw))),
+                                1.0e-5,
+                            ) * 1.25
+                            t0_gw = float(t_gw[0])
+                            t1_gw = max(float(t_gw[-1]), t0_gw + 0.05)
+                            w_gw = max(1.0, 0.85 * s)
+                            if implot.begin_plot(
+                                "LIGO Strain (+z): h+ & hx", imgui.ImVec2(-1.0, float(round(108.0 * s)))
+                            ):
+                                implot.setup_axes("Sim t", "h_TT")
+                                implot.setup_legend(implot.Location_.north_west, implot.LegendFlags_.horizontal)
+                                implot.setup_axes_limits(t0_gw, t1_gw, -h_lim, h_lim, implot.Cond_.always)
+                                implot.plot_line(
+                                    "h+",
+                                    t_gw,
+                                    hp_gw,
+                                    spec=implot.Spec(line_color=COL_WARN, line_weight=1.9 * w_gw),
+                                )
+                                implot.plot_line(
+                                    "hx",
+                                    t_gw,
+                                    hx_gw,
+                                    spec=implot.Spec(line_color=COL_FORECAST, line_weight=1.9 * w_gw),
+                                )
+                                implot.end_plot()
                     imgui.push_text_wrap_pos(0.0)
                     imgui.text_colored(
                         COL_PASS if self.arena1.retention_ratio > 0.70 else COL_WARN,
@@ -2798,12 +2913,18 @@ class WeaveForgeStudioApp:
                     if imgui.menu_item_simple(kp_lbl, None, self.arena1.preset_idx == kp_i):
                         self._clear_replay_backup(0)
                         self.arena1.reset_field(kp_i)
-                        if kp_i in (4, 5):
+                        if kp_i in (4, 5, 6, 7):
                             self.cameras[0].reset(yaw=0.34, pitch=0.32, distance=19.2)
                         else:
                             self.cameras[0].reset(*_DEFAULT_CAMERA_POSES[0])
                         self._poll_memory_telemetry(force=True)
                         self._reset_frame_pacing_clock()
+                imgui.separator()
+                imgui.text_colored(COL_MUTED, "Gravitational-Wave Shell Mode:")
+                for gwm_i, gwm_lbl in enumerate(GW_VIS_MODES):
+                    if imgui.menu_item_simple(gwm_lbl, None, int(getattr(self.arena1, "gw_vis_mode", 0)) == gwm_i):
+                        self.arena1.show_gw_ripples = True
+                        self.arena1.gw_vis_mode = gwm_i
                 imgui.separator()
                 imgui.text_colored(COL_MUTED, "Grid Resolution:")
                 for gn, glbl in (
@@ -3140,8 +3261,9 @@ class WeaveForgeStudioApp:
                 self._poll_memory_telemetry(force=True)
                 self._reset_frame_pacing_clock()
 
-            avail_plots_h = max(imgui.get_content_region_avail().y - 6.0 * s, 465.0 * s)
-            plot_h = float(np.clip(avail_plots_h / 3.0 - style.item_spacing.y, 155.0 * s, 420.0 * s))
+            extra_bars_h = imgui.get_frame_height_with_spacing() * 2.15
+            avail_plots_h = max(imgui.get_content_region_avail().y - extra_bars_h - 6.0 * s, 420.0 * s)
+            plot_h = float(np.clip(avail_plots_h / 3.0 - style.item_spacing.y, 138.0 * s, 420.0 * s))
             w_scale = max(1.0, 0.85 * s)
 
             # Chart 1: SPARC Real Galaxy Rotation Curve V(R)
@@ -3180,16 +3302,74 @@ class WeaveForgeStudioApp:
                 )
                 implot.end_plot()
 
-            # Chart 2: Real CAMB Boltzmann Planck 2018 CMB TT Acoustic Spectrum
-            if implot.begin_plot("Planck 2018 CAMB TT Spectrum D_l [uK^2]", imgui.ImVec2(-1.0, plot_h)):
+            # Chart 2: Real CAMB Boltzmann Planck 2018 CMB TT / TE / EE Spectrum (l = 2..2500)
+            cmb_mode = int(np.clip(self.cmb_plot_mode, 0, len(CMB_PLOT_MODES) - 1))
+            imgui.text_colored(COL_MUTED, "CMB:")
+            for cm_i, (cm_short, _) in enumerate(CMB_PLOT_MODES):
+                imgui.same_line()
+                is_cm_sel = cm_i == cmb_mode
+                if is_cm_sel:
+                    imgui.push_style_color(imgui.Col_.button, imgui.ImVec4(0.16, 0.44, 0.78, 0.96))
+                    imgui.push_style_color(imgui.Col_.button_hovered, imgui.ImVec4(0.22, 0.54, 0.90, 1.00))
+                if imgui.small_button(f"{cm_short}##cmb_mode_{cm_i}"):
+                    self.cmb_plot_mode = cm_i
+                    cmb_mode = cm_i
+                if is_cm_sel:
+                    imgui.pop_style_color(2)
+            pol_stat_txt = f"TE r={rep.cmb_te_corr_2500:.4f}"
+            pol_stat_w = imgui.calc_text_size(pol_stat_txt).x
+            cur_end_x = imgui.get_item_rect_max().x - imgui.get_window_pos().x
+            avail_pol_x = imgui.get_window_width() - pol_stat_w - style.window_padding.x
+            if avail_pol_x > cur_end_x + 8.0 * s:
+                imgui.same_line(avail_pol_x)
+                imgui.text_colored(
+                    COL_PASS if rep.cmb_te_corr_2500 > 0.92 else COL_FAIL,
+                    pol_stat_txt,
+                )
+
+            has_2500 = len(rep.cmb_ell_2500) >= 10
+            _, cmb_title = CMB_PLOT_MODES[cmb_mode if has_2500 else 0]
+            if implot.begin_plot(cmb_title, imgui.ImVec2(-1.0, plot_h)):
                 implot.setup_axes("Multipole l", "D_l [uK^2]")
                 implot.setup_legend(implot.Location_.north_east, implot.LegendFlags_.horizontal)
-                ell_a = np.ascontiguousarray(rep.cmb_ell, dtype=np.float64)
-                obs_a = np.ascontiguousarray(rep.cmb_dl_obs, dtype=np.float64)
-                mod_a = np.ascontiguousarray(rep.cmb_dl_mod, dtype=np.float64)
-                dmax = max(float(np.max(obs_a)), float(np.max(mod_a)), 1000.0) * 1.22
-                implot.setup_axes_limits(2.0, 1000.0, 0.0, dmax, implot.Cond_.always)
+                if cmb_mode == 1 and has_2500:
+                    ell_a = np.ascontiguousarray(rep.cmb_ell_2500, dtype=np.float64)
+                    obs_a = np.ascontiguousarray(rep.cmb_tt_obs_2500, dtype=np.float64)
+                    mod_a = np.ascontiguousarray(rep.cmb_tt_mod_2500, dtype=np.float64)
+                    dmin = 0.0
+                    dmax = max(float(np.max(obs_a)), float(np.max(mod_a)), 1000.0) * 1.22
+                    x_hi = 2500.0
+                    mod_col = COL_PASS if rep.cmb_r32_ratio > 0.85 else COL_FAIL
+                elif cmb_mode == 2 and has_2500:
+                    ell_a = np.ascontiguousarray(rep.cmb_ell_2500, dtype=np.float64)
+                    obs_a = np.ascontiguousarray(rep.cmb_te_obs_2500, dtype=np.float64)
+                    mod_a = np.ascontiguousarray(rep.cmb_te_mod_2500, dtype=np.float64)
+                    dmin = min(float(np.min(obs_a)), float(np.min(mod_a)), -120.0) * 1.18
+                    dmax = max(float(np.max(obs_a)), float(np.max(mod_a)), 120.0) * 1.24
+                    x_hi = 2500.0
+                    mod_col = COL_PASS if rep.cmb_te_corr_2500 > 0.92 else COL_FAIL
+                elif cmb_mode == 3 and has_2500:
+                    ell_a = np.ascontiguousarray(rep.cmb_ell_2500, dtype=np.float64)
+                    obs_a = np.ascontiguousarray(rep.cmb_ee_obs_2500, dtype=np.float64)
+                    mod_a = np.ascontiguousarray(rep.cmb_ee_mod_2500, dtype=np.float64)
+                    dmin = 0.0
+                    dmax = max(float(np.max(obs_a)), float(np.max(mod_a)), 25.0) * 1.24
+                    x_hi = 2500.0
+                    mod_col = (
+                        COL_PASS
+                        if (0.85 <= rep.cmb_ee_peak_ratio <= 1.15 and rep.cmb_te_corr_2500 > 0.90)
+                        else COL_FAIL
+                    )
+                else:
+                    ell_a = np.ascontiguousarray(rep.cmb_ell, dtype=np.float64)
+                    obs_a = np.ascontiguousarray(rep.cmb_dl_obs, dtype=np.float64)
+                    mod_a = np.ascontiguousarray(rep.cmb_dl_mod, dtype=np.float64)
+                    dmin = 0.0
+                    dmax = max(float(np.max(obs_a)), float(np.max(mod_a)), 1000.0) * 1.22
+                    x_hi = 1000.0
+                    mod_col = COL_PASS if rep.cmb_r32_ratio > 0.85 else COL_FAIL
 
+                implot.setup_axes_limits(2.0, x_hi, dmin, dmax, implot.Cond_.always)
                 implot.plot_line(
                     "Planck 2018",
                     ell_a,
@@ -3201,13 +3381,35 @@ class WeaveForgeStudioApp:
                     ell_a,
                     mod_a,
                     spec=implot.Spec(
-                        line_color=COL_PASS if rep.cmb_r32_ratio > 0.85 else COL_FAIL,
+                        line_color=mod_col,
                         line_weight=2.2 * w_scale,
                     ),
                 )
                 implot.end_plot()
 
-            # Chart 3: Dec 2, 2026 Gaia DR4 3D QUMOND Wide-Binary Boost (Zenodo 10.5281/zenodo.23919217)
+            # Chart 3: Dec 2, 2026 Gaia DR4 3D QUMOND Wide-Binary Boost + Blind Day-1 Rehearsal
+            if imgui.small_button("Run Day-1 Blind Rehearsal##gaia_day1_btn"):
+                self.run_gaia_day1_rehearsal(n_binaries=3200)
+            if self._gaia_day1_rehearsal is not None:
+                reh = self._gaia_day1_rehearsal
+                v_str = str(reh.get("verdict", ""))
+                short_v = (
+                    "TNAP"
+                    if "TNAP" in v_str
+                    else ("LCDM" if "LAMBDA_CDM" in v_str else "INC")
+                )
+                reh_txt = f"dChi2={float(reh.get('delta_chi2', 0.0)):+.1f} ({short_v})"
+                reh_col = (
+                    COL_PASS
+                    if "TNAP" in v_str
+                    else (COL_FORECAST if "LAMBDA_CDM" in v_str else COL_WARN)
+                )
+                reh_w = imgui.calc_text_size(reh_txt).x
+                btn_end_x = imgui.get_item_rect_max().x - imgui.get_window_pos().x
+                avail_reh_x = imgui.get_window_width() - reh_w - style.window_padding.x
+                if avail_reh_x > btn_end_x + 6.0 * s:
+                    imgui.same_line(avail_reh_x)
+                    imgui.text_colored(reh_col, reh_txt)
             wb = rep.wb_curves
             if wb and implot.begin_plot("Gaia DR4 3D QUMOND Boost vs log10(s/AU)", imgui.ImVec2(-1.0, plot_h)):
                 implot.setup_axes("log10(s [AU])", "Boost [%]")

@@ -85,16 +85,60 @@ def _cmd_audit(_args: argparse.Namespace) -> int:
 
 
 def _cmd_gaia(args: argparse.Namespace) -> int:
+    import tempfile
     from weaveforge.data.gaia_dr4_pipeline import (
+        GaiaCutFlowSummary,
         analyze_gaia_wide_binary_sample,
+        evaluate_gaia_dr4_day_one_verdict,
+        export_mock_raw_gaia_dr4_astrometry_csv,
         generate_mock_gaia_dr4_catalog,
+        ingest_gaia_dr4_raw_astrometry,
+        is_raw_gaia_astrometry_csv,
         load_gaia_dr4_csv,
     )
 
+    inject_contam = not bool(args.no_contaminants)
+    cut_flow: GaiaCutFlowSummary | None = None
+    is_raw = False
+
+    if args.export_raw_mock:
+        out_path = Path(args.export_raw_mock)
+        exp_stats = export_mock_raw_gaia_dr4_astrometry_csv(
+            out_path,
+            n_binaries=args.mock_count,
+            truth_mode=args.truth,
+            inject_contaminants=inject_contam,
+        )
+        print(
+            f"[WeaveForge Gaia DR4 Raw Mock] Exported {exp_stats['n_total_exported']} rows "
+            f"({exp_stats['n_clean_injected']} clean, {exp_stats['n_contaminants_injected']} contaminants) -> {out_path}"
+        )
+
     if args.csv:
         p = Path(args.csv)
-        pairs = load_gaia_dr4_csv(p, max_ruwe=args.max_ruwe)
+        if is_raw_gaia_astrometry_csv(p):
+            pairs, cut_flow = ingest_gaia_dr4_raw_astrometry(p, max_ruwe=args.max_ruwe)
+            is_raw = True
+        else:
+            pairs = load_gaia_dr4_csv(p, max_ruwe=args.max_ruwe)
         label = f"CSV ({p.name})"
+    elif args.export_raw_mock:
+        p = Path(args.export_raw_mock)
+        pairs, cut_flow = ingest_gaia_dr4_raw_astrometry(p, max_ruwe=args.max_ruwe)
+        is_raw = True
+        label = f"Raw Mock CSV ({p.name}, {args.truth}, N={args.mock_count})"
+    elif args.day_one_verdict:
+        with tempfile.TemporaryDirectory() as tmp_d:
+            tmp_csv = Path(tmp_d) / "gaia_dr4_day_one_rehearsal.csv"
+            export_mock_raw_gaia_dr4_astrometry_csv(
+                tmp_csv,
+                n_binaries=args.mock_count,
+                truth_mode=args.truth,
+                inject_contaminants=inject_contam,
+            )
+            pairs, cut_flow = ingest_gaia_dr4_raw_astrometry(tmp_csv, max_ruwe=args.max_ruwe)
+        is_raw = True
+        label = f"Day-One 3D Sky Mock ({args.truth}, N={args.mock_count})"
     else:
         pairs = generate_mock_gaia_dr4_catalog(n_binaries=args.mock_count, truth_mode=args.truth)
         label = f"Synthetic Gaia DR4 Mock ({args.truth}, N={args.mock_count})"
@@ -105,6 +149,34 @@ def _cmd_gaia(args: argparse.Namespace) -> int:
     print(f"  Disk Boost (|z|<1.5k) : {res['disk_boost_pct']:+.2f}%")
     print(f"  Halo Boost (|z|>=4.5k): {res['halo_boost_pct']:+.2f}%")
     print(f"  Halo-vs-Disk Excess   : {res['halo_excess_sigma']:+.2f} sigma")
+
+    if bool(args.day_one_verdict) or is_raw:
+        verdict = evaluate_gaia_dr4_day_one_verdict(pairs, cut_flow=cut_flow)
+        print(f"\n[Zenodo {verdict['zenodo_doi']} — 3-Test Blind Falsification Scorecard]")
+        if cut_flow is not None:
+            print(
+                f"  Cut-Flow              : raw={cut_flow.n_raw_rows} -> poe={cut_flow.n_passed_snr_parallax} "
+                f"-> plx={cut_flow.n_passed_consistent_parallax} -> nss={cut_flow.n_passed_nss} "
+                f"-> ruwe={cut_flow.n_passed_ruwe} -> rv={cut_flow.n_passed_rv_bound} -> clean={cut_flow.n_clean_final}"
+            )
+        print(
+            f"  [Test A] Local <=300pc: {verdict['local_backyard_15k_boost_pct']:+.2f}% +/- "
+            f"{verdict['local_backyard_15k_err_pct']:.2f}% (TNaP {verdict['tnap_pred_local_15k_boost_pct']:+.2f}% vs LCDM +0.00%)"
+        )
+        print(
+            f"  [Test B] GC Compass   : {verdict['compass_split_pct']:+.2f}% +/- "
+            f"{verdict['compass_split_err_pct']:.2f}% (TNaP {verdict['tnap_pred_compass_split_pct']:+.2f}% vs LCDM +0.00%)"
+        )
+        print(
+            f"  [Test C] Env Step     : {verdict['env_step_halo_minus_inner_pct']:+.2f}% +/- "
+            f"{verdict['env_step_err_pct']:.2f}% (TNaP {verdict['tnap_pred_env_step_pct']:+.2f}% vs LCDM +0.00%)"
+        )
+        print(
+            f"  Combined Chi^2        : chi2_tnap={verdict['chi2_tnap']:.2f} | "
+            f"chi2_lambda_cdm={verdict['chi2_lambda_cdm']:.2f} | "
+            f"delta_chi2={verdict['delta_chi2']:+.2f} | log10_BF={verdict['log10_bayes_factor']:+.2f}"
+        )
+        print(f"  Day-One Blind Verdict : {verdict['verdict']}")
     return 0
 
 
@@ -162,6 +234,22 @@ def main(argv: list[str] | None = None) -> int:
     p_gaia.add_argument("--max-ruwe", type=float, default=1.20)
     p_gaia.add_argument("--mock-count", type=int, default=2400)
     p_gaia.add_argument("--truth", type=str, default="tnap_weave", choices=["tnap_weave", "lambda_cdm"])
+    p_gaia.add_argument(
+        "--day-one-verdict",
+        action="store_true",
+        help="Evaluate Zenodo 10.5281/zenodo.23919217 3-test blind falsification scorecard & verdict",
+    )
+    p_gaia.add_argument(
+        "--export-raw-mock",
+        type=str,
+        default=None,
+        help="Export realistic 3D Keplerian sky-level Gaia DR4 two-star astrometry CSV to path",
+    )
+    p_gaia.add_argument(
+        "--no-contaminants",
+        action="store_true",
+        help="Disable ~12%% RUWE-triple / NSS / RV-flyby contaminant injection in raw mock export",
+    )
     p_gaia.set_defaults(func=_cmd_gaia)
 
     p_sparc = sub.add_parser("fetch-sparc", help="Download/refresh official Lelli+ 2016 SPARC .mrt tables")

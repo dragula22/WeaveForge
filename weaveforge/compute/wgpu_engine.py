@@ -215,10 +215,57 @@ def _eval_trefoil_pq_numpy(
     return p_re, p_im, q_re, q_im
 
 
+def _eval_hopfion_su2_numpy(
+    X: np.ndarray,
+    Y: np.ndarray,
+    Z: np.ndarray,
+    a0: float,
+    phase_psi: float = 0.0,
+    p_scale: float = 1.55,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Evaluates a localized `Q_H = +1` `S^3 -> SU(2)` Hopfion spinor `(q_re, q_im, p_re, p_im)`
+    normalized to `|Q|^2 + |P|^2 == 1` with internal `U(1)` phase `phase_psi`.
+    """
+    r = np.sqrt(X * X + Y * Y + Z * Z)
+    rn = r / float(a0)
+    rn2 = rn * rn
+    chi = np.float32(3.14159265) * np.exp(-0.6931472 * rn2 - 0.095 * rn2 * rn2)
+    sc = np.where(r > 1.0e-5, np.sin(chi) / np.maximum(r, 1.0e-5), np.float32(0.0))
+    cpsi = float(math.cos(phase_psi))
+    spsi = float(math.sin(phase_psi))
+    zx = sc * X
+    zy = sc * Y
+    p_re = float(p_scale) * (zx * cpsi - zy * spsi)
+    p_im = float(p_scale) * (zx * spsi + zy * cpsi)
+    q_re = np.cos(chi)
+    q_im = -sc * Z
+    inv_n = 1.0 / np.maximum(np.sqrt(q_re * q_re + q_im * q_im + p_re * p_re + p_im * p_im), 1.0e-12)
+    return (
+        (q_re * inv_n).astype(np.float32),
+        (q_im * inv_n).astype(np.float32),
+        (p_re * inv_n).astype(np.float32),
+        (p_im * inv_n).astype(np.float32),
+    )
+
+
+KNOT_PRESETS: List[Tuple[str, str]] = [
+    ("trefoil_knot", "Trefoil Knot T(3,2)  [Baryon Q_H = +7]"),
+    ("z3_braid", "3-Ribbon Z_3 Braid  [Koide Generation Link]"),
+    ("hopfion_ring", "Linked Hopfion Rings  [Skyrme-Faddeev Link]"),
+    ("packet_smash", "3D Wave-Packet Smash  [Relativistic Interference]"),
+    ("two_matter_trefoils", "Two Matter Trefoils (+7 / +7): Emergent 1/r^2 Gravity"),
+    ("matter_antimatter_trefoils", "Matter + Antimatter Trefoils (+7 / -7): Gravity + Annihilation"),
+    ("binary_trefoil_inspiral", "Binary Trefoil Inspiral (+7 / +7): Orbiting Quadrupole GW Ripples"),
+    ("fermion_hopfion_pauli", "Fermionic Hopfions (+1 / +1): Pauli In-Phase Core Repulsion"),
+]
+
+
 def build_3d_topological_initial_state(
     grid_n: int = 64,
     preset: str = "trefoil_knot",
     box_size: float = 12.0,
+    pauli_twist_pi: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Constructs C-infinity smooth, periodic-boundary-clean 3D topological Hopfion / knot initial fields
@@ -229,6 +276,8 @@ def build_3d_topological_initial_state(
       • `packet_smash`:               Head-on 3D relativistic wave-packet collision (`Observer Channel A/B` interference)
       • `two_matter_trefoils`:        Two separated `+7 / +7` Matter Trefoils (`Q_H = +14`) at rest for `1/r^2` gravity!
       • `matter_antimatter_trefoils`: Separated `+7 / -7` Matter + Antimatter Trefoils (`Q_H = 0`) for gravity + annihilation!
+      • `binary_trefoil_inspiral`:    Orbiting `+7 / +7` Trefoil Binary (`Q_H = +14`) for quadrupole GW radiation!
+      • `fermion_hopfion_pauli`:      Two `+1 / +1` Finkelstein-Rubinstein Hopfions (`Q_H = +2`) head-on Pauli scattering!
     """
     idx_lin = (np.arange(grid_n, dtype=np.float32) + 0.5) / float(grid_n)
     coords = (idx_lin - 0.5) * float(box_size)
@@ -441,6 +490,35 @@ def build_3d_topological_initial_state(
             dphi_dy = (np.roll(phi[..., :3], -1, axis=1) - np.roll(phi[..., :3], 1, axis=1)) / (2.0 * dx_init)
             vel[..., :3] = -vy_prof[..., None] * dphi_dy
 
+    elif preset in ("fermion_hopfion_pauli", "fermion_hopfion_singlet"):
+        a0 = 0.135 * float(box_size)
+        x_off = 0.132 * float(box_size)
+        psi_right = math.pi if (preset == "fermion_hopfion_singlet" or pauli_twist_pi) else 0.0
+        q1_re, q1_im, p1_re, p1_im = _eval_hopfion_su2_numpy(X + x_off, Y, Z, a0, phase_psi=0.0, p_scale=1.55)
+        q2_re, q2_im, p2_re, p2_im = _eval_hopfion_su2_numpy(X - x_off, Y, Z, a0, phase_psi=psi_right, p_scale=1.55)
+
+        # Pointwise SU(2) group product U_12(x) = U_1(x + x_off) * U_2(x - x_off):
+        # Q_12 = Q_1 Q_2 - P_1 P_2*,  P_12 = Q_1 P_2 + P_1 Q_2*  (exact degree Q_H = 1 + 1 = +2)
+        qt_re = (q1_re * q2_re - q1_im * q2_im) - (p1_re * p2_re + p1_im * p2_im)
+        qt_im = (q1_re * q2_im + q1_im * q2_re) - (p1_im * p2_re - p1_re * p2_im)
+        pt_re = (q1_re * p2_re - q1_im * p2_im) + (p1_re * q2_re + p1_im * q2_im)
+        pt_im = (q1_re * p2_im + q1_im * p2_re) + (p1_im * q2_re - p1_re * q2_im)
+
+        q2 = qt_re * qt_re + qt_im * qt_im
+        p2 = pt_re * pt_re + pt_im * pt_im
+        denom = np.maximum(p2 + q2, 1.0e-12)
+        pqbar_re = pt_re * qt_re + pt_im * qt_im
+        pqbar_im = pt_im * qt_re - pt_re * qt_im
+        phi[..., 0] = v0 * (2.0 * pqbar_re / denom)
+        phi[..., 1] = v0 * (2.0 * pqbar_im / denom)
+        phi[..., 2] = v0 * (((q2 - p2) / denom) - 1.0)
+
+        dx_init = float(box_size) / float(grid_n)
+        w_boost = 0.0609 * float(box_size)
+        vx_prof = -0.08 * np.tanh(X / max(w_boost, 1.0e-4))
+        dphi_dx = (np.roll(phi[..., :3], -1, axis=2) - np.roll(phi[..., :3], 1, axis=2)) / (2.0 * dx_init)
+        vel[..., :3] = -vx_prof[..., None] * dphi_dx
+
     else:  # packet_smash
         sep = 0.20 * box_size
         w0 = 0.065 * box_size
@@ -465,6 +543,8 @@ _PRESET_NAME_TO_IDX: Dict[str, int] = {
     "two_matter_trefoils": 4,
     "matter_antimatter_trefoils": 5,
     "binary_trefoil_inspiral": 6,
+    "fermion_hopfion_pauli": 7,
+    "fermion_hopfion_singlet": 8,
 }
 
 _INIT_KNOT_WGSL = """
@@ -503,6 +583,39 @@ fn eval_trefoil_pq(pt: vec3<f32>, a0: f32) -> vec4<f32> {
     let Q_map = cmul(Z1_2, Z1) + Z2_2;
     let P_map = 1.95 * cmul(Z1_2, Z2);
     return vec4<f32>(P_map.x, P_map.y, Q_map.x, Q_map.y);
+}
+
+fn eval_hopfion_su2(pt: vec3<f32>, a0: f32, psi: f32) -> vec4<f32> {
+    let r = length(pt);
+    let rn = r / a0;
+    let rn2 = rn * rn;
+    let chi = 3.14159265 * exp(-0.6931472 * rn2 - 0.095 * rn2 * rn2);
+    var sc: f32 = 0.0;
+    if (r > 1e-5) {
+        sc = sin(chi) / r;
+    }
+    let cpsi = cos(psi);
+    let spsi = sin(psi);
+    let zx = sc * pt.x;
+    let zy = sc * pt.y;
+    let p_vec = 1.55 * vec2<f32>(zx * cpsi - zy * spsi, zx * spsi + zy * cpsi);
+    let q_vec = vec2<f32>(cos(chi), -sc * pt.z);
+    let inv_n = 1.0 / max(sqrt(dot(q_vec, q_vec) + dot(p_vec, p_vec)), 1e-12);
+    return vec4<f32>(q_vec.x * inv_n, q_vec.y * inv_n, p_vec.x * inv_n, p_vec.y * inv_n);
+}
+
+fn eval_two_hopfion_phi(pt: vec3<f32>, a0: f32, x_off: f32, psi_right: f32, v0: f32) -> vec3<f32> {
+    let u1 = eval_hopfion_su2(vec3<f32>(pt.x + x_off, pt.y, pt.z), a0, 0.0);
+    let u2 = eval_hopfion_su2(vec3<f32>(pt.x - x_off, pt.y, pt.z), a0, psi_right);
+    let qc = cmul(u1.xy, u2.xy) - cmul(u1.zw, cconj(u2.zw));
+    let pc = cmul(u1.xy, u2.zw) + cmul(u1.zw, cconj(u2.xy));
+    let denom = max(dot(pc, pc) + dot(qc, qc), 1e-12);
+    let pqb = cmul(pc, cconj(qc));
+    return v0 * vec3<f32>(
+        2.0 * pqb.x / denom,
+        2.0 * pqb.y / denom,
+        ((dot(qc, qc) - dot(pc, pc)) / denom) - 1.0
+    );
 }
 
 @compute @workgroup_size(8, 8, 4)
@@ -713,6 +826,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let vy_orb = 0.105 * tanh(p.x / 1.10);
             vel = -vy_orb * ((phi_yp - phi_ym) / (2.0 * dx_i));
         }
+    } else if (params.preset == 7u || params.preset == 8u) {
+        let a0 = 0.135 * u_box;
+        let x_off = 0.132 * u_box;
+        let psi_r = select(0.0, 3.14159265, params.preset == 8u);
+        phi = eval_two_hopfion_phi(p, a0, x_off, psi_r, v0);
+        let dx_i = u_box / f32(n);
+        let phi_xp = eval_two_hopfion_phi(vec3<f32>(p.x + dx_i, p.y, p.z), a0, x_off, psi_r, v0);
+        let phi_xm = eval_two_hopfion_phi(vec3<f32>(p.x - dx_i, p.y, p.z), a0, x_off, psi_r, v0);
+        let w_boost = max(0.0609 * u_box, 1e-4);
+        let vx_in = -0.08 * tanh(p.x / w_boost);
+        vel = -vx_in * ((phi_xp - phi_xm) / (2.0 * dx_i));
     } else {
         let sep = 0.20 * u_box;
         let w0 = 0.065 * u_box;
@@ -958,6 +1082,290 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 }}
 """
 
+
+def _build_step_spin2_gw_wgsl() -> str:
+    """
+    Emits a cross-platform WGSL compute shader advancing the 5 independent trace-free tensor GW channels
+    `d^2 q_a / dt^2 = c_gw^2 * (nabla^2 q_a + 4 * kappa * S_a^{TF})` (`a = 0..4`) sourced by the exact
+    3D Skyrme-Faddeev spatial stress tensor `Sigma_{ij}^{TF}`, using an `O(dx^4)`-isotropic 18-neighbor
+    gradient + 19-point Laplacian stencil (so spherical monopoles satisfy `h_+ = h_x = 0` by Birkhoff's
+    theorem!) and 1st-order spherical Bayliss-Turkel / Sommerfeld radiative outflow on all 6 outer faces.
+    """
+    return """
+struct GwWaveParams {
+    N: u32,
+    dx: f32,
+    dt: f32,
+    half_box: f32,
+    kappa: f32,
+    c_gw: f32,
+    c_w: f32,
+    k_skyrme: f32,
+};
+
+@group(0) @binding(0) var<uniform> gparams: GwWaveParams;
+@group(0) @binding(1) var<storage, read> phi_in: array<f32>;
+@group(0) @binding(2) var<storage, read> q_in: array<f32>;
+@group(0) @binding(3) var<storage, read_write> qt_io: array<f32>;
+@group(0) @binding(4) var<storage, read_write> q_out: array<f32>;
+
+fn idx_wrap(x: i32, y: i32, z: i32, n: i32) -> u32 {
+    let xm = (x + n) % n;
+    let ym = (y + n) % n;
+    let zm = (z + n) % n;
+    return u32((zm * n + ym) * n + xm);
+}
+
+fn idx_clamp(x: i32, y: i32, z: i32, n: i32) -> u32 {
+    let xc = clamp(x, 0, n - 1);
+    let yc = clamp(y, 0, n - 1);
+    let zc = clamp(z, 0, n - 1);
+    return u32((zc * n + yc) * n + xc);
+}
+
+fn load_phi(idx: u32) -> vec3<f32> {
+    let b = idx * 3u;
+    return vec3<f32>(phi_in[b], phi_in[b + 1u], phi_in[b + 2u]);
+}
+
+fn sample_trilinear_q(ch_base: u32, fc: vec3<f32>, n: i32) -> f32 {
+    let i0 = vec3<i32>(floor(fc));
+    let t = fc - vec3<f32>(i0);
+    let c000 = q_in[ch_base + idx_clamp(i0.x,     i0.y,     i0.z,     n)];
+    let c100 = q_in[ch_base + idx_clamp(i0.x + 1, i0.y,     i0.z,     n)];
+    let c010 = q_in[ch_base + idx_clamp(i0.x,     i0.y + 1, i0.z,     n)];
+    let c110 = q_in[ch_base + idx_clamp(i0.x + 1, i0.y + 1, i0.z,     n)];
+    let c001 = q_in[ch_base + idx_clamp(i0.x,     i0.y,     i0.z + 1, n)];
+    let c101 = q_in[ch_base + idx_clamp(i0.x + 1, i0.y,     i0.z + 1, n)];
+    let c011 = q_in[ch_base + idx_clamp(i0.x,     i0.y + 1, i0.z + 1, n)];
+    let c111 = q_in[ch_base + idx_clamp(i0.x + 1, i0.y + 1, i0.z + 1, n)];
+    let c00 = mix(c000, c100, t.x);
+    let c10 = mix(c010, c110, t.x);
+    let c01 = mix(c001, c101, t.x);
+    let c11 = mix(c011, c111, t.x);
+    return mix(mix(c00, c10, t.y), mix(c01, c11, t.y), t.z);
+}
+
+@compute @workgroup_size(8, 8, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n_u = gparams.N;
+    if (gid.x >= n_u || gid.y >= n_u || gid.z >= n_u) {
+        return;
+    }
+    let n = i32(n_u);
+    let vox = n_u * n_u * n_u;
+    let gx = i32(gid.x);
+    let gy = i32(gid.y);
+    let gz = i32(gid.z);
+    let c_idx = u32((gz * n + gy) * n + gx);
+    let h = gparams.dx;
+
+    if (gx == 0 || gx == n - 1 || gy == 0 || gy == n - 1 || gz == 0 || gz == n - 1) {
+        let p_cell = (vec3<f32>(f32(gx), f32(gy), f32(gz)) + vec3<f32>(0.5)) * h - vec3<f32>(gparams.half_box);
+        let r = max(length(p_cell), h);
+        let r_in = max(r - h, 0.5 * h);
+        let ratio_r = r_in / r;
+        let p_in = p_cell * ratio_r;
+        let fc = clamp(
+            (p_in + vec3<f32>(gparams.half_box)) / h - vec3<f32>(0.5),
+            vec3<f32>(0.0),
+            vec3<f32>(f32(n - 1) - 1e-4)
+        );
+        let alpha = (gparams.c_gw * gparams.dt) / h;
+        let inv_1pa = 1.0 / (1.0 + alpha);
+        let inv_dt = 1.0 / max(gparams.dt, 1e-12);
+        for (var a: u32 = 0u; a < 5u; a = a + 1u) {
+            let ch_base = a * vox;
+            let q_c = q_in[ch_base + c_idx];
+            let q_inner = sample_trilinear_q(ch_base, fc, n);
+            let q_next = (q_c + alpha * (ratio_r * q_inner)) * inv_1pa;
+            qt_io[ch_base + c_idx] = (q_next - q_c) * inv_dt;
+            q_out[ch_base + c_idx] = q_next;
+        }
+        return;
+    }
+
+    // O(dx^4)-isotropic 18-neighbor gradient on phi_in
+    let inv_dx = 1.0 / h;
+    let p_p00 = load_phi(idx_wrap(gx + 1, gy,     gz,     n));
+    let p_m00 = load_phi(idx_wrap(gx - 1, gy,     gz,     n));
+    let p_0p0 = load_phi(idx_wrap(gx,     gy + 1, gz,     n));
+    let p_0m0 = load_phi(idx_wrap(gx,     gy - 1, gz,     n));
+    let p_00p = load_phi(idx_wrap(gx,     gy,     gz + 1, n));
+    let p_00m = load_phi(idx_wrap(gx,     gy,     gz - 1, n));
+
+    let p_pp0 = load_phi(idx_wrap(gx + 1, gy + 1, gz,     n));
+    let p_pm0 = load_phi(idx_wrap(gx + 1, gy - 1, gz,     n));
+    let p_mp0 = load_phi(idx_wrap(gx - 1, gy + 1, gz,     n));
+    let p_mm0 = load_phi(idx_wrap(gx - 1, gy - 1, gz,     n));
+
+    let p_p0p = load_phi(idx_wrap(gx + 1, gy,     gz + 1, n));
+    let p_p0m = load_phi(idx_wrap(gx + 1, gy,     gz - 1, n));
+    let p_m0p = load_phi(idx_wrap(gx - 1, gy,     gz + 1, n));
+    let p_m0m = load_phi(idx_wrap(gx - 1, gy,     gz - 1, n));
+
+    let p_0pp = load_phi(idx_wrap(gx,     gy + 1, gz + 1, n));
+    let p_0pm = load_phi(idx_wrap(gx,     gy + 1, gz - 1, n));
+    let p_0mp = load_phi(idx_wrap(gx,     gy - 1, gz + 1, n));
+    let p_0mm = load_phi(idx_wrap(gx,     gy - 1, gz - 1, n));
+
+    let gx_v = ((p_p00 - p_m00) * (1.0 / 6.0)
+              + ((p_pp0 - p_mp0) + (p_pm0 - p_mm0) + (p_p0p - p_m0p) + (p_p0m - p_m0m)) * (1.0 / 12.0)) * inv_dx;
+    let gy_v = ((p_0p0 - p_0m0) * (1.0 / 6.0)
+              + ((p_pp0 - p_pm0) + (p_mp0 - p_mm0) + (p_0pp - p_0mp) + (p_0pm - p_0mm)) * (1.0 / 12.0)) * inv_dx;
+    let gz_v = ((p_00p - p_00m) * (1.0 / 6.0)
+              + ((p_p0p - p_p0m) + (p_m0p - p_m0m) + (p_0pp - p_0pm) + (p_0mp - p_0mm)) * (1.0 / 12.0)) * inv_dx;
+
+    let bx = cross(gy_v, gz_v);
+    let by = cross(gz_v, gx_v);
+    let bz = cross(gx_v, gy_v);
+    let bx2 = dot(bx, bx);
+    let by2 = dot(by, by);
+    let bz2 = dot(bz, bz);
+
+    let cw2 = gparams.c_w * gparams.c_w;
+    let ks = gparams.k_skyrme;
+    let sxx = cw2 * dot(gx_v, gx_v) + ks * (by2 + bz2);
+    let syy = cw2 * dot(gy_v, gy_v) + ks * (bx2 + bz2);
+    let szz = cw2 * dot(gz_v, gz_v) + ks * (bx2 + by2);
+    let sxy = cw2 * dot(gx_v, gy_v) - ks * dot(bx, by);
+    let sxz = cw2 * dot(gx_v, gz_v) - ks * dot(bx, bz);
+    let syz = cw2 * dot(gy_v, gz_v) - ks * dot(by, bz);
+
+    var src_tf: array<f32, 5>;
+    src_tf[0] = 0.5 * (sxx - syy);
+    src_tf[1] = sxy;
+    src_tf[2] = sxz;
+    src_tf[3] = syz;
+    src_tf[4] = (2.0 * szz - sxx - syy) * (1.0 / 3.0);
+
+    // Precompute clamped neighbor indices for 19-point isotropic Laplacian
+    let id_m00 = idx_clamp(gx - 1, gy,     gz,     n);
+    let id_p00 = idx_clamp(gx + 1, gy,     gz,     n);
+    let id_0m0 = idx_clamp(gx,     gy - 1, gz,     n);
+    let id_0p0 = idx_clamp(gx,     gy + 1, gz,     n);
+    let id_00m = idx_clamp(gx,     gy,     gz - 1, n);
+    let id_00p = idx_clamp(gx,     gy,     gz + 1, n);
+
+    let id_pp0 = idx_clamp(gx + 1, gy + 1, gz,     n);
+    let id_pm0 = idx_clamp(gx + 1, gy - 1, gz,     n);
+    let id_mp0 = idx_clamp(gx - 1, gy + 1, gz,     n);
+    let id_mm0 = idx_clamp(gx - 1, gy - 1, gz,     n);
+
+    let id_p0p = idx_clamp(gx + 1, gy,     gz + 1, n);
+    let id_p0m = idx_clamp(gx + 1, gy,     gz - 1, n);
+    let id_m0p = idx_clamp(gx - 1, gy,     gz + 1, n);
+    let id_m0m = idx_clamp(gx - 1, gy,     gz - 1, n);
+
+    let id_0pp = idx_clamp(gx,     gy + 1, gz + 1, n);
+    let id_0pm = idx_clamp(gx,     gy + 1, gz - 1, n);
+    let id_0mp = idx_clamp(gx,     gy - 1, gz + 1, n);
+    let id_0mm = idx_clamp(gx,     gy - 1, gz - 1, n);
+
+    let inv_dx2 = inv_dx * inv_dx;
+    let cgw2 = gparams.c_gw * gparams.c_gw;
+    let four_kappa = 4.0 * gparams.kappa;
+    let dt = gparams.dt;
+
+    for (var a: u32 = 0u; a < 5u; a = a + 1u) {
+        let ch_base = a * vox;
+        let q_c = q_in[ch_base + c_idx];
+        let s_face = q_in[ch_base + id_m00] + q_in[ch_base + id_p00]
+                   + q_in[ch_base + id_0m0] + q_in[ch_base + id_0p0]
+                   + q_in[ch_base + id_00m] + q_in[ch_base + id_00p];
+        let s_edge = q_in[ch_base + id_pp0] + q_in[ch_base + id_pm0] + q_in[ch_base + id_mp0] + q_in[ch_base + id_mm0]
+                   + q_in[ch_base + id_p0p] + q_in[ch_base + id_p0m] + q_in[ch_base + id_m0p] + q_in[ch_base + id_m0m]
+                   + q_in[ch_base + id_0pp] + q_in[ch_base + id_0pm] + q_in[ch_base + id_0mp] + q_in[ch_base + id_0mm];
+        let lap_q = (s_face * (1.0 / 3.0) + s_edge * (1.0 / 6.0) - 4.0 * q_c) * inv_dx2;
+        let acc_q = cgw2 * (lap_q + four_kappa * src_tf[a]);
+        let qt_next = qt_io[ch_base + c_idx] + dt * acc_q;
+        let q_next = q_c + dt * qt_next;
+        qt_io[ch_base + c_idx] = qt_next;
+        q_out[ch_base + c_idx] = q_next;
+    }
+}
+"""
+
+
+def project_spin2_tt_numpy(
+    q_5zyx: np.ndarray,
+    box_size: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Projects the 5 trace-free tensor wave channels `q_5zyx` (`shape = (5, M, M, M)`) onto the
+    local spherical Transverse-Traceless (`TT`) gravitational-wave polarizations `(h_plus, h_cross)`
+    via the exact projector `h_{ij}^{TT}(r_hat) = P_{ik} P_{jl} h_{kl} - 1/2 P_{ij} (P_{kl} h_{kl})`.
+    """
+    q = np.asarray(q_5zyx, dtype=np.float64)
+    if q.ndim != 4 or q.shape[0] != 5:
+        raise ValueError(f"Expected q_5zyx of shape (5, M, M, M), got {q.shape}")
+    m_grid = int(q.shape[1])
+
+    q0, q1, q2, q3, q4 = q[0], q[1], q[2], q[3], q[4]
+    hxx = q0 - 0.5 * q4
+    hyy = -q0 - 0.5 * q4
+    hzz = q4
+    hxy = q1
+    hxz = q2
+    hyz = q3
+
+    coords = ((np.arange(m_grid, dtype=np.float64) + 0.5) / float(m_grid) - 0.5) * float(box_size)
+    Z, Y, X = np.meshgrid(coords, coords, coords, indexing="ij")
+    rho_xy2 = X * X + Y * Y
+    r = np.maximum(np.sqrt(rho_xy2 + Z * Z), 1.0e-7)
+    rx = X / r
+    ry = Y / r
+    rz = Z / r
+
+    pole_mask = rho_xy2 < 1.0e-8
+    rho_xy_safe = np.where(pole_mask, 1.0, np.sqrt(np.maximum(rho_xy2, 1.0e-30)))
+    c_phi = np.where(pole_mask, 1.0, X / rho_xy_safe)
+    s_phi = np.where(pole_mask, 0.0, Y / rho_xy_safe)
+    c_th = np.where(pole_mask, 1.0, Z / r)
+    s_th = np.where(pole_mask, 0.0, rho_xy_safe / r)
+
+    et_x = np.where(pole_mask, 1.0, c_th * c_phi)
+    et_y = np.where(pole_mask, 0.0, c_th * s_phi)
+    et_z = np.where(pole_mask, 0.0, -s_th)
+
+    ep_x = np.where(pole_mask, 0.0, -s_phi)
+    ep_y = np.where(pole_mask, 1.0, c_phi)
+    ep_z = np.zeros_like(X)
+
+    # Exact TT projection h_{ij}^{TT} = P_{ik} P_{jl} h_{kl} - 1/2 P_{ij} (P_{kl} h_{kl})
+    # Using Tr(h) == 0: P_{kl} h_{kl} = -r_k r_l h_{kl} = -s_rr
+    vx = hxx * rx + hxy * ry + hxz * rz
+    vy = hxy * rx + hyy * ry + hyz * rz
+    vz = hxz * rx + hyz * ry + hzz * rz
+    s_rr = rx * vx + ry * vy + rz * vz
+
+    htt_xx = hxx - 2.0 * rx * vx + 0.5 * (1.0 + rx * rx) * s_rr
+    htt_yy = hyy - 2.0 * ry * vy + 0.5 * (1.0 + ry * ry) * s_rr
+    htt_zz = hzz - 2.0 * rz * vz + 0.5 * (1.0 + rz * rz) * s_rr
+    htt_xy = hxy - rx * vy - ry * vx + 0.5 * rx * ry * s_rr
+    htt_xz = hxz - rx * vz - rz * vx + 0.5 * rx * rz * s_rr
+    htt_yz = hyz - ry * vz - rz * vy + 0.5 * ry * rz * s_rr
+
+    htt_tt = (
+        et_x * (htt_xx * et_x + htt_xy * et_y + htt_xz * et_z)
+        + et_y * (htt_xy * et_x + htt_yy * et_y + htt_yz * et_z)
+        + et_z * (htt_xz * et_x + htt_yz * et_y + htt_zz * et_z)
+    )
+    htt_pp = (
+        ep_x * (htt_xx * ep_x + htt_xy * ep_y + htt_xz * ep_z)
+        + ep_y * (htt_xy * ep_x + htt_yy * ep_y + htt_yz * ep_z)
+        + ep_z * (htt_xz * ep_x + htt_yz * ep_y + htt_zz * ep_z)
+    )
+    htt_tp = (
+        et_x * (htt_xx * ep_x + htt_xy * ep_y + htt_xz * ep_z)
+        + et_y * (htt_xy * ep_x + htt_yy * ep_y + htt_yz * ep_z)
+        + et_z * (htt_xz * ep_x + htt_yz * ep_y + htt_zz * ep_z)
+    )
+
+    h_plus = (0.5 * (htt_tt - htt_pp)).astype(np.float32)
+    h_cross = htt_tp.astype(np.float32)
+    return h_plus, h_cross
+
 _LIMIT_KEYS_FOR_COMPUTE = (
     "max-storage-buffer-binding-size",
     "max-buffer-size",
@@ -1119,6 +1527,8 @@ class WgpuComputeEngine:
         u_field_override: Optional[np.ndarray] = None,
         zero_init_tension_u: bool = False,
         readback_tension_u: bool = False,
+        enable_spin2_gw: bool = False,
+        readback_spin2_gw: Optional[bool] = None,
     ) -> Dict[str, object]:
         """
         Executes `n_steps` of the compiled 3D WGSL PDE kernel on GPU using packed 3-float (`12` B/voxel)
@@ -1139,6 +1549,8 @@ class WgpuComputeEngine:
         nbytes_vec3 = total_vox * 12
         if readback_full_field is None:
             readback_full_field = grid_n <= 128
+        if readback_spin2_gw is None:
+            readback_spin2_gw = bool(enable_spin2_gw)
 
         usage_storage = (
             wgpu.BufferUsage.STORAGE
@@ -1155,6 +1567,10 @@ class WgpuComputeEngine:
         buf_u_b: Optional[wgpu.GPUBuffer] = None
         buf_ut: Optional[wgpu.GPUBuffer] = None
         buf_u_uni: Optional[wgpu.GPUBuffer] = None
+        buf_gw_q_a: Optional[wgpu.GPUBuffer] = None
+        buf_gw_q_b: Optional[wgpu.GPUBuffer] = None
+        buf_gw_qt: Optional[wgpu.GPUBuffer] = None
+        buf_gw_uni: Optional[wgpu.GPUBuffer] = None
         buf_uni: Optional[wgpu.GPUBuffer] = None
         buf_init_uni: Optional[wgpu.GPUBuffer] = None
         phi0_3_cpu: Optional[np.ndarray] = None
@@ -1342,6 +1758,55 @@ class WgpuComputeEngine:
                     ],
                 )
 
+            spin2_active = bool(enable_spin2_gw and abs(g_knot_val) > 1.0e-12 and grid_n <= 128)
+            gw_wave_pipe = None
+            bg_gw_ab = None
+            bg_gw_ba = None
+            nbytes_gw = 5 * total_vox * 4
+            if spin2_active:
+                zeros_gw = np.zeros(5 * total_vox, dtype=np.float32).tobytes()
+                buf_gw_q_a = self.device.create_buffer_with_data(data=zeros_gw, usage=usage_storage)
+                buf_gw_q_b = self.device.create_buffer(size=nbytes_gw, usage=usage_storage)
+                buf_gw_qt = self.device.create_buffer_with_data(data=zeros_gw, usage=usage_storage)
+                gw_wave_pipe = self._get_pipeline(_build_step_spin2_gw_wgsl())
+                c_gw_spin2 = compute_effective_gw_speed(mod, compiled)
+                gw_uni_bytes = struct.pack(
+                    "<I7f",
+                    int(grid_n),
+                    float(dx),
+                    float(dt),
+                    float(box_size) * 0.5,
+                    float(WEAVE_KAPPA_SCALE * g_knot_val),
+                    float(c_gw_spin2),
+                    float(mod.parameters.c_w),
+                    float(mod.parameters.k_skyrme),
+                )
+                buf_gw_uni = self.device.create_buffer_with_data(
+                    data=gw_uni_bytes,
+                    usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+                )
+                gw_layout = gw_wave_pipe.get_bind_group_layout(0)
+                bg_gw_ab = self.device.create_bind_group(
+                    layout=gw_layout,
+                    entries=[
+                        {"binding": 0, "resource": {"buffer": buf_gw_uni}},
+                        {"binding": 1, "resource": {"buffer": buf_a}},
+                        {"binding": 2, "resource": {"buffer": buf_gw_q_a}},
+                        {"binding": 3, "resource": {"buffer": buf_gw_qt}},
+                        {"binding": 4, "resource": {"buffer": buf_gw_q_b}},
+                    ],
+                )
+                bg_gw_ba = self.device.create_bind_group(
+                    layout=gw_layout,
+                    entries=[
+                        {"binding": 0, "resource": {"buffer": buf_gw_uni}},
+                        {"binding": 1, "resource": {"buffer": buf_b}},
+                        {"binding": 2, "resource": {"buffer": buf_gw_q_b}},
+                        {"binding": 3, "resource": {"buffer": buf_gw_qt}},
+                        {"binding": 4, "resource": {"buffer": buf_gw_q_a}},
+                    ],
+                )
+
             bind_layout = pipe.get_bind_group_layout(0)
             u_for_ab = buf_u_b if (retarded_active and buf_u_b is not None) else buf_u
             u_for_ba = buf_u
@@ -1370,11 +1835,16 @@ class WgpuComputeEngine:
             if n_steps > 0:
                 encoder = self.device.create_command_encoder()
                 cpass = encoder.begin_compute_pass()
-                if retarded_active and u_wave_pipe is not None:
+                if (retarded_active and u_wave_pipe is not None) or (spin2_active and gw_wave_pipe is not None):
                     for _ in range(n_steps):
-                        cpass.set_pipeline(u_wave_pipe)
-                        cpass.set_bind_group(0, bg_u_ab if cur_in_a else bg_u_ba)
-                        cpass.dispatch_workgroups(wg_xy, wg_xy, wg_z)
+                        if retarded_active and u_wave_pipe is not None:
+                            cpass.set_pipeline(u_wave_pipe)
+                            cpass.set_bind_group(0, bg_u_ab if cur_in_a else bg_u_ba)
+                            cpass.dispatch_workgroups(wg_xy, wg_xy, wg_z)
+                        if spin2_active and gw_wave_pipe is not None:
+                            cpass.set_pipeline(gw_wave_pipe)
+                            cpass.set_bind_group(0, bg_gw_ab if cur_in_a else bg_gw_ba)
+                            cpass.dispatch_workgroups(wg_xy, wg_xy, wg_z)
                         cpass.set_pipeline(pipe)
                         cpass.set_bind_group(0, bg_ab if cur_in_a else bg_ba)
                         cpass.dispatch_workgroups(wg_xy, wg_xy, wg_z)
@@ -1400,6 +1870,19 @@ class WgpuComputeEngine:
                     udot_final_arr = np.frombuffer(raw_ut, dtype=np.float32).reshape((grid_n, grid_n, grid_n)).copy()
                 else:
                     udot_final_arr = np.zeros((grid_n, grid_n, grid_n), dtype=np.float32)
+
+            gw_q_final_arr: Optional[np.ndarray] = None
+            gw_qt_final_arr: Optional[np.ndarray] = None
+            h_plus_final_arr: Optional[np.ndarray] = None
+            h_cross_final_arr: Optional[np.ndarray] = None
+            if readback_spin2_gw and spin2_active:
+                final_gw_q_buf = (buf_gw_q_a if cur_in_a else buf_gw_q_b) if n_steps > 0 else buf_gw_q_a
+                if final_gw_q_buf is not None and buf_gw_qt is not None:
+                    raw_gq = self.device.queue.read_buffer(final_gw_q_buf, size=nbytes_gw)
+                    raw_gqt = self.device.queue.read_buffer(buf_gw_qt, size=nbytes_gw)
+                    gw_q_final_arr = np.frombuffer(raw_gq, dtype=np.float32).reshape((5, grid_n, grid_n, grid_n)).copy()
+                    gw_qt_final_arr = np.frombuffer(raw_gqt, dtype=np.float32).reshape((5, grid_n, grid_n, grid_n)).copy()
+                    h_plus_final_arr, h_cross_final_arr = project_spin2_tt_numpy(gw_q_final_arr, box_size=box_size)
 
             if readback_full_field:
                 phi_final: Optional[np.ndarray] = np.empty((grid_n, grid_n, grid_n, 4), dtype=np.float32)
@@ -1459,11 +1942,29 @@ class WgpuComputeEngine:
                 "vel_final": vel_final,
                 "u_final": u_final_arr,
                 "udot_final": udot_final_arr,
+                "gw_q_final": gw_q_final_arr,
+                "gw_qt_final": gw_qt_final_arr,
+                "h_plus_final": h_plus_final_arr,
+                "h_cross_final": h_cross_final_arr,
                 "mid_slice_xy": mid_slice_xy,
                 "elapsed_ms": elapsed_ms,
             }
         finally:
-            for buf_obj in (buf_a, buf_b, buf_vel, buf_u, buf_u_b, buf_ut, buf_u_uni, buf_uni, buf_init_uni):
+            for buf_obj in (
+                buf_a,
+                buf_b,
+                buf_vel,
+                buf_u,
+                buf_u_b,
+                buf_ut,
+                buf_u_uni,
+                buf_gw_q_a,
+                buf_gw_q_b,
+                buf_gw_qt,
+                buf_gw_uni,
+                buf_uni,
+                buf_init_uni,
+            ):
                 if buf_obj is not None:
                     buf_obj.destroy()
 
