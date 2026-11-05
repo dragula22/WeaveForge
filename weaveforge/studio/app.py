@@ -2,14 +2,14 @@
 WeaveForge Interactive 60–120+ FPS 3D Studio (`weaveforge/studio/app.py`)
 =========================================================================
 Unified Desktop GPU Sandbox (`GLFW` + `ModernGL` OpenGL 4.6 + `Dear ImGui` + `ImPlot`):
-  • Top Command Bar: Live Physics Framework Switcher (6 built-in mods + custom `.toml` save),
+  • Top Command Bar: Live Physics Framework Switcher (7 built-in mods + custom `.toml` save),
     4 Multi-Scale 3D Arena Tabs, Pause/Reset/Snapshot, and live FPS + RTX 5080 telemetry.
   • Left Studio Panel: "One Master Cost Sheet" Live Symbolic Lagrangian Editor (`SymPy` ->
     `GLSL 430` + `WGSL` in `< 50 ms`), 5-Gate Red-Team Health Audit, Coupling Sliders,
     Context-Sensitive Arena Controls, and Rig 2 (`AMD RX 5700 XT`) LAN Worker Dispatcher.
   • Center 3D Viewport: Zero-copy OpenGL FBO texture display (`ImTextureRef`) with full
     60+ FPS `WASD + Q/E + Shift` Free-Fly & Turntable Orbit/Pan/Zoom camera.
-  • Right Studio Panel: Ruthlessly Honest 7-Dataset Observational Pass/Fail Crucible +
+  • Right Studio Panel: Ruthlessly Honest 8-Dataset Observational Pass/Fail Crucible +
     AST Free-Knob Auditor + 3 Real-Time `ImPlot` Scientific Charts (SPARC Rotation Curves,
     Planck CMB TT/TE/EE Knox Chi2, and Dec 2, 2026 `Gaia DR4` Wide-Binary `|z_gal|` Boost).
 """
@@ -59,8 +59,10 @@ from weaveforge.core.symbolic_compiler import (
 )
 from weaveforge.data.gaia_dr4_pipeline import (
     evaluate_gaia_dr4_day_one_verdict,
+    evaluate_gaia_dr4_protocol_v2_verdict,
     export_mock_raw_gaia_dr4_astrometry_csv,
     ingest_gaia_dr4_raw_astrometry,
+    load_bundled_real_gaia_dr3_wide_binaries,
 )
 from weaveforge.studio.theme import (
     COL_ACCENT,
@@ -568,6 +570,7 @@ class WeaveForgeStudioApp:
         self._last_top_reset_btn_rect: Optional[Tuple[float, float, float, float]] = None
         self.cmb_plot_mode: int = 0
         self._gaia_day1_rehearsal: Optional[Dict[str, Any]] = None
+        self._gaia_real_dr3_audit: Optional[Dict[str, Any]] = None
 
         # Viewport offscreen FBO (zero-copy texture bound to ImGui viewport)
         self._view_tex: Optional[moderngl.Texture] = None
@@ -1231,6 +1234,33 @@ class WeaveForgeStudioApp:
         )
         self._reset_frame_pacing_clock()
         return res
+
+    def run_real_gaia_dr3_calibration(self) -> Dict[str, Any]:
+        """
+        Evaluates both archived Zenodo Protocol v1 and systematics-hardened Protocol v2
+        on the bundled 6,322 real ESA/DPAC Gaia DR3 wide binaries (`gaia_dr3_real_wide_binaries.npz`).
+        """
+        t0 = time.perf_counter()
+        a0_val = float(getattr(self.working_mod.parameters, "a0_si", 1.202712e-10))
+        pairs_v1, cf_v1 = load_bundled_real_gaia_dr3_wide_binaries(max_ruwe=1.20, max_sigma_v2d_frac=0.35)
+        pairs_v2, cf_v2 = load_bundled_real_gaia_dr3_wide_binaries(max_ruwe=1.20, max_sigma_v2d_frac=None)
+        v1_res = dict(evaluate_gaia_dr4_day_one_verdict(pairs_v1, a0_si=a0_val, cut_flow=cf_v1))
+        v2_res = dict(evaluate_gaia_dr4_protocol_v2_verdict(pairs_v2, a0_si=a0_val, cut_flow=cf_v2))
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        out: Dict[str, Any] = {
+            "v1": v1_res,
+            "v2": v2_res,
+            "elapsed_ms": elapsed_ms,
+        }
+        self._gaia_real_dr3_audit = out
+        self.status_banner = (
+            f"Real ESA Gaia DR3 (N={v2_res['n_clean']} clean): "
+            f"v1 A={v1_res['local_backyard_15k_boost_pct']:+.1f}% -> "
+            f"v2 A={v2_res['local_backyard_15k_boost_pct']:+.2f}% +/- {v2_res['local_backyard_15k_err_pct']:.2f}%, "
+            f"dChi2={v2_res['delta_chi2']:+.2f} [{v2_res['verdict']}] ({elapsed_ms:.0f} ms)"
+        )
+        self._reset_frame_pacing_clock()
+        return out
 
     def _clear_replay_backup(self, arena_idx: int) -> None:
         self._replay_live_backup.pop(arena_idx, None)
@@ -3173,6 +3203,11 @@ class WeaveForgeStudioApp:
                 imgui.separator()
                 if imgui.menu_item_simple("Reset Observer Slice (|tau| = 2.65)"):
                     self.arena4.tau_now = 2.65
+                imgui.separator()
+                if imgui.menu_item_simple("Run Real ESA Gaia DR3 Calibration (v1 vs v2)"):
+                    self.run_real_gaia_dr3_calibration()
+                if imgui.menu_item_simple("Run Blind Gaia DR4 Day-1 Rehearsal"):
+                    self.run_gaia_day1_rehearsal(n_binaries=3200)
             imgui.end_menu()
 
         if imgui.menu_item_simple("Reset 3D Camera View", "Home"):
@@ -3577,10 +3612,43 @@ class WeaveForgeStudioApp:
                 )
                 implot.end_plot()
 
-            # Chart 3: Dec 2, 2026 Gaia DR4 3D QUMOND Wide-Binary Boost + Blind Day-1 Rehearsal
-            if imgui.small_button("Run Day-1 Blind Rehearsal##gaia_day1_btn"):
+            # Chart 3: Dec 2, 2026 Gaia DR4 3D QUMOND Wide-Binary Boost + Real DR3 & Blind Day-1 Rehearsal
+            if imgui.small_button("Day-1 Mock##gaia_day1_btn"):
                 self.run_gaia_day1_rehearsal(n_binaries=3200)
-            if self._gaia_day1_rehearsal is not None:
+                self._gaia_real_dr3_audit = None
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Run blind 3D Keplerian Gaia DR4 Day-1 rehearsal with injected triples & flybys")
+            imgui.same_line()
+            if imgui.small_button("Real DR3 (v2)##gaia_real_dr3_btn"):
+                self.run_real_gaia_dr3_calibration()
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Evaluate bundled 6,322 real ESA/DPAC Gaia DR3 wide binaries under Zenodo Protocol v1 vs v2"
+                )
+            btn_end_x = imgui.get_item_rect_max().x - imgui.get_window_pos().x
+            if self._gaia_real_dr3_audit is not None:
+                v1r = self._gaia_real_dr3_audit["v1"]
+                v2r = self._gaia_real_dr3_audit["v2"]
+                dr3_txt = (
+                    f"DR3 v2: {float(v2r['local_backyard_15k_boost_pct']):+.1f}%"
+                    f"+/-{float(v2r['local_backyard_15k_err_pct']):.1f}% "
+                    f"(dChi2={float(v2r['delta_chi2']):+.1f})"
+                )
+                dr3_w = imgui.calc_text_size(dr3_txt).x
+                avail_dr3_x = imgui.get_window_width() - dr3_w - style.window_padding.x
+                if avail_dr3_x > btn_end_x + 6.0 * s:
+                    imgui.same_line(avail_dr3_x)
+                    imgui.text_colored(COL_WARN, dr3_txt)
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip(
+                            f"Real ESA Gaia DR3 (6,322 isolated pairs):\n"
+                            f"  Protocol v1 (0.35 SNR, no bound window): Test A = {float(v1r['local_backyard_15k_boost_pct']):+.2f}% +/- {float(v1r['local_backyard_15k_err_pct']):.2f}%\n"
+                            f"  Protocol v2 (Persp + Ricean + Bound<=2.6 + TripleCal f={float(v2r['f_triple_inner_hat']):.2f}):\n"
+                            f"    Test A = {float(v2r['local_backyard_15k_boost_pct']):+.2f}% +/- {float(v2r['local_backyard_15k_err_pct']):.2f}% "
+                            f"(raw {float(v2r['raw_debiased_local_boost_pct']):+.2f}%, bias {float(v2r['triple_forward_bias_local_pct']):+.2f}%)\n"
+                            f"    Verdict: {v2r['verdict']} (chi2_tnap={float(v2r['chi2_tnap']):.2f}, chi2_lcdm={float(v2r['chi2_lambda_cdm']):.2f})"
+                        )
+            elif self._gaia_day1_rehearsal is not None:
                 reh = self._gaia_day1_rehearsal
                 v_str = str(reh.get("verdict", ""))
                 short_v = (
@@ -3595,7 +3663,6 @@ class WeaveForgeStudioApp:
                     else (COL_FORECAST if "LAMBDA_CDM" in v_str else COL_WARN)
                 )
                 reh_w = imgui.calc_text_size(reh_txt).x
-                btn_end_x = imgui.get_item_rect_max().x - imgui.get_window_pos().x
                 avail_reh_x = imgui.get_window_width() - reh_w - style.window_padding.x
                 if avail_reh_x > btn_end_x + 6.0 * s:
                     imgui.same_line(avail_reh_x)

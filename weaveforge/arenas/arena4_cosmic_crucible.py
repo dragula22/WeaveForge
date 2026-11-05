@@ -44,6 +44,7 @@ except Exception:  # pragma: no cover
     camb = None  # type: ignore
     _HAS_CAMB = False
 
+from weaveforge.core.bhex_ringdown import get_kerr_lvk_ringdown_audit
 from weaveforge.core.camera import Camera3D
 from weaveforge.core.cosmology_referee import (
     audit_single_h0_consistency,
@@ -181,6 +182,10 @@ class CrucibleReport:
     per_galaxy_halo_knobs: int = 0
     knob_audit_summary: str = ""
     desi_bao_anchored_chi2_dof: float = 1.0
+    lvk_ringdown_status: str = "PASS"
+    lvk_imr_sigma: float = 0.27
+    lvk_o4_hier_sigma: float = 0.33
+    lvk_max_q220: float = 7.02
 
 
 _CAMB_FORTRAN_LOCK = threading.Lock()
@@ -1745,6 +1750,36 @@ def evaluate_observational_crucible(
         detail_honest=wb_detail,
     ))
 
+    # -------------------------------------------------------------------------
+    # ROW 8: Spinning GW150914 & Hierarchical LVK O3b/O4 Black-Hole Ringdown
+    # -------------------------------------------------------------------------
+    try:
+        lvk_aud = get_kerr_lvk_ringdown_audit(mod, spin_a=0.67)
+        lvk_status = str(lvk_aud["lvk_status"])
+        lvk_imr_sig = float(lvk_aud["gw150914_imr_sigma"])
+        lvk_o4_sig = float(lvk_aud["lvk_o4_hierarchical_sigma"])
+        lvk_qmax = float(lvk_aud["max_achievable_Q220"])
+        lvk_df68 = float(lvk_aud["delta_f220_at_chi068_pct"])
+        lvk_headline = f"IMR {lvk_imr_sig:.2f}σ | O4 {lvk_o4_sig:.2f}σ | Qmax={lvk_qmax:.2f}"
+        lvk_detail = (
+            f"{lvk_aud['honest_verdict']} (Spinning df_220(chi=0.68)={lvk_df68:+.2f}%, "
+            f"BHEX Shadow={compiled.shadow_radius_rg:.3f} r_g [{compiled.shadow_vs_gr_pct:+.2f}%])."
+        )
+    except Exception as exc:
+        lvk_status = "FAIL"
+        lvk_headline = "Singular / No Photon-Sphere Barrier"
+        lvk_detail = (
+            f"Strong-field metric lacks a well-posed Regge-Wheeler photon-sphere ringdown barrier ({exc}); "
+            f"incompatible with LVK O3b/O4 black-hole ringdown spectroscopy."
+        )
+    badges.append(CrucibleBadge(
+        badge_id="lvk_ringdown",
+        dataset_name="LVK O4 Black-Hole Ringdown",
+        status=lvk_status,
+        headline_metric=lvk_headline,
+        detail_honest=lvk_detail,
+    ))
+
     return CrucibleReport(
         mod_id=mod.id,
         mod_name=mod.name,
@@ -1806,6 +1841,10 @@ def evaluate_observational_crucible(
         per_galaxy_halo_knobs=int(knob_audit["per_galaxy_halo_knobs"]),
         knob_audit_summary=str(knob_audit["summary_label"]),
         desi_bao_anchored_chi2_dof=desi_anchored_chi2_dof,
+        lvk_ringdown_status=lvk_status,
+        lvk_imr_sigma=lvk_imr_sig,
+        lvk_o4_hier_sigma=lvk_o4_sig,
+        lvk_max_q220=lvk_qmax,
     )
 
 

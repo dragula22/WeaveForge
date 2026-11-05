@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "weaveforge"
-version = "1.0.0"
+version = "1.1.0"
 description = "WeaveForge: Open-Source Real-Time 3D Moddable Action-to-GPU Physics Sandbox & Observational Crucible Engine"
 readme = "README.md"
 requires-python = ">=3.11"

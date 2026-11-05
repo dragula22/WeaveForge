@@ -49,13 +49,13 @@ def test_single_h0_6736_unification_and_toml_roundtrip() -> None:
     assert not hasattr(a4m, "_PLANCK_H0_NNU_3303")
     assert not hasattr(a4m, "_h0_for_pol_nnu_branch")
 
-    # 2. All 6 mods share h0_kms_mpc = 67.36 and pleat_screening_mpc = 0.0
+    # 2. All built-in mods share h0_kms_mpc = 67.36 and pleat_screening_mpc = 0.0
     mods = get_mods_by_id()
-    assert len(mods) >= 6
+    assert len(mods) >= 7
     for m in mods.values():
         assert math.isclose(m.parameters.h0_kms_mpc, 67.36, rel_tol=0.0, abs_tol=1e-9)
         assert math.isclose(m.parameters.pleat_screening_mpc, 0.0, rel_tol=0.0, abs_tol=1e-12)
-        if m.id == "tnap_weave":
+        if m.id in ("tnap_weave", "tnap_gibbons_spool"):
             assert math.isclose(m.parameters.delta_neff_pleat, 0.259, rel_tol=0.0, abs_tol=1e-9)
         else:
             assert math.isclose(m.parameters.delta_neff_pleat, 0.0, rel_tol=0.0, abs_tol=1e-12)
@@ -250,7 +250,7 @@ def test_cross_scale_mass_continuity_ngc3198_double_counting_seam() -> None:
 def test_ast_knob_counter_7row_scoreboard_and_referee_latency() -> None:
     mods = get_mods_by_id()
 
-    # 1. Exact 7-row scoreboard order & preserved badge IDs
+    # 1. Exact 8-row scoreboard order & preserved badge IDs
     tnap_comp = compile_master_action(mods["tnap_weave"])
     tnap_rep = evaluate_observational_crucible(mods["tnap_weave"], tnap_comp)
     badge_ids = [b.badge_id for b in tnap_rep.badges]
@@ -262,6 +262,7 @@ def test_ast_knob_counter_7row_scoreboard_and_referee_latency() -> None:
         "solar_gw",
         "desi_h0",
         "gaia_dr4",
+        "lvk_ringdown",
     ]
 
     # 2. Transparent AST knob audit on Lambda-CDM vs TNaP Spacetime Weave
@@ -331,13 +332,13 @@ def test_studio_v1_wind_tunnel_ui_and_parameter_reset_integration() -> None:
     import weaveforge
     from weaveforge.studio.app import WeaveForgeStudioApp
 
-    assert weaveforge.__version__ == "1.0.0"
+    assert weaveforge.__version__ == "1.1.0"
 
     app = WeaveForgeStudioApp(width=1280, height=760, visible=False, initial_arena=4)
     try:
         app.render_single_frame()
         assert app.crucible is not None
-        assert len(app.crucible.badges) == 7
+        assert len(app.crucible.badges) == 8
 
         # Modify h0_kms_mpc, delta_neff_pleat, and pleat_screening_mpc and verify dirty tracking + reset
         app.working_mod.parameters.h0_kms_mpc = 73.04

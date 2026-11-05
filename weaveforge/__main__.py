@@ -48,7 +48,10 @@ def _cmd_worker(args: argparse.Namespace) -> int:
 
 def _cmd_audit(_args: argparse.Namespace) -> int:
     from weaveforge.arenas.arena4_cosmic_crucible import evaluate_observational_crucible
-    from weaveforge.core.bhex_ringdown import get_kerr_lvk_ringdown_audit
+    from weaveforge.core.bhex_ringdown import (
+        evaluate_gibbons_spool_strong_field_shootout,
+        get_kerr_lvk_ringdown_audit,
+    )
     from weaveforge.core.frameworks import load_all_mods
     from weaveforge.core.symbolic_compiler import (
         compile_master_action,
@@ -56,14 +59,14 @@ def _cmd_audit(_args: argparse.Namespace) -> int:
     )
 
     print("================================================================================")
-    print(" WEAVEFORGE v1.0.0 — FOUNDATIONAL SYMPY ALGEBRAIC IDENTITIES AUDIT")
+    print(" WEAVEFORGE v1.1.0 — FOUNDATIONAL SYMPY ALGEBRAIC IDENTITIES AUDIT")
     print("================================================================================")
     proofs = verify_foundational_tnap_identities()
     for k, v in proofs.items():
         print(f"  * {k:34s}: {v}")
 
     print("\n================================================================================")
-    print(" COMPETING PHYSICS MODS — 5-GATE AUDIT, AST KNOBS & 7-DATASET WIND TUNNEL")
+    print(" COMPETING PHYSICS MODS — 5-GATE AUDIT, AST KNOBS & 8-DATASET WIND TUNNEL")
     print("================================================================================")
     for mod in load_all_mods():
         comp = compile_master_action(mod)
@@ -88,6 +91,17 @@ def _cmd_audit(_args: argparse.Namespace) -> int:
         )
         for b in rep.badges:
             print(f"    [{b.status:8s}] {b.dataset_name:32s} -> {b.headline_metric}")
+
+    shoot = evaluate_gibbons_spool_strong_field_shootout(spin_a=0.67)
+    print("\n================================================================================")
+    print(" STRONG-FIELD GIBBONS PLANCK-SPOOL VS INTERIOR-CLAMP PARETO SHOOTOUT")
+    print("================================================================================")
+    print(
+        f"  * Empirical LVK O4 Shadow Ceiling : <= {float(shoot['max_shadow_shift_pct_2sigma_lvk']):+.2f}% (2 sigma) / "
+        f"<= {float(shoot['max_shadow_shift_pct_3sigma_lvk']):+.2f}% (3 sigma)"
+    )
+    print(f"  * Zero-Knob Winner                : {shoot['zero_knob_winner_id']}")
+    print(f"  * Verdict                         : {shoot['verdict_summary']}")
     return 0
 
 
@@ -96,17 +110,32 @@ def _cmd_gaia(args: argparse.Namespace) -> int:
     from weaveforge.data.gaia_dr4_pipeline import (
         GaiaCutFlowSummary,
         analyze_gaia_wide_binary_sample,
+        build_zenodo_v2_preregistration_manifest,
         evaluate_gaia_dr4_day_one_verdict,
+        evaluate_gaia_dr4_protocol_v2_verdict,
         export_mock_raw_gaia_dr4_astrometry_csv,
+        fetch_esa_gaia_wide_binaries_tap,
         generate_mock_gaia_dr4_catalog,
         ingest_gaia_dr4_raw_astrometry,
+        ingest_gaia_wide_binary_table,
         is_raw_gaia_astrometry_csv,
+        load_bundled_real_gaia_dr3_wide_binaries,
         load_gaia_dr4_csv,
     )
+
+    if getattr(args, "export_zenodo_v2_manifest", None):
+        v2_man = build_zenodo_v2_preregistration_manifest()
+        man_out = Path(args.export_zenodo_v2_manifest)
+        man_out.parent.mkdir(parents=True, exist_ok=True)
+        man_out.write_text(str(v2_man["canonical_json"]), encoding="utf-8")
+        print(f"[WeaveForge Zenodo Protocol v2] Wrote canonical manifest -> {man_out}")
+        print(f"  Deterministic SHA-256 : {v2_man['sha256']}")
 
     inject_contam = not bool(args.no_contaminants)
     cut_flow: GaiaCutFlowSummary | None = None
     is_raw = False
+    pairs_v2_src = None
+    cf_v2_src: GaiaCutFlowSummary | None = None
 
     if args.export_raw_mock:
         out_path = Path(args.export_raw_mock)
@@ -121,17 +150,50 @@ def _cmd_gaia(args: argparse.Namespace) -> int:
             f"({exp_stats['n_clean_injected']} clean, {exp_stats['n_contaminants_injected']} contaminants) -> {out_path}"
         )
 
-    if args.csv:
-        p = Path(args.csv)
-        if is_raw_gaia_astrometry_csv(p):
-            pairs, cut_flow = ingest_gaia_dr4_raw_astrometry(p, max_ruwe=args.max_ruwe)
-            is_raw = True
+    table_arg = getattr(args, "file", None) or args.csv
+    if getattr(args, "real_dr3", False):
+        pairs, cut_flow = load_bundled_real_gaia_dr3_wide_binaries(max_ruwe=args.max_ruwe, max_sigma_v2d_frac=0.35)
+        pairs_v2_src, cf_v2_src = load_bundled_real_gaia_dr3_wide_binaries(
+            max_ruwe=args.max_ruwe, max_sigma_v2d_frac=None
+        )
+        is_raw = True
+        label = "Bundled Real ESA/DPAC Gaia DR3 Wide Binaries (gaia_dr3_real_wide_binaries.npz)"
+    elif getattr(args, "fetch_tap", False):
+        pairs, cut_flow, tap_meta = fetch_esa_gaia_wide_binaries_tap(
+            ra_deg=args.ra,
+            dec_deg=args.dec,
+            healpix_level=args.healpix_level,
+            min_parallax_mas=args.min_parallax,
+            max_ruwe=args.max_ruwe,
+            release=args.release,
+        )
+        is_raw = True
+        label = (
+            f"Live TAP ({tap_meta['table_name']} via {tap_meta['mirror_url']}, "
+            f"HP{tap_meta['healpix_level']}={tap_meta['healpix_index']})"
+        )
+    elif table_arg:
+        p = Path(table_arg)
+        if p.suffix.lower() == ".csv":
+            if is_raw_gaia_astrometry_csv(p):
+                pairs, cut_flow = ingest_gaia_dr4_raw_astrometry(p, max_ruwe=args.max_ruwe)
+                pairs_v2_src, cf_v2_src = ingest_gaia_dr4_raw_astrometry(
+                    p, max_ruwe=args.max_ruwe, max_sigma_v2d_frac=None
+                )
+                is_raw = True
+            else:
+                pairs = load_gaia_dr4_csv(p, max_ruwe=args.max_ruwe)
         else:
-            pairs = load_gaia_dr4_csv(p, max_ruwe=args.max_ruwe)
-        label = f"CSV ({p.name})"
+            pairs, cut_flow = ingest_gaia_wide_binary_table(p, max_ruwe=args.max_ruwe)
+            pairs_v2_src, cf_v2_src = ingest_gaia_wide_binary_table(
+                p, max_ruwe=args.max_ruwe, max_sigma_v2d_frac=None
+            )
+            is_raw = True
+        label = f"Table ({p.name})"
     elif args.export_raw_mock:
         p = Path(args.export_raw_mock)
         pairs, cut_flow = ingest_gaia_dr4_raw_astrometry(p, max_ruwe=args.max_ruwe)
+        pairs_v2_src, cf_v2_src = ingest_gaia_dr4_raw_astrometry(p, max_ruwe=args.max_ruwe, max_sigma_v2d_frac=None)
         is_raw = True
         label = f"Raw Mock CSV ({p.name}, {args.truth}, N={args.mock_count})"
     elif args.day_one_verdict:
@@ -144,6 +206,9 @@ def _cmd_gaia(args: argparse.Namespace) -> int:
                 inject_contaminants=inject_contam,
             )
             pairs, cut_flow = ingest_gaia_dr4_raw_astrometry(tmp_csv, max_ruwe=args.max_ruwe)
+            pairs_v2_src, cf_v2_src = ingest_gaia_dr4_raw_astrometry(
+                tmp_csv, max_ruwe=args.max_ruwe, max_sigma_v2d_frac=None
+            )
         is_raw = True
         label = f"Day-One 3D Sky Mock ({args.truth}, N={args.mock_count})"
     else:
@@ -157,33 +222,68 @@ def _cmd_gaia(args: argparse.Namespace) -> int:
     print(f"  Halo Boost (|z|>=4.5k): {res['halo_boost_pct']:+.2f}%")
     print(f"  Halo-vs-Disk Excess   : {res['halo_excess_sigma']:+.2f} sigma")
 
+    proto = getattr(args, "protocol", "auto")
+    if proto == "auto":
+        proto = "both" if getattr(args, "real_dr3", False) else "v1"
+
     if bool(args.day_one_verdict) or is_raw:
-        verdict = evaluate_gaia_dr4_day_one_verdict(pairs, cut_flow=cut_flow)
-        print(f"\n[Zenodo {verdict['zenodo_doi']} — 3-Test Blind Falsification Scorecard]")
-        if cut_flow is not None:
+        if proto in ("v1", "both"):
+            verdict = evaluate_gaia_dr4_day_one_verdict(pairs, cut_flow=cut_flow)
+            print(f"\n[Zenodo {verdict['zenodo_doi']} — Protocol v1 Archived 3-Test Scorecard]")
+            if cut_flow is not None:
+                print(
+                    f"  Cut-Flow              : raw={cut_flow.n_raw_rows} -> poe={cut_flow.n_passed_snr_parallax} "
+                    f"-> plx={cut_flow.n_passed_consistent_parallax} -> nss={cut_flow.n_passed_nss} "
+                    f"-> ruwe={cut_flow.n_passed_ruwe} -> rv={cut_flow.n_passed_rv_bound} -> clean={cut_flow.n_clean_final}"
+                )
             print(
-                f"  Cut-Flow              : raw={cut_flow.n_raw_rows} -> poe={cut_flow.n_passed_snr_parallax} "
-                f"-> plx={cut_flow.n_passed_consistent_parallax} -> nss={cut_flow.n_passed_nss} "
-                f"-> ruwe={cut_flow.n_passed_ruwe} -> rv={cut_flow.n_passed_rv_bound} -> clean={cut_flow.n_clean_final}"
+                f"  [Test A] Local <=300pc: {verdict['local_backyard_15k_boost_pct']:+.2f}% +/- "
+                f"{verdict['local_backyard_15k_err_pct']:.2f}% (TNaP {verdict['tnap_pred_local_15k_boost_pct']:+.2f}% vs LCDM +0.00%)"
             )
-        print(
-            f"  [Test A] Local <=300pc: {verdict['local_backyard_15k_boost_pct']:+.2f}% +/- "
-            f"{verdict['local_backyard_15k_err_pct']:.2f}% (TNaP {verdict['tnap_pred_local_15k_boost_pct']:+.2f}% vs LCDM +0.00%)"
-        )
-        print(
-            f"  [Test B] GC Compass   : {verdict['compass_split_pct']:+.2f}% +/- "
-            f"{verdict['compass_split_err_pct']:.2f}% (TNaP {verdict['tnap_pred_compass_split_pct']:+.2f}% vs LCDM +0.00%)"
-        )
-        print(
-            f"  [Test C] Env Step     : {verdict['env_step_halo_minus_inner_pct']:+.2f}% +/- "
-            f"{verdict['env_step_err_pct']:.2f}% (TNaP {verdict['tnap_pred_env_step_pct']:+.2f}% vs LCDM +0.00%)"
-        )
-        print(
-            f"  Combined Chi^2        : chi2_tnap={verdict['chi2_tnap']:.2f} | "
-            f"chi2_lambda_cdm={verdict['chi2_lambda_cdm']:.2f} | "
-            f"delta_chi2={verdict['delta_chi2']:+.2f} | log10_BF={verdict['log10_bayes_factor']:+.2f}"
-        )
-        print(f"  Day-One Blind Verdict : {verdict['verdict']}")
+            print(
+                f"  [Test B] GC Compass   : {verdict['compass_split_pct']:+.2f}% +/- "
+                f"{verdict['compass_split_err_pct']:.2f}% (TNaP {verdict['tnap_pred_compass_split_pct']:+.2f}% vs LCDM +0.00%)"
+            )
+            print(
+                f"  [Test C] Env Step     : {verdict['env_step_halo_minus_inner_pct']:+.2f}% +/- "
+                f"{verdict['env_step_err_pct']:.2f}% (TNaP {verdict['tnap_pred_env_step_pct']:+.2f}% vs LCDM +0.00%)"
+            )
+            print(
+                f"  Combined Chi^2        : chi2_tnap={verdict['chi2_tnap']:.2f} | "
+                f"chi2_lambda_cdm={verdict['chi2_lambda_cdm']:.2f} | "
+                f"delta_chi2={verdict['delta_chi2']:+.2f} | log10_BF={verdict['log10_bayes_factor']:+.2f}"
+            )
+            print(f"  Day-One Blind Verdict : {verdict['verdict']}")
+
+        if proto in ("v2", "both"):
+            v2_in = pairs_v2_src if pairs_v2_src is not None else pairs
+            v2_cf = cf_v2_src if cf_v2_src is not None else cut_flow
+            v2 = evaluate_gaia_dr4_protocol_v2_verdict(v2_in, cut_flow=v2_cf)
+            print(f"\n[Zenodo {v2['zenodo_doi']} — Protocol v2 Systematics-Hardened Scorecard]")
+            print(f"  Manifest v2 SHA-256   : {v2['zenodo_v2_sha256']}")
+            print(
+                f"  Inner Triple Forward  : f_triple={v2['f_triple_inner_hat']:.3f} | "
+                f"sigma_kick={v2['sigma_kick_triple_kms']:.2f} km/s | "
+                f"bias_sub={v2['triple_forward_bias_local_pct']:+.2f}% (raw {v2['raw_debiased_local_boost_pct']:+.2f}%)"
+            )
+            print(
+                f"  [Test A] Local <=300pc: {v2['local_backyard_15k_boost_pct']:+.2f}% +/- "
+                f"{v2['local_backyard_15k_err_pct']:.2f}% (TNaP {v2['tnap_pred_local_15k_boost_pct']:+.2f}% vs LCDM +0.00%)"
+            )
+            print(
+                f"  [Test B] GC Compass   : {v2['compass_split_pct']:+.2f}% +/- "
+                f"{v2['compass_split_err_pct']:.2f}% (TNaP {v2['tnap_pred_compass_split_pct']:+.2f}% vs LCDM +0.00%)"
+            )
+            print(
+                f"  [Test C] Env Step     : {v2['env_step_halo_minus_inner_pct']:+.2f}% +/- "
+                f"{v2['env_step_err_pct']:.2f}% (TNaP {v2['tnap_pred_env_step_pct']:+.2f}% vs LCDM +0.00%)"
+            )
+            print(
+                f"  Combined Chi^2        : chi2_tnap={v2['chi2_tnap']:.2f} | "
+                f"chi2_lambda_cdm={v2['chi2_lambda_cdm']:.2f} | "
+                f"delta_chi2={v2['delta_chi2']:+.2f} | log10_BF={v2['log10_bayes_factor']:+.2f}"
+            )
+            print(f"  Protocol v2 Verdict   : {v2['verdict']}")
     return 0
 
 
@@ -237,7 +337,41 @@ def main(argv: list[str] | None = None) -> int:
     p_audit.set_defaults(func=_cmd_audit)
 
     p_gaia = sub.add_parser("gaia-dr4", help="Run Dec 2, 2026 Gaia DR4 Wide-Binary |z_gal| Pipeline")
-    p_gaia.add_argument("--csv", type=str, default=None, help="Path to Gaia DR4 wide-binary CSV")
+    p_gaia.add_argument("--csv", type=str, default=None, help="Path to Gaia DR3/DR4 wide-binary CSV")
+    p_gaia.add_argument(
+        "--file",
+        type=str,
+        default=None,
+        help="Path to multi-format Gaia wide-binary table (.npz, .fits, .vot, .ecsv, .csv)",
+    )
+    p_gaia.add_argument(
+        "--real-dr3",
+        action="store_true",
+        help="Evaluate bundled real ESA/DPAC Gaia DR3 isolated wide-binary snapshot (Protocol v1 vs v2)",
+    )
+    p_gaia.add_argument(
+        "--fetch-tap",
+        action="store_true",
+        help="Query live ESA/ARI Gaia TAP archive via nested-HEALPix primary-key range + local 3D cKDTree pairing",
+    )
+    p_gaia.add_argument("--release", type=str, default="dr3", choices=["dr3", "dr4"], help="Gaia TAP release")
+    p_gaia.add_argument("--ra", type=float, default=192.86, help="Live TAP sky cone center RA [deg]")
+    p_gaia.add_argument("--dec", type=float, default=27.13, help="Live TAP sky cone center Dec [deg]")
+    p_gaia.add_argument("--healpix-level", type=int, default=2, help="Gaia nested HEALPix query level (0..8)")
+    p_gaia.add_argument("--min-parallax", type=float, default=0.65, help="Live TAP minimum parallax [mas]")
+    p_gaia.add_argument(
+        "--protocol",
+        type=str,
+        default="auto",
+        choices=["auto", "v1", "v2", "both"],
+        help="Falsification protocol version (v1 archived Zenodo, v2 systematics-hardened, or both)",
+    )
+    p_gaia.add_argument(
+        "--export-zenodo-v2-manifest",
+        type=str,
+        default=None,
+        help="Write canonical deterministic Protocol v2 JSON pre-registration manifest & print SHA-256",
+    )
     p_gaia.add_argument("--max-ruwe", type=float, default=1.20)
     p_gaia.add_argument("--mock-count", type=int, default=2400)
     p_gaia.add_argument("--truth", type=str, default="tnap_weave", choices=["tnap_weave", "lambda_cdm"])

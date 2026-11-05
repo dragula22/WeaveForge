@@ -1,0 +1,39 @@
+# ==============================================================================
+# WeaveForge Physics Mod #7: TNaP Gibbons Planck-Spool Saturation (Strong-Field)
+# ==============================================================================
+id = "tnap_gibbons_spool"
+name = "TNaP Spacetime Weave (Gibbons F_max = c^4/4G Spool Saturation)"
+author = "David Stoler & TNaP Open-Science Collective"
+summary = "Strong-field Gibbons maximum-tension (F_max = c^4 / 4G) projective weave saturation onto an exact R_spool = 2GM/c^2 horizon core (zero added action knobs). Resolves the 5.9-sigma LVK O4 spinning ringdown failure of bare exp(2U) (0.27s GW150914 IMR, 0.33s O4 TGR PASS), trading the +4.63% BHEX shadow enlargement for Kerr-identical prompt ringdown + testable Planck-spool GW echoes."
+
+[action]
+# Identical 3D nonlinear topological knot/braid wave weave Lagrangian to Mod #5:
+field_lagrangian = "exp(4 * U) * T_kin - c_w**2 * G_grad - exp(-2 * U) * k_skyrme * (0.7098 / (0.8425 + rho + 1.70 * phi3)**2) * S_skyrme - exp(2 * U) * (0.5 * m_eff**2 * rho - 0.25 * g4 * (rho + 1.70 * phi3)**2 + (1.0/6.0) * g6 * rho * (rho + 1.70 * phi3)**2 + 80.0 * phi3**2 * (rho + 1.70 * phi3)**2 + 120.0 * (rho + 1.70 * phi3)**2 / (1.0 + 0.25 * (rho + 1.70 * phi3)**6) + 12000.0 * (exp(-9.0 * (0.7225 + rho + 1.70 * phi3)) - 0.0014996858)**2)"
+# Gibbons Maximum-Tension Projective Saturation (F_max = c^4 / 4G -> R_spool = 2GM/c^2 at isotropic U_H = 2):
+# -> Zero non-canonical literals added (ActionKnobs = 9, identical to Mod #5!)
+# -> Exact 1PN Solar-System PPN match (alpha = 1, gamma = 1, beta = 1)
+# -> Passes spinning GW150914 IMR (0.27 sigma) & hierarchical LVK O3b/O4 TGR (0.33 sigma)!
+# -> Candid trade-off: collapses static shadow shift from +4.63% to +0.00% (5.1962 r_g), shifting strong-field falsifiability to post-merger Planck-spool GW echoes.
+optical_metric_n = "((1 + U/2)**3) / (1 - U/2)"
+metric_lapse_A = "((1 - U/2) / (1 + U/2))**2"
+interpolation_nu = "1.0 / (1.0 - exp(-sqrt(y)))"
+gw_speed_ratio = "1"
+
+[parameters]
+c_w = 1.0
+m_eff = 0.72
+g4 = 0.80
+g6 = 3.10
+k_skyrme = 1.55
+g_knot = 0.90
+retarded_weave_u = true
+a0_si = 1.202712e-10
+has_cdm_halo = false
+cdm_halo_scale = 0.0
+waist_clamping_ell = 3.21
+pinned_pleat_coupling = 1.0
+w0_de = -0.91
+wa_de = -0.28
+h0_kms_mpc = 67.36
+delta_neff_pleat = 0.259
+pleat_screening_mpc = 0.0
